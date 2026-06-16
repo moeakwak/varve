@@ -15,6 +15,7 @@ from varve.experiment import Experiment
 from varve.keys import compute_key_components, content_key, run_key
 from varve.ledger import Ledger
 from varve.lock import OutputLock
+from varve.log import get_logger
 from varve.models import (
     AttemptMarker,
     BatchRecord,
@@ -229,6 +230,8 @@ async def _drive(
     instance = experiment_type()
     outcomes: list[StageOutcome] = []
     known_content_keys: dict[str, str] = {}
+    logger = get_logger()
+    logger.info("plan: %s", " -> ".join(name for name in experiment_type.topo_order() if name in selected))
 
     for stage_name in experiment_type.topo_order():
         if stage_name not in selected:
@@ -286,12 +289,16 @@ async def _drive(
         if force:
             decision = Decision("stale" if previous else "no-cache", "forced")
         if dry or decision.status == "hit":
+            logger.info("[%s] %s%s", stage_name, decision.status, f" · {decision.reason}" if decision.reason != decision.status else "")
+            logger.debug("[%s] content_key %s", stage_name, current_key)
             outcomes.append(StageOutcome(stage_name, decision.status, decision.reason, None))
             continue
         if decision.status == "unrecoverable":
             raise RuntimeError(f"[{stage_name}] {decision.reason}")
 
         started = time.monotonic()
+        logger.info("[%s] run · %s", stage_name, decision.reason)
+        logger.debug("[%s] content_key %s", stage_name, current_key)
         ledger.write_attempt(
             stage_name,
             AttemptMarker(
@@ -366,8 +373,10 @@ async def _drive(
                 )
             )
         ledger.clear_attempt(stage_name)
+        elapsed = time.monotonic() - started
+        logger.info("[%s] done · %.2fs", stage_name, elapsed)
         outcomes.append(
-            StageOutcome(stage_name, decision.status, decision.reason, time.monotonic() - started)
+            StageOutcome(stage_name, decision.status, decision.reason, elapsed)
         )
     return outcomes
 

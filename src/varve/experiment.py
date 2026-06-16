@@ -66,5 +66,6 @@ class Experiment:
 
     @classmethod
     def cli(cls, argv: list[str] | None = None) -> int:
-        raise NotImplementedError("Experiment.cli() is implemented in a later phase")
+        from varve.cli import main
 
+        return main(cls, argv)
