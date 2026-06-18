@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 from pydantic import BaseModel
 
-from varve import Experiment, batch_stage, stage
+from varve import Experiment, KeySpec, batch_stage, stage
 from varve.ledger import Ledger
 from varve.runner import run, selected_stages
 
@@ -154,3 +155,57 @@ def test_batch_multi_output_index_requires_all_paths(tmp_path: Path) -> None:
         (1, "1-left.txt"),
         (1, "1-right.txt"),
     ]
+
+
+class FileKeyConfig(BaseModel):
+    out: Path
+    src: Path
+
+
+class FileKeyExperiment(Experiment):
+    Config = FileKeyConfig
+
+    @stage(
+        produces="copy.txt",
+        key=KeySpec(files={"src": lambda ctx: ctx.config.src}),
+    )
+    def copy(self, ctx):
+        (ctx.out / "copy.txt").write_text(
+            ctx.config.src.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+
+
+def test_hit_refreshes_touched_but_unchanged_file_fingerprint(tmp_path: Path) -> None:
+    src = tmp_path / "input.txt"
+    src.write_text("payload", encoding="utf-8")
+    config = FileKeyConfig(out=tmp_path / "work", src=src)
+
+    first = run(FileKeyExperiment, config)
+    assert [outcome.status for outcome in first] == ["no-cache"]
+
+    cached_mtime = _cached_src_mtime(config.out)
+
+    # Touch the file without changing its content: bump mtime, same bytes.
+    new_mtime = cached_mtime + 100.0
+    os.utime(src, (new_mtime, new_mtime))
+
+    second = run(FileKeyExperiment, config)
+    assert [outcome.status for outcome in second] == ["hit"]
+
+    refreshed_mtime = _cached_src_mtime(config.out)
+    assert refreshed_mtime == new_mtime
+    assert refreshed_mtime != cached_mtime
+
+
+def _cached_src_mtime(out: Path) -> float:
+    record = Ledger(out).read_success("copy")
+    assert record is not None
+    return record.key_components.files["src"][0].mtime
+
+
+def test_batch_stage_rejects_produces() -> None:
+    with pytest.raises(ValueError, match="batch_stage does not accept produces"):
+
+        @batch_stage(produces="out.txt")
+        async def bad(self, ctx):  # pragma: no cover - decorator raises first
+            yield ctx.out / "out.txt"

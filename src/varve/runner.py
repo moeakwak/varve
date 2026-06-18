@@ -19,6 +19,7 @@ from varve.log import get_logger
 from varve.models import (
     AttemptMarker,
     BatchRecord,
+    KeyComponents,
     OutputHandle,
     PartialMeta,
     ProducedPath,
@@ -40,7 +41,46 @@ def _now() -> str:
 
 
 def _relative_to_out(path: Path, out: Path) -> str:
-    return str(path.resolve().relative_to(out.resolve()))
+    resolved = path.resolve()
+    out_resolved = out.resolve()
+    try:
+        return str(resolved.relative_to(out_resolved))
+    except ValueError as error:
+        raise ValueError(
+            f"Yielded varve output must live inside the output root: {resolved} "
+            f"is not under {out_resolved}"
+        ) from error
+
+
+def _refresh_fingerprint_cache(
+    *,
+    ledger: Ledger,
+    stage_name: str,
+    previous: SuccessRecord | None,
+    components: KeyComponents,
+) -> None:
+    """Rewrite a hit stage's success record when file fingerprints drifted.
+
+    A content-key hit guarantees identical file sha256 digests, since the key
+    only folds in digests. But a file may have been touched (new mtime/size)
+    without its content changing. The freshly computed `components` already
+    carry the refreshed fingerprints; persisting them avoids re-hashing the
+    same unchanged bytes on every subsequent run while leaving the content key
+    untouched. Only the size/mtime metadata moves.
+    """
+
+    if previous is None:
+        return
+    if previous.key_components.files == components.files:
+        return
+    refreshed = previous.model_copy(
+        update={
+            "key_components": previous.key_components.model_copy(
+                update={"files": components.files}
+            )
+        }
+    )
+    ledger.write_success(refreshed)
 
 
 def _produced_paths(produces, ctx: Ctx) -> list[ProducedPath]:
@@ -288,6 +328,13 @@ async def _drive(
 
         if force:
             decision = Decision("stale" if previous else "no-cache", "forced")
+        if not dry and decision.status == "hit":
+            _refresh_fingerprint_cache(
+                ledger=ledger,
+                stage_name=stage_name,
+                previous=previous,
+                components=components,
+            )
         if dry or decision.status == "hit":
             logger.info("[%s] %s%s", stage_name, decision.status, f" · {decision.reason}" if decision.reason != decision.status else "")
             logger.debug("[%s] content_key %s", stage_name, current_key)

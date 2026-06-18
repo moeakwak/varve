@@ -71,6 +71,12 @@ def batch_stage(
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Declare an async-generator batch stage."""
 
+    if produces is not None:
+        raise ValueError(
+            "batch_stage does not accept produces: batch outputs are recorded from the "
+            "paths each batch yields, not from a static produces declaration."
+        )
+
     def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
         spec = StageSpec(
             name=func.__name__,
