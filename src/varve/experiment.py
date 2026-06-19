@@ -65,7 +65,17 @@ class Experiment:
         )
 
     @classmethod
+    def clean_roots(cls, config: Any) -> list[Path] | None:
+        """Optionally restrict full-clean (no target) to specific roots.
+
+        Returning None (default) keeps current behavior: only the dangerous blacklist
+        (/, home, cwd) and manifest anchor guard a full clean. Override to declare
+        experiment-specific allowed roots (e.g. studies/results, /tmp).
+        """
+        return None
+
+    @classmethod
     def cli(cls, argv: list[str] | None = None) -> int:
-        from varve.cli import main
+        from varve.cli.app import main
 
         return main(cls, argv)

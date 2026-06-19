@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from varve.fingerprint import canonical_json, file_fingerprint, files_fingerprints
+from varve.keying.fingerprint import canonical_json, file_fingerprint, files_fingerprints
 
 
 def test_file_fingerprint_reuses_cached_sha_when_size_and_mtime_match(tmp_path: Path) -> None:

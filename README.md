@@ -1,6 +1,8 @@
 # varve
 
-`varve` is a small Python library for serial experiment orchestration with a materialized, content-addressed cache. It is intentionally thin: experiments own their output paths and file formats, while varve owns the ledger that records which stage successfully produced which durable artifacts for a given content key.
+`varve` is a small Python library for serial experiment orchestration with a materialized, content-addressed cache. It is intentionally thin: experiments own their output paths and file formats, while varve owns the store that records which stage successfully produced which durable artifacts for a given content key.
+
+For maintainers, see [ARCHITECTURE.md](ARCHITECTURE.md) for the current package layout and cache model, and [AGENTS.md](AGENTS.md) for development rules and dependency boundaries.
 
 ```python
 from pathlib import Path
@@ -28,7 +30,19 @@ Commands:
 - `status [TARGET]`: show cache state without executing stages.
 - `plan`: print the stage order or graph.
 - `list`: list declared stages.
-- `clean [TARGET] --yes`: remove ledger records and artifacts.
+- `clean [TARGET] --yes`: remove store records and artifacts.
+
+## Configuration sources
+
+`run`, `status`, and `clean` build an experiment `Config` from multiple sources, in priority order:
+
+```text
+CLI flag > env > dotenv (.env) > yaml (--config) > field default
+```
+
+Nested environment variables use `__` as the delimiter, for example `INNER__NAME` for `inner.name`.
+
+The CLI is strict: unknown options fail instead of being ignored. Config flags are generated at runtime from the experiment `Config`, so varve keeps an `argparse` front-end rather than introducing typer or click.
 
 ## Known limitations
 

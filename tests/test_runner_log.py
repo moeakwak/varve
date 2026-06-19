@@ -6,7 +6,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from varve import Experiment, stage
-from varve.runner import run
+from varve.engine.runner import run
 
 
 class Config(BaseModel):

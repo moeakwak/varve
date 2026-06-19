@@ -8,7 +8,7 @@ import pytest
 from pydantic import BaseModel
 
 from varve.decorators import StageSpec, stage
-from varve.keys import compute_key_components, content_key, run_key
+from varve.keying.keys import compute_key_components, content_key, run_key
 from varve.keyspec import KeySpec
 from varve.models import (
     KeyComponents,

@@ -1,4 +1,4 @@
-"""Pydantic schemas persisted in the varve ledger."""
+"""Pydantic schemas persisted in the varve store."""
 
 from __future__ import annotations
 

@@ -11,10 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from varve.context import Ctx
+from varve.engine.state import Decision, Status, decide_batch, decide_single
 from varve.experiment import Experiment
-from varve.keys import compute_key_components, content_key, run_key
-from varve.ledger import Ledger
-from varve.lock import OutputLock
+from varve.keying.keys import compute_key_components, content_key, run_key
 from varve.log import get_logger
 from varve.models import (
     AttemptMarker,
@@ -25,7 +24,8 @@ from varve.models import (
     ProducedPath,
     SuccessRecord,
 )
-from varve.state import Decision, Status, decide_batch, decide_single
+from varve.store.lock import OutputLock
+from varve.store.store import Store
 
 
 @dataclass(frozen=True)
@@ -54,7 +54,7 @@ def _relative_to_out(path: Path, out: Path) -> str:
 
 def _refresh_fingerprint_cache(
     *,
-    ledger: Ledger,
+    store: Store,
     stage_name: str,
     previous: SuccessRecord | None,
     components: KeyComponents,
@@ -80,7 +80,7 @@ def _refresh_fingerprint_cache(
             )
         }
     )
-    ledger.write_success(refreshed)
+    store.write_success(refreshed)
 
 
 def _produced_paths(produces, ctx: Ctx) -> list[ProducedPath]:
@@ -156,10 +156,10 @@ def selected_stages(
     return set(stages)
 
 
-def _upstream_keys(stage_spec, ledger: Ledger) -> dict[str, str]:
+def _upstream_keys(stage_spec, store: Store) -> dict[str, str]:
     keys: dict[str, str] = {}
     for name in stage_spec.needs:
-        record = ledger.read_success(name)
+        record = store.read_success(name)
         if record is None:
             raise ValueError(f"Upstream stage has no success record: {name}")
         keys[name] = record.content_key
@@ -168,7 +168,7 @@ def _upstream_keys(stage_spec, ledger: Ledger) -> dict[str, str]:
 
 def _upstream_keys_from_known(
     stage_spec,
-    ledger: Ledger,
+    store: Store,
     known_content_keys: dict[str, str],
 ) -> dict[str, str]:
     keys: dict[str, str] = {}
@@ -176,7 +176,7 @@ def _upstream_keys_from_known(
         if name in known_content_keys:
             keys[name] = known_content_keys[name]
             continue
-        record = ledger.read_success(name)
+        record = store.read_success(name)
         if record is None:
             raise ValueError(f"Upstream stage has no success record: {name}")
         keys[name] = record.content_key
@@ -186,7 +186,7 @@ def _upstream_keys_from_known(
 def _validate_external_upstreams(
     experiment_type: type[Experiment],
     selected: set[str],
-    ledger: Ledger,
+    store: Store,
     out: Path,
 ) -> None:
     stages = experiment_type.stages()
@@ -194,8 +194,8 @@ def _validate_external_upstreams(
         for upstream in stages[stage_name].needs:
             if upstream in selected:
                 continue
-            attempt = ledger.read_attempt(upstream)
-            record = ledger.read_success(upstream)
+            attempt = store.read_attempt(upstream)
+            record = store.read_success(upstream)
             if attempt is not None:
                 raise ValueError(f"Upstream stage is dirty: {upstream}")
             if record is None:
@@ -257,7 +257,7 @@ async def _drive(
     dry: bool,
 ) -> list[StageOutcome]:
     out = experiment_type.output_root(config)
-    ledger = Ledger(out)
+    store = Store(out)
     selected = selected_stages(
         experiment_type,
         target=target,
@@ -265,7 +265,7 @@ async def _drive(
         downstream=downstream,
     )
     if not dry:
-        _validate_external_upstreams(experiment_type, selected, ledger, out)
+        _validate_external_upstreams(experiment_type, selected, store, out)
 
     instance = experiment_type()
     outcomes: list[StageOutcome] = []
@@ -278,22 +278,22 @@ async def _drive(
             continue
         stage_spec = experiment_type.stages()[stage_name]
         if dry:
-            missing_upstream = any(ledger.read_success(name) is None for name in stage_spec.needs)
+            missing_upstream = any(store.read_success(name) is None for name in stage_spec.needs)
             if missing_upstream:
                 outcomes.append(StageOutcome(stage_name, "no-cache", "no cache", None))
                 continue
         upstream_keys = (
-            _upstream_keys_from_known(stage_spec, ledger, known_content_keys)
+            _upstream_keys_from_known(stage_spec, store, known_content_keys)
             if dry
-            else _upstream_keys(stage_spec, ledger)
+            else _upstream_keys(stage_spec, store)
         )
-        previous = ledger.read_success(stage_name)
+        previous = store.read_success(stage_name)
         cached_files = previous.key_components.files if previous is not None else None
-        ctx_for_key = Ctx(config=config, out=out, ledger=ledger)
+        ctx_for_key = Ctx(config=config, out=out, store=store)
         components = compute_key_components(stage_spec, ctx_for_key, upstream_keys, cached_files)
         current_key = content_key(components)
         known_content_keys[stage_name] = current_key
-        attempt = ledger.read_attempt(stage_name)
+        attempt = store.read_attempt(stage_name)
         partition = _partition_values(stage_spec, config) if stage_spec.kind == "batch" else {}
         current_run_key = run_key(current_key, partition)
 
@@ -311,7 +311,12 @@ async def _drive(
                 produces_exist=produces_exist,
             )
         else:
-            partial = ledger.read_partial(stage_name, current_run_key)
+            partial = store.read_partial(stage_name, current_run_key)
+            partial_run_key = (
+                run_key(partial[0].content_key, partial[0].partition_values)
+                if partial is not None
+                else None
+            )
             attempt_for_decision = attempt
             if previous is None and partial is not None:
                 attempt_for_decision = None
@@ -320,6 +325,7 @@ async def _drive(
                 current_components=components,
                 current_partition=partition,
                 run_key=current_run_key,
+                partial_run_key=partial_run_key,
                 success=previous,
                 partial=partial,
                 attempt=attempt_for_decision,
@@ -330,7 +336,7 @@ async def _drive(
             decision = Decision("stale" if previous else "no-cache", "forced")
         if not dry and decision.status == "hit":
             _refresh_fingerprint_cache(
-                ledger=ledger,
+                store=store,
                 stage_name=stage_name,
                 previous=previous,
                 components=components,
@@ -346,7 +352,7 @@ async def _drive(
         started = time.monotonic()
         logger.info("[%s] run · %s", stage_name, decision.reason)
         logger.debug("[%s] content_key %s", stage_name, current_key)
-        ledger.write_attempt(
+        store.write_attempt(
             stage_name,
             AttemptMarker(
                 content_key=current_key,
@@ -354,11 +360,11 @@ async def _drive(
                 touched_existing=previous is not None,
             ),
         )
-        ctx = Ctx(config=config, out=out, ledger=ledger, resume_skip=decision.resume_skip)
+        ctx = Ctx(config=config, out=out, store=store, resume_skip=decision.resume_skip)
         if stage_spec.kind == "single":
             await _execute_stage(instance, stage_spec, ctx)
             produces = _produced_paths(stage_spec.produces, ctx)
-            ledger.write_success(
+            store.write_success(
                 SuccessRecord(
                     experiment=experiment_type.__name__,
                     stage=stage_name,
@@ -370,16 +376,16 @@ async def _drive(
                 )
             )
         else:
-            if force:
-                ledger.clear_partial(stage_name, current_run_key)
-            partial = ledger.read_partial(stage_name, current_run_key)
+            if force or decision.status != "resume":
+                store.clear_partial(stage_name, current_run_key)
+            partial_for_outputs = partial if decision.status == "resume" else None
             outputs_by_index = _batch_outputs_from_records(
                 previous=previous,
-                partial=partial,
+                partial=partial_for_outputs,
                 out=out,
                 force=force,
             )
-            ledger.write_partial_meta(
+            store.write_partial_meta(
                 stage_name,
                 current_run_key,
                 PartialMeta(
@@ -396,7 +402,7 @@ async def _drive(
                     if not absolute.exists():
                         raise FileNotFoundError(f"Yielded varve output does not exist: {absolute}")
                     yielded.append(_relative_to_out(absolute, out))
-                ledger.write_batch(
+                store.write_batch(
                     stage_name,
                     current_run_key,
                     BatchRecord(index=index, yielded=yielded, committed_at=_now()),
@@ -407,7 +413,7 @@ async def _drive(
                 for index, paths in sorted(outputs_by_index.items())
                 for path in paths
             ]
-            ledger.write_success(
+            store.write_success(
                 SuccessRecord(
                     experiment=experiment_type.__name__,
                     stage=stage_name,
@@ -419,7 +425,7 @@ async def _drive(
                     committed_at=_now(),
                 )
             )
-        ledger.clear_attempt(stage_name)
+        store.clear_attempt(stage_name)
         elapsed = time.monotonic() - started
         logger.info("[%s] done · %.2fs", stage_name, elapsed)
         outcomes.append(
@@ -451,10 +457,10 @@ def run(
                 dry=True,
             )
         )
-    ledger = Ledger(out)
-    ledger.root.mkdir(parents=True, exist_ok=True)
-    with OutputLock(ledger.root):
-        ledger.ensure_initialized(experiment.__name__)
+    store = Store(out)
+    store.root.mkdir(parents=True, exist_ok=True)
+    with OutputLock(store.root):
+        store.ensure_initialized(experiment.__name__)
         return asyncio.run(
             _drive(
                 experiment,

@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
 from typing import Any
 
-from varve.ledger import Ledger
+from varve.store.store import Store
 
 
 class Ctx:
@@ -15,17 +15,22 @@ class Ctx:
         *,
         config: Any,
         out: Path,
-        ledger: Ledger,
+        store: Store | None = None,
+        ledger: Store | None = None,
         resume_skip: frozenset[int] | None = None,
     ) -> None:
         self.config = config
         self.out = out
-        self._ledger = ledger
+        if store is None:
+            store = ledger  # Legacy keyword compatibility.
+        if store is None:
+            raise ValueError("Ctx requires a varve store")
+        self._store = store
         self._resume_skip = resume_skip or frozenset()
         self._current_batch_index: int | None = None
 
     def input(self, stage: str) -> Path | list[Path]:
-        record = self._ledger.read_success(stage)
+        record = self._store.read_success(stage)
         if record is None:
             raise ValueError(f"Upstream stage has no success record: {stage}")
         if record.kind == "single":

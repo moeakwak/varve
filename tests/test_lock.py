@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from varve.lock import OutputLock, is_stale_lock
+from varve.store.lock import OutputLock, is_stale_lock
 
 
 def test_output_lock_excludes_other_writers(tmp_path: Path) -> None:
@@ -23,4 +23,3 @@ def test_stale_lock_detection(tmp_path: Path) -> None:
     varve_root.mkdir()
     (varve_root / "lock").write_text(str(os.getpid() + 10_000_000), encoding="utf-8")
     assert is_stale_lock(varve_root)
-

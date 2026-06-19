@@ -15,7 +15,7 @@ class KeySpec:
     """Declarative inputs that affect a stage's durable outputs.
 
     The object deliberately stores callables and is therefore a dataclass rather
-    than a pydantic model. The ledger persists the evaluated values, not this
+    than a pydantic model. The store persists the evaluated values, not this
     declaration object.
     """
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from varve.keys import run_key
+from varve.engine.state import decide_batch, decide_single, invalidation_reason
+from varve.keying.keys import run_key
 from varve.models import (
     AttemptMarker,
     BatchRecord,
@@ -10,7 +11,6 @@ from varve.models import (
     ProducedPath,
     SuccessRecord,
 )
-from varve.state import decide_batch, decide_single, invalidation_reason
 
 
 def _components(**overrides) -> KeyComponents:
@@ -74,6 +74,7 @@ def test_decide_batch_rows() -> None:
         current_components=_components(),
         current_partition={"batch": 1},
         run_key=run_key("sha256:a", {"batch": 1}),
+        partial_run_key=None,
         success=success,
         partial=None,
         attempt=None,
@@ -86,6 +87,7 @@ def test_decide_batch_rows() -> None:
         current_components=_components(),
         current_partition={"batch": 1},
         run_key=run_key("sha256:a", {"batch": 1}),
+        partial_run_key=None,
         success=success,
         partial=None,
         attempt=None,
@@ -99,6 +101,7 @@ def test_decide_batch_rows() -> None:
         current_components=_components(),
         current_partition={"batch": 2},
         run_key=run_key("sha256:a", {"batch": 2}),
+        partial_run_key=None,
         success=success,
         partial=None,
         attempt=None,
@@ -114,6 +117,7 @@ def test_decide_batch_rows() -> None:
         current_components=_components(),
         current_partition={"batch": 1},
         run_key=run_key("sha256:a", {"batch": 1}),
+        partial_run_key=run_key(partial[0].content_key, partial[0].partition_values),
         success=None,
         partial=partial,
         attempt=None,
@@ -128,6 +132,7 @@ def test_decide_batch_rows() -> None:
         current_components=_components(),
         current_partition={"batch": 1},
         run_key=run_key("sha256:a", {"batch": 1}),
+        partial_run_key=None,
         success=success,
         partial=None,
         attempt=marker,
@@ -139,6 +144,7 @@ def test_decide_batch_rows() -> None:
         current_components=_components(source={"x": "y"}),
         current_partition={"batch": 1},
         run_key=run_key("sha256:b", {"batch": 1}),
+        partial_run_key=None,
         success=success,
         partial=None,
         attempt=None,
@@ -150,6 +156,7 @@ def test_decide_batch_rows() -> None:
         current_components=_components(),
         current_partition={"batch": 2},
         run_key=run_key("sha256:a", {"batch": 2}),
+        partial_run_key=run_key(partial[0].content_key, partial[0].partition_values),
         success=None,
         partial=partial,
         attempt=None,

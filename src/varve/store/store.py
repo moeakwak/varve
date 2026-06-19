@@ -1,4 +1,4 @@
-"""Persistent ledger storage for varve runs."""
+"""Persistent snapshot store for varve runs."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ from varve.models import (
 ModelT = TypeVar("ModelT", bound=VarveModel)
 
 
-class CorruptLedger(Exception):  # noqa: N818 - plan and public API use this term.
-    """Raised when a ledger file exists but cannot be parsed as expected."""
+class CorruptStore(Exception):  # noqa: N818 - public-facing store must surface corruption explicitly.
+    """Raised when a store file exists but cannot be parsed as expected."""
 
 
 def _atomic_write_json(path: Path, model: VarveModel) -> None:
@@ -42,11 +42,11 @@ def _read_model[ModelT: VarveModel](path: Path, model_type: type[ModelT]) -> Mod
         data = json.loads(path.read_text(encoding="utf-8"))
         return model_type.model_validate(data)
     except (json.JSONDecodeError, OSError, ValidationError) as error:
-        raise CorruptLedger(f"Corrupt varve ledger file: {path}") from error
+        raise CorruptStore(f"Corrupt varve store file: {path}") from error
 
 
-class Ledger:
-    """Atomic JSON ledger rooted at `<output_root>/.varve`."""
+class Store:
+    """Latest-wins snapshot store for a varve run, holding success records, attempt markers, and partial scratch (no append-only history)."""
 
     def __init__(self, output_root: Path) -> None:
         self.output_root = output_root
@@ -63,7 +63,7 @@ class Ledger:
             return
         if manifest.experiment != experiment:
             raise ValueError(
-                f"Varve ledger belongs to {manifest.experiment}, not {experiment}: "
+                f"Varve store belongs to {manifest.experiment}, not {experiment}: "
                 f"{manifest_path}"
             )
 

@@ -3,26 +3,43 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
-from typing import ClassVar, get_args, get_origin
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, create_model
 from pydantic_settings import BaseSettings, SettingsConfigDict, YamlConfigSettingsSource
 
-from varve.clean import clean
+from varve.cli import argmap
+from varve.cli.clean import clean
+from varve.engine.runner import run, selected_stages
 from varve.experiment import Experiment
 from varve.log import configure_cli_logging
-from varve.runner import run, selected_stages
+
+_COMMANDS = {"run", "status", "clean", "plan", "list"}
+_CONFIG_COMMANDS = {"run", "status", "clean"}
+_NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
+_COMMAND_OPTION_ARITIES = {
+    "run": {
+        "--only": 1,
+        "-s": 1,
+        "--downstream": 1,
+        "--force": 0,
+        "-f": 0,
+        "--dry": 0,
+        "--config": 1,
+    },
+    "status": {"--config": 1},
+    "clean": {"--yes": 0, "-y": 0, "--config": 1},
+}
 
 
 def _settings_type(config_type: type[BaseModel], yaml_file: Path | None = None):
     class VarveSettings(BaseSettings):
         model_config = SettingsConfigDict(
-            cli_implicit_flags="dual",
-            cli_kebab_case=True,
-            cli_ignore_unknown_args=True,
             env_nested_delimiter="__",
+            env_file=".env",
         )
 
         _yaml_file: ClassVar[Path | None] = yaml_file
@@ -54,83 +71,12 @@ def _settings_type(config_type: type[BaseModel], yaml_file: Path | None = None):
 def _config_from_args(
     config_type: type[BaseModel],
     *,
-    argv: list[str],
+    init_kwargs: dict[str, Any],
     yaml_file: Path | None,
 ) -> BaseModel:
     settings_type = _settings_type(config_type, yaml_file)
-    settings = settings_type(_cli_parse_args=argv)
+    settings = settings_type(**init_kwargs)
     return config_type.model_validate(settings.model_dump())
-
-
-def _extract_option(args: list[str], names: set[str]) -> str | None:
-    for index, token in enumerate(args):
-        if token in names and index + 1 < len(args):
-            return args[index + 1]
-        for name in names:
-            prefix = name + "="
-            if token.startswith(prefix):
-                return token[len(prefix) :]
-    return None
-
-
-def _field_type(annotation):
-    origin = get_origin(annotation)
-    if origin is None:
-        return annotation
-    args = [arg for arg in get_args(annotation) if arg is not type(None)]
-    return _field_type(args[0]) if args else annotation
-
-
-def _is_model_type(annotation) -> bool:
-    value_type = _field_type(annotation)
-    return isinstance(value_type, type) and issubclass(value_type, BaseModel)
-
-
-def _config_option_sets(
-    config_type: type[BaseModel],
-    *,
-    prefix: str = "",
-) -> tuple[set[str], set[str]]:
-    value_options: set[str] = set()
-    flag_options: set[str] = set()
-    for name, field in config_type.model_fields.items():
-        option_name = f"{prefix}{name.replace('_', '-')}"
-        option = "--" + option_name
-        field_type = _field_type(field.annotation)
-        if _is_model_type(field.annotation):
-            nested_values, nested_flags = _config_option_sets(field_type, prefix=f"{option_name}.")
-            value_options |= nested_values
-            flag_options |= nested_flags
-        elif field_type is bool:
-            flag_options.add(option)
-            flag_options.add("--no-" + option_name)
-        else:
-            value_options.add(option)
-    return value_options, flag_options
-
-
-def _has_flag(args: list[str], names: set[str]) -> bool:
-    return any(token in names for token in args)
-
-
-def _target_from_args(args: list[str], known_value_options: set[str], known_flags: set[str]) -> str | None:
-    index = 0
-    while index < len(args):
-        token = args[index]
-        if token in known_flags:
-            index += 1
-            continue
-        if token.startswith("-") and "=" in token:
-            index += 1
-            continue
-        if token in known_value_options:
-            index += 2
-            continue
-        if token.startswith("-"):
-            index += 1
-            continue
-        return token
-    return None
 
 
 def _print_list(experiment: type[Experiment]) -> None:
@@ -182,8 +128,80 @@ def _print_status(experiment: type[Experiment], config, target: str | None) -> N
         print(f"{outcome.stage}\t{outcome.status}\t{outcome.reason}")
 
 
+def _default_confirm(message: str) -> bool:
+    try:
+        answer = input(f"{message} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def _selected_command_index(argv: list[str]) -> int | None:
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"-v", "--verbose"}:
+            index += 1
+            continue
+        if token == "--":
+            next_index = index + 1
+            return next_index if next_index < len(argv) else None
+        if token.startswith("-"):
+            return None
+        return index
+    return None
+
+
+def _selected_command(argv: list[str]) -> str | None:
+    index = _selected_command_index(argv)
+    if index is None:
+        return None
+    return argv[index]
+
+
+def _option_name(token: str) -> str:
+    if token.startswith("--"):
+        return token.split("=", 1)[0]
+    return token
+
+
+def _looks_like_option(token: str) -> bool:
+    return token.startswith("-") and token != "-" and _NEGATIVE_NUMBER_RE.match(token) is None
+
+
+def _has_unknown_option_before_config_registration(
+    *,
+    command: str,
+    command_args: list[str],
+    config_type: type[BaseModel],
+) -> bool:
+    option_arities = argmap.config_option_arities(config_type)
+    option_arities.update(_COMMAND_OPTION_ARITIES[command])
+
+    index = 0
+    while index < len(command_args):
+        token = command_args[index]
+        if token == "--":
+            return False
+        if not token.startswith("-") or token == "-":
+            index += 1
+            continue
+        option = _option_name(token)
+        arity = option_arities.get(option)
+        if arity is None:
+            return True
+        index += 1
+        if arity == 1 and "=" not in token:
+            if index >= len(command_args) or _looks_like_option(command_args[index]):
+                return True
+            index += 1
+    return False
+
+
 def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    selected_command_index = _selected_command_index(raw_argv)
+    selected_command = _selected_command(raw_argv)
     parser = argparse.ArgumentParser(prog=experiment.__name__)
     parser.add_argument("-v", "--verbose", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -212,10 +230,23 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
 
     subparsers.add_parser("list")
 
-    namespace, _unknown = parser.parse_known_args(raw_argv)
-    command_args = []
-    if raw_argv is not None and namespace.command in raw_argv:
-        command_args = raw_argv[raw_argv.index(namespace.command) + 1 :]
+    if selected_command in _CONFIG_COMMANDS and selected_command_index is not None:
+        command_args = raw_argv[selected_command_index + 1 :]
+        if _has_unknown_option_before_config_registration(
+            command=selected_command,
+            command_args=command_args,
+            config_type=experiment.Config,
+        ):
+            parser.error("unknown option or missing option value")
+
+    if selected_command == "run":
+        argmap.register_config_args(run_parser, experiment.Config)
+    if selected_command == "status":
+        argmap.register_config_args(status_parser, experiment.Config)
+    if selected_command == "clean":
+        argmap.register_config_args(clean_parser, experiment.Config)
+
+    namespace = parser.parse_args(raw_argv)
     configure_cli_logging(namespace.verbose)
 
     if namespace.command == "list":
@@ -225,46 +256,32 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
         _print_plan(experiment, target=namespace.target, mermaid=namespace.mermaid, dot=namespace.dot)
         return 0
 
-    config_value_options, config_flags = _config_option_sets(experiment.Config)
-    target = _target_from_args(
-        command_args,
-        known_value_options={"--only", "-s", "--downstream", "--config"} | config_value_options,
-        known_flags={"--force", "-f", "--dry", "--yes", "-y"} | config_flags,
-    )
-    if namespace.command == "run":
-        only = _extract_option(command_args, {"--only", "-s"})
-        downstream = _extract_option(command_args, {"--downstream"})
-        force = _has_flag(command_args, {"--force", "-f"})
-        dry = _has_flag(command_args, {"--dry"})
-    else:
-        only = None
-        downstream = None
-        force = False
-        dry = False
-    if namespace.command == "clean":
-        yes = _has_flag(command_args, {"--yes", "-y"})
-    else:
-        yes = False
-    config_path = _extract_option(command_args, {"--config"})
-
+    cli_overrides = argmap.collect_cli_config_namespace(namespace, experiment.Config)
     config = _config_from_args(
         experiment.Config,
-        argv=raw_argv or [],
-        yaml_file=Path(config_path) if config_path else None,
+        init_kwargs=cli_overrides,
+        yaml_file=namespace.config,
     )
     if namespace.command == "status":
-        _print_status(experiment, config, target)
+        _print_status(experiment, config, namespace.target)
     elif namespace.command == "clean":
-        clean(experiment, config, target=target, yes=yes)
+        clean(
+            experiment,
+            config,
+            target=namespace.target,
+            yes=namespace.yes,
+            allowed_roots=experiment.clean_roots(config),
+            confirm=_default_confirm,
+        )
     elif namespace.command == "run":
         outcomes = run(
             experiment,
             config,
-            target=target,
-            only=only,
-            downstream=downstream,
-            force=force,
-            dry=dry,
+            target=namespace.target,
+            only=namespace.only,
+            downstream=namespace.downstream,
+            force=namespace.force,
+            dry=namespace.dry,
         )
         for outcome in outcomes:
             print(f"{outcome.stage}\t{outcome.status}\t{outcome.reason}")

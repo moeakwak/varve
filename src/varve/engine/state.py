@@ -16,7 +16,7 @@ Status = Literal[
     "no-cache",
     "resume",
     "unrecoverable",
-    "corrupt-ledger",
+    "corrupt-store",
 ]
 
 
@@ -60,6 +60,7 @@ def decide_batch(
     current_components: KeyComponents,
     current_partition: dict,
     run_key: str,
+    partial_run_key: str | None,
     success: SuccessRecord | None,
     partial: tuple[PartialMeta, dict[int, BatchRecord]] | None,
     attempt: AttemptMarker | None,
@@ -89,23 +90,15 @@ def decide_batch(
     if partial is None:
         return Decision("no-cache", "no cache")
 
-    meta, batches = partial
-    expected_run_key = run_key
-    actual_run_key = run_key_from_partial(meta)
-    if actual_run_key != expected_run_key:
+    if partial_run_key != run_key:
         return Decision("no-cache", "no cache")
+    _meta, batches = partial
     skip = {
         index
         for index, batch in batches.items()
         if all(output_exists(path) for path in batch.yielded)
     }
     return Decision("resume", "resume", frozenset(skip))
-
-
-def run_key_from_partial(meta: PartialMeta) -> str:
-    from varve.keys import run_key
-
-    return run_key(meta.content_key, meta.partition_values)
 
 
 def invalidation_reason(old: KeyComponents, new: KeyComponents) -> str:

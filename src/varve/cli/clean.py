@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from varve.experiment import Experiment
-from varve.ledger import Ledger
-from varve.lock import OutputLock
 from varve.models import Manifest
+from varve.store.lock import OutputLock
+from varve.store.store import Store
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -40,8 +40,8 @@ def _confirm(message: str, yes: bool, confirm: Callable[[str], bool] | None) -> 
     raise ValueError("Clean requires confirmation or yes=True")
 
 
-def _read_manifest_anchor(ledger: Ledger, experiment: type[Experiment]) -> Manifest:
-    manifest_path = ledger.root / "manifest.json"
+def _read_manifest_anchor(store: Store, experiment: type[Experiment]) -> Manifest:
+    manifest_path = store.root / "manifest.json"
     if not manifest_path.exists():
         raise ValueError(f"Missing varve manifest anchor: {manifest_path}")
     manifest = Manifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
@@ -77,10 +77,10 @@ def _record_paths(record) -> list[str]:
     return [item.path for item in record.outputs]
 
 
-def _collect_target_records(ledger: Ledger, stages: set[str]) -> dict[str, Any]:
+def _collect_target_records(store: Store, stages: set[str]) -> dict[str, Any]:
     records = {}
     for stage_name in stages:
-        record = ledger.read_success(stage_name)
+        record = store.read_success(stage_name)
         if record is not None:
             records[stage_name] = record
     return records
@@ -108,9 +108,9 @@ def clean(
     confirm: Callable[[str], bool] | None = None,
 ) -> None:
     root = experiment.output_root(config)
-    ledger = Ledger(root)
-    with OutputLock(ledger.root):
-        _read_manifest_anchor(ledger, experiment)
+    store = Store(root)
+    with OutputLock(store.root):
+        _read_manifest_anchor(store, experiment)
 
         if target is None:
             _validate_destructive(root, allowed_roots)
@@ -121,7 +121,7 @@ def clean(
         if target not in experiment.stages():
             raise ValueError(f"Unknown varve stage: {target}")
         stage_names = _downstream_closure(experiment, target)
-        records = _collect_target_records(ledger, stage_names)
+        records = _collect_target_records(store, stage_names)
         _validate_record_paths(root, records)
         _confirm(f"Clean varve stage subtree {target}?", yes, confirm)
 
@@ -133,6 +133,6 @@ def clean(
                 else:
                     path.unlink(missing_ok=True)
         for stage_name in stage_names:
-            (ledger.root / "stages" / f"{stage_name}.json").unlink(missing_ok=True)
-            ledger.clear_attempt(stage_name)
-            ledger.clear_partial(stage_name)
+            (store.root / "stages" / f"{stage_name}.json").unlink(missing_ok=True)
+            store.clear_attempt(stage_name)
+            store.clear_partial(stage_name)

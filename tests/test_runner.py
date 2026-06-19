@@ -7,8 +7,9 @@ import pytest
 from pydantic import BaseModel
 
 from varve import Experiment, KeySpec, batch_stage, stage
-from varve.ledger import Ledger
-from varve.runner import run, selected_stages
+from varve.engine.runner import run, selected_stages
+from varve.models import BatchRecord, PartialMeta
+from varve.store.store import Store
 
 
 class Config(BaseModel):
@@ -78,7 +79,7 @@ def test_runner_hit_stale_and_artifact_missing(tmp_path: Path) -> None:
     assert repaired[-1].status == "artifact-missing"
 
 
-def test_runner_dry_does_not_initialize_ledger(tmp_path: Path) -> None:
+def test_runner_dry_does_not_initialize_store(tmp_path: Path) -> None:
     outcomes = run(ToyExperiment, Config(out=tmp_path), dry=True)
     assert [outcome.status for outcome in outcomes] == ["no-cache", "no-cache", "no-cache"]
     assert not (tmp_path / ".varve").exists()
@@ -98,7 +99,7 @@ def test_batch_resume_after_failure(tmp_path: Path) -> None:
     assert resumed[-1].status == "resume"
     assert len(list((tmp_path / "transform").glob("part-*.txt"))) == 4
 
-    record = Ledger(tmp_path).read_success("transform")
+    record = Store(tmp_path).read_success("transform")
     assert record is not None
     assert record.outputs is not None
     assert [output.index for output in record.outputs] == [0, 1, 2, 3]
@@ -108,12 +109,93 @@ def test_batch_resume_after_failure(tmp_path: Path) -> None:
     assert (tmp_path / "summary.txt").read_text(encoding="utf-8") == "0:a,1:a,2:a,3:a"
 
 
+def test_no_cache_batch_ignores_mismatched_partial_outputs(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="planned failure"):
+        run(ToyExperiment, Config(out=tmp_path, fail_after=0), target="transform")
+
+    partial_root = tmp_path / ".varve" / "partial" / "transform"
+    current_run_key = next(path.name for path in partial_root.iterdir())
+    stale_output = tmp_path / "stale.txt"
+    stale_output.write_text("stale", encoding="utf-8")
+
+    store = Store(tmp_path)
+    store.write_partial_meta(
+        "transform",
+        current_run_key,
+        PartialMeta(
+            content_key="sha256:mismatch",
+            partition_values={"batch_size": 999},
+            started_at="old",
+        ),
+    )
+    store.write_batch(
+        "transform",
+        current_run_key,
+        BatchRecord(index=99, yielded=["stale.txt"], committed_at="old"),
+    )
+
+    rerun = run(ToyExperiment, Config(out=tmp_path), target="transform")
+    assert rerun[-1].status == "no-cache"
+
+    record = Store(tmp_path).read_success("transform")
+    assert record is not None
+    assert record.outputs is not None
+    assert [(output.index, output.path) for output in record.outputs] == [
+        (0, "transform/part-0.txt"),
+        (1, "transform/part-1.txt"),
+        (2, "transform/part-2.txt"),
+        (3, "transform/part-3.txt"),
+    ]
+
+
+def test_no_cache_failure_does_not_resume_mismatched_partial_outputs(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="planned failure"):
+        run(ToyExperiment, Config(out=tmp_path, fail_after=0), target="transform")
+
+    partial_root = tmp_path / ".varve" / "partial" / "transform"
+    current_run_key = next(path.name for path in partial_root.iterdir())
+    stale_output = tmp_path / "stale.txt"
+    stale_output.write_text("stale", encoding="utf-8")
+
+    store = Store(tmp_path)
+    store.write_partial_meta(
+        "transform",
+        current_run_key,
+        PartialMeta(
+            content_key="sha256:mismatch",
+            partition_values={"batch_size": 999},
+            started_at="old",
+        ),
+    )
+    store.write_batch(
+        "transform",
+        current_run_key,
+        BatchRecord(index=99, yielded=["stale.txt"], committed_at="old"),
+    )
+
+    with pytest.raises(RuntimeError, match="planned failure"):
+        run(ToyExperiment, Config(out=tmp_path, fail_after=0), target="transform")
+
+    resumed = run(ToyExperiment, Config(out=tmp_path), target="transform")
+    assert resumed[-1].status == "resume"
+
+    record = Store(tmp_path).read_success("transform")
+    assert record is not None
+    assert record.outputs is not None
+    assert [(output.index, output.path) for output in record.outputs] == [
+        (0, "transform/part-0.txt"),
+        (1, "transform/part-1.txt"),
+        (2, "transform/part-2.txt"),
+        (3, "transform/part-3.txt"),
+    ]
+
+
 def test_completed_batch_artifact_missing_and_unrecoverable(tmp_path: Path) -> None:
     run(ToyExperiment, Config(out=tmp_path), target="transform")
     (tmp_path / "transform" / "part-1.txt").unlink()
     repaired = run(ToyExperiment, Config(out=tmp_path), target="transform")
     assert repaired[-1].status == "artifact-missing"
-    record = Ledger(tmp_path).read_success("transform")
+    record = Store(tmp_path).read_success("transform")
     assert record is not None
     assert record.outputs is not None
     assert [output.index for output in record.outputs] == [0, 1, 2, 3]
@@ -129,7 +211,7 @@ def test_force_reruns_all_batch_items_after_partial(tmp_path: Path) -> None:
     forced = run(ToyExperiment, Config(out=tmp_path), target="transform", force=True)
     assert forced[-1].reason == "forced"
     assert len(list((tmp_path / "transform").glob("part-*.txt"))) == 4
-    record = Ledger(tmp_path).read_success("transform")
+    record = Store(tmp_path).read_success("transform")
     assert record is not None
     assert record.outputs is not None
     assert [output.index for output in record.outputs] == [0, 1, 2, 3]
@@ -146,7 +228,7 @@ def test_batch_multi_output_index_requires_all_paths(tmp_path: Path) -> None:
     assert repaired[-1].status == "artifact-missing"
     assert (tmp_path / "1-right.txt").exists()
 
-    record = Ledger(tmp_path).read_success("split")
+    record = Store(tmp_path).read_success("split")
     assert record is not None
     assert record.outputs is not None
     assert [(output.index, output.path) for output in record.outputs] == [
@@ -198,7 +280,7 @@ def test_hit_refreshes_touched_but_unchanged_file_fingerprint(tmp_path: Path) ->
 
 
 def _cached_src_mtime(out: Path) -> float:
-    record = Ledger(out).read_success("copy")
+    record = Store(out).read_success("copy")
     assert record is not None
     return record.key_components.files["src"][0].mtime
 

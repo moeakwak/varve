@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Callable, Mapping
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
-from varve.astkey import source_hash
-from varve.decorators import StageSpec
-from varve.fingerprint import files_fingerprints, json_sha256
-from varve.keyspec import JSON
+from varve.keying.astkey import source_hash
+from varve.keying.fingerprint import files_fingerprints, json_sha256
+from varve.keyspec import JSON, KeySpec
 from varve.models import FileFingerprint, KeyComponents
+
+
+class StageSpecLike(Protocol):
+    func: Callable[..., Any]
+    uses: tuple[Callable[..., Any], ...]
+    keyspec: KeySpec
+    needs: tuple[str, ...]
 
 
 def _config_data(config: Any) -> dict[str, Any]:
@@ -33,7 +39,7 @@ def _pick_config_values(config: Any, fields: tuple[str, ...]) -> dict[str, JSON]
 
 
 def compute_key_components(
-    stage_spec: StageSpec,
+    stage_spec: StageSpecLike,
     ctx: Any,
     upstream_keys: Mapping[str, str],
     cached_files: Mapping[str, list[FileFingerprint]] | None = None,

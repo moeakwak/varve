@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from varve.astkey import _normalized_source_hash, source_hash
+from varve.keying.astkey import _normalized_source_hash, source_hash
 
 
 def same_logic(x: int) -> int:
