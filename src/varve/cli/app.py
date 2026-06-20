@@ -6,9 +6,10 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, ValidationError, create_model
 from pydantic_settings import BaseSettings, SettingsConfigDict, YamlConfigSettingsSource
 
 from varve.cli import argmap
@@ -77,6 +78,28 @@ def _config_from_args(
     settings_type = _settings_type(config_type, yaml_file)
     settings = settings_type(**init_kwargs)
     return config_type.model_validate(settings.model_dump())
+
+
+def _clean_config_from_args(
+    config_type: type[BaseModel],
+    *,
+    init_kwargs: dict[str, Any],
+    yaml_file: Path | None,
+) -> Any:
+    """Build a config for clean, tolerating a bare output root.
+
+    clean only needs the output root to locate the store, so when the full
+    Config cannot be built (required fields missing) we fall back to a minimal
+    object carrying just the output root provided on the CLI.
+    """
+    try:
+        return _config_from_args(config_type, init_kwargs=init_kwargs, yaml_file=yaml_file)
+    except ValidationError:
+        out = init_kwargs.get("output_root") or init_kwargs.get("out")
+        if out is None:
+            raise
+        out_path = Path(out)
+        return SimpleNamespace(out=out_path, output_root=out_path)
 
 
 def _print_list(experiment: type[Experiment]) -> None:
@@ -177,6 +200,9 @@ def _has_unknown_option_before_config_registration(
 ) -> bool:
     option_arities = argmap.config_option_arities(config_type)
     option_arities.update(_COMMAND_OPTION_ARITIES[command])
+    # Let argparse handle help instead of failing the strict precheck.
+    option_arities.setdefault("--help", 0)
+    option_arities.setdefault("-h", 0)
 
     index = 0
     while index < len(command_args):
@@ -257,11 +283,18 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
         return 0
 
     cli_overrides = argmap.collect_cli_config_namespace(namespace, experiment.Config)
-    config = _config_from_args(
-        experiment.Config,
-        init_kwargs=cli_overrides,
-        yaml_file=namespace.config,
-    )
+    if namespace.command == "clean":
+        config = _clean_config_from_args(
+            experiment.Config,
+            init_kwargs=cli_overrides,
+            yaml_file=namespace.config,
+        )
+    else:
+        config = _config_from_args(
+            experiment.Config,
+            init_kwargs=cli_overrides,
+            yaml_file=namespace.config,
+        )
     if namespace.command == "status":
         _print_status(experiment, config, namespace.target)
     elif namespace.command == "clean":

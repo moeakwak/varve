@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from pydantic import BaseModel, Field
@@ -357,3 +359,109 @@ def test_cli_priority_cli_gt_env_gt_dotenv_gt_yaml_gt_default(
     assert config.inner.name == "from-dotenv"
     assert config.items == [4, 5]
     assert config.enabled is True
+
+
+class Engine(str, Enum):
+    mathjax = "mathjax"
+    katex = "katex"
+
+
+class ChoiceConfig(BaseModel):
+    out: Path
+    mode: Literal["fast", "slow"] = "fast"
+    engine: Engine = Engine.mathjax
+    sample: int | None = 5
+
+
+class ChoiceCliExperiment(Experiment):
+    Config = ChoiceConfig
+
+    @stage(produces="sample.txt", key=["mode", "engine", "sample"])
+    def sample(self, ctx):
+        (ctx.out / "sample.txt").write_text(ctx.config.mode, encoding="utf-8")
+
+
+class RequiredExtraConfig(BaseModel):
+    out: Path
+    dataset: str
+
+
+class RequiredExtraCliExperiment(Experiment):
+    Config = RequiredExtraConfig
+
+    @stage(produces="sample.txt", key=["dataset"])
+    def sample(self, ctx):
+        (ctx.out / "sample.txt").write_text(ctx.config.dataset, encoding="utf-8")
+
+
+def _capture_run(monkeypatch: pytest.MonkeyPatch) -> list:
+    captured: list = []
+
+    def fake_run(experiment, config, **kwargs):
+        captured.append(config)
+        return []
+
+    monkeypatch.setattr("varve.cli.app.run", fake_run)
+    return captured
+
+
+def test_cli_literal_field_accepts_valid_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _capture_run(monkeypatch)
+    assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--mode", "slow"]) == 0
+    assert captured[-1].mode == "slow"
+
+
+def test_cli_literal_field_rejects_invalid_choice(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--mode", "bogus"])
+    assert exc_info.value.code != 0
+
+
+def test_cli_str_enum_field_accepts_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _capture_run(monkeypatch)
+    assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--engine", "katex"]) == 0
+    assert captured[-1].engine is Engine.katex
+
+
+def test_cli_str_enum_field_rejects_invalid_value(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--engine", "bogus"])
+    assert exc_info.value.code != 0
+
+
+def test_cli_optional_field_accepts_null_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _capture_run(monkeypatch)
+    assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--sample", "null"]) == 0
+    assert captured[-1].sample is None
+
+
+def test_cli_optional_field_accepts_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _capture_run(monkeypatch)
+    assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--sample", "9"]) == 0
+    assert captured[-1].sample == 9
+
+
+@pytest.mark.parametrize("command", ["run", "status", "clean"])
+def test_cli_help_is_handled_by_argparse(command: str, capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        ChoiceCliExperiment.cli([command, "--help"])
+    assert exc_info.value.code == 0
+    assert "--mode" in capsys.readouterr().out
+
+
+def test_cli_clean_with_bare_output_root_skips_required_fields(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    assert RequiredExtraCliExperiment.cli(["run", f"--out={out}", "--dataset", "alpha"]) == 0
+    assert (out / "sample.txt").exists()
+
+    # clean only needs the output root, not the unrelated required `dataset` field.
+    assert RequiredExtraCliExperiment.cli(["clean", f"--out={out}", "--yes"]) == 0
+    assert not out.exists()
