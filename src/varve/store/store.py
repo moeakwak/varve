@@ -35,7 +35,7 @@ def _atomic_write_json(path: Path, model: VarveModel) -> None:
     os.replace(tmp, path)
 
 
-def _read_model[ModelT: VarveModel](path: Path, model_type: type[ModelT]) -> ModelT | None:
+def _read_model(path: Path, model_type: type[ModelT]) -> ModelT | None:
     if not path.exists():
         return None
     try:
