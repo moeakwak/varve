@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -18,8 +17,17 @@ def test_output_lock_excludes_other_writers(tmp_path: Path) -> None:
         pass
 
 
-def test_stale_lock_detection(tmp_path: Path) -> None:
+def test_unlocked_existing_marker_is_stale(tmp_path: Path) -> None:
     varve_root = tmp_path / ".varve"
     varve_root.mkdir()
-    (varve_root / "lock").write_text(str(os.getpid() + 10_000_000), encoding="utf-8")
+    (varve_root / "lock").write_text("locked\n", encoding="utf-8")
     assert is_stale_lock(varve_root)
+
+
+def test_existing_lock_file_without_file_lock_is_reused(tmp_path: Path) -> None:
+    varve_root = tmp_path / ".varve"
+    varve_root.mkdir()
+    (varve_root / "lock").write_text("legacy marker\n", encoding="utf-8")
+
+    with OutputLock(varve_root):
+        pass

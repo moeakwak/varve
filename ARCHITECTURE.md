@@ -119,7 +119,7 @@ The store lives at:
 <output_root>/.varve/
 ├── manifest.json
 ├── .gitignore
-├── lock
+├── lock                 # OS file-lock marker for the active writer.
 ├── stages/<stage>.json
 ├── attempts/<stage>.json
 └── partial/<stage>/<run_key>/
@@ -135,6 +135,10 @@ The store lives at:
   partition.
 
 There is no append-only history.
+
+Recorded artifact paths are output-root-relative. Static `@stage(produces=...)` declarations are
+resolved against `ctx.out`. Batch stages may yield absolute paths under `ctx.out` or paths already
+relative to `ctx.out`; relative batch paths are not current-working-directory-relative.
 
 ### Keys
 

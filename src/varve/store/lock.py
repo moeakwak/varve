@@ -2,29 +2,43 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
 from pathlib import Path
 
 
-def _pid_alive(pid: int) -> bool:
+def _lock_payload() -> bytes:
+    return b"locked\n"
+
+
+def _try_file_lock(fd: int) -> bool:
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EAGAIN):
+            return False
+        raise
     return True
+
+
+def _unlock_file(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 def is_stale_lock(varve_root: Path) -> bool:
     path = varve_root / "lock"
-    if not path.exists():
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except FileNotFoundError:
         return False
     try:
-        pid = int(path.read_text(encoding="utf-8").strip())
-    except ValueError:
+        if not _try_file_lock(fd):
+            return False
+        _unlock_file(fd)
         return True
-    return not _pid_alive(pid)
+    finally:
+        os.close(fd)
 
 
 class OutputLock:
@@ -35,20 +49,35 @@ class OutputLock:
 
     def __enter__(self) -> OutputLock:
         self.varve_root.mkdir(parents=True, exist_ok=True)
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        if not _try_file_lock(self._fd):
+            os.close(self._fd)
+            self._fd = None
+            raise RuntimeError(f"Varve output root is already locked: {self.path}")
         try:
-            self._fd = os.open(self.path, flags)
-        except FileExistsError as error:
-            if is_stale_lock(self.varve_root):
-                self.path.unlink(missing_ok=True)
-                self._fd = os.open(self.path, flags)
-            else:
-                raise RuntimeError(f"Varve output root is already locked: {self.path}") from error
-        os.write(self._fd, str(os.getpid()).encode("utf-8"))
+            os.ftruncate(self._fd, 0)
+            os.write(self._fd, _lock_payload())
+        except Exception:
+            _unlock_file(self._fd)
+            os.close(self._fd)
+            self._fd = None
+            raise
         return self
 
     def __exit__(self, *exc) -> None:
         if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
-        self.path.unlink(missing_ok=True)
+            try:
+                stat = os.fstat(self._fd)
+                try:
+                    path_stat = self.path.stat()
+                except FileNotFoundError:
+                    path_stat = None
+                if path_stat is not None and (
+                    path_stat.st_dev,
+                    path_stat.st_ino,
+                ) == (stat.st_dev, stat.st_ino):
+                    self.path.unlink()
+            finally:
+                _unlock_file(self._fd)
+                os.close(self._fd)
+                self._fd = None

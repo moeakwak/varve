@@ -32,7 +32,9 @@ class ToyExperiment(Experiment):
         async for index, item in ctx.resume(items):
             path = ctx.out / "transform" / f"part-{index}.txt"
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"{item}:{ctx.input('sample').read_text(encoding='utf-8')}", encoding="utf-8")
+            path.write_text(
+                f"{item}:{ctx.input('sample').read_text(encoding='utf-8')}", encoding="utf-8"
+            )
             yield path
             if ctx.config.fail_after is not None and index >= ctx.config.fail_after:
                 raise RuntimeError("planned failure")
@@ -56,6 +58,18 @@ class MultiOutputBatchExperiment(Experiment):
             left.write_text(f"{item}:left", encoding="utf-8")
             right.write_text(f"{item}:right", encoding="utf-8")
             yield [left, right]
+
+
+class CwdRelativeBatchExperiment(Experiment):
+    Config = Config
+
+    @batch_stage(partition_key=["batch_size"])
+    async def transform(self, ctx):
+        async for index, _item in ctx.resume(["zero"]):
+            path = ctx.out / "transform" / f"part-{index}.txt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("payload", encoding="utf-8")
+            yield path
 
 
 def test_selected_stages() -> None:
@@ -237,6 +251,15 @@ def test_batch_multi_output_index_requires_all_paths(tmp_path: Path) -> None:
         (1, "1-left.txt"),
         (1, "1-right.txt"),
     ]
+
+
+def test_batch_rejects_cwd_relative_output_with_actionable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="relative to the output root"):
+        run(CwdRelativeBatchExperiment, Config(out=Path("out")))
 
 
 class FileKeyConfig(BaseModel):

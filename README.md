@@ -32,6 +32,15 @@ Commands:
 - `list`: list declared stages.
 - `clean [TARGET] --yes`: remove store records and artifacts.
 
+## Output paths
+
+Stage outputs are anchored at the experiment output root (`ctx.out`). Static
+`@stage(produces=...)` entries are interpreted relative to `ctx.out`.
+
+Batch stages record the paths they yield. Yield either an absolute path under
+`ctx.out`, or a path relative to `ctx.out`. Relative batch output paths are not
+interpreted relative to the current working directory.
+
 ## Configuration sources
 
 `run`, `status`, and `clean` build an experiment `Config` from multiple sources, in priority order:

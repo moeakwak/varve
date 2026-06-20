@@ -123,3 +123,40 @@ from varve import Ctx, Experiment, JSON, KeySpec, StageSpec, batch_stage, stage
 
 When changing signatures used by experiment authors, update README and architecture docs in the
 same change.
+
+## Commit Messages
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
+`<type>(<scope>)<!>: <subject>`.
+
+### Types
+
+- `feat` — a user-facing feature or behavior change.
+- `fix` — a bug fix.
+- `perf` — a performance improvement.
+- `docs`, `chore`, `ci`, `test`, `style`, `refactor`, `build`, `revert` — supporting changes.
+
+Append `!` after the type/scope to mark a breaking change, e.g. `feat(cli)!: ...`. Because
+`varve` keeps a small public surface, treat any change to the public API or persisted store
+schema as breaking.
+
+### Scopes
+
+Prefer an existing scope naming the affected area: `keying`, `store`, `engine`, `cli`,
+`experiment`, `models`. Omit the scope only when a change genuinely spans multiple areas.
+
+### Subject
+
+Keep the subject short, imperative, and lower-case after the type/scope prefix. Use backticks
+around code identifiers — commands, types, methods — in the subject:
+
+```bash
+git commit -m 'feat(cli): support `Literal`/`Enum` choices'
+git commit -m 'fix(store): guard batch `produces` against missing output root'
+git commit -m 'refactor(engine)!: rename `ledger` to `store`'
+```
+
+### Body
+
+For large commits with several important changes, add a body after a blank line, formatted as a
+Markdown unordered list with one bullet per important change.

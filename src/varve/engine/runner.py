@@ -52,6 +52,22 @@ def _relative_to_out(path: Path, out: Path) -> str:
         ) from error
 
 
+def _cwd_relative_path_hint(path: Path, out: Path) -> str | None:
+    if path.is_absolute() or not path.exists():
+        return None
+    resolved = path.resolve()
+    out_resolved = out.resolve()
+    try:
+        out_relative = resolved.relative_to(out_resolved)
+    except ValueError:
+        return None
+    return (
+        "Relative batch output paths are interpreted relative to the output root, "
+        f"not the current working directory: yielded {path!s}, which exists at {resolved}. "
+        f"Yield {out_relative!s} or {resolved!s} instead."
+    )
+
+
 def _refresh_fingerprint_cache(
     *,
     store: Store,
@@ -75,9 +91,7 @@ def _refresh_fingerprint_cache(
         return
     refreshed = previous.model_copy(
         update={
-            "key_components": previous.key_components.model_copy(
-                update={"files": components.files}
-            )
+            "key_components": previous.key_components.model_copy(update={"files": components.files})
         }
     )
     store.write_success(refreshed)
@@ -110,7 +124,9 @@ def _partition_values(stage_spec, config) -> dict[str, Any]:
     return {name: data[name] for name in stage_spec.partition_key}
 
 
-def _stage_sets(experiment_type: type[Experiment]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+def _stage_sets(
+    experiment_type: type[Experiment],
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     stages = experiment_type.stages()
     ancestors = {name: set(spec.needs) for name, spec in stages.items()}
     descendants = {name: set() for name in stages}
@@ -271,7 +287,9 @@ async def _drive(
     outcomes: list[StageOutcome] = []
     known_content_keys: dict[str, str] = {}
     logger = get_logger()
-    logger.info("plan: %s", " -> ".join(name for name in experiment_type.topo_order() if name in selected))
+    logger.info(
+        "plan: %s", " -> ".join(name for name in experiment_type.topo_order() if name in selected)
+    )
 
     for stage_name in experiment_type.topo_order():
         if stage_name not in selected:
@@ -342,7 +360,12 @@ async def _drive(
                 components=components,
             )
         if dry or decision.status == "hit":
-            logger.info("[%s] %s%s", stage_name, decision.status, f" · {decision.reason}" if decision.reason != decision.status else "")
+            logger.info(
+                "[%s] %s%s",
+                stage_name,
+                decision.status,
+                f" · {decision.reason}" if decision.reason != decision.status else "",
+            )
             logger.debug("[%s] content_key %s", stage_name, current_key)
             outcomes.append(StageOutcome(stage_name, decision.status, decision.reason, None))
             continue
@@ -400,6 +423,9 @@ async def _drive(
                 for path in index_paths:
                     absolute = path if path.is_absolute() else out / path
                     if not absolute.exists():
+                        hint = _cwd_relative_path_hint(path, out)
+                        if hint is not None:
+                            raise ValueError(hint)
                         raise FileNotFoundError(f"Yielded varve output does not exist: {absolute}")
                     yielded.append(_relative_to_out(absolute, out))
                 store.write_batch(
@@ -428,9 +454,7 @@ async def _drive(
         store.clear_attempt(stage_name)
         elapsed = time.monotonic() - started
         logger.info("[%s] done · %.2fs", stage_name, elapsed)
-        outcomes.append(
-            StageOutcome(stage_name, decision.status, decision.reason, elapsed)
-        )
+        outcomes.append(StageOutcome(stage_name, decision.status, decision.reason, elapsed))
     return outcomes
 
 
