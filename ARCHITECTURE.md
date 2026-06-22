@@ -140,6 +140,11 @@ Recorded artifact paths are output-root-relative. Static `@stage(produces=...)` 
 resolved against `ctx.out`. Batch stages may yield absolute paths under `ctx.out` or paths already
 relative to `ctx.out`; relative batch paths are not current-working-directory-relative.
 
+`Ctx.resume(iterable, progress=True, desc=..., unit=..., total=..., postfix=...)` keeps resume
+semantics unchanged while showing one `tqdm` progress bar for the whole resumed iterable. The bar
+is enabled by default and labeled with the stage name; skipped indexes seed its initial value, so
+resumed runs do not restart the displayed count from zero. Pass `progress=False` to disable it.
+
 ### Keys
 
 `content_key` hashes a canonical JSON view of:

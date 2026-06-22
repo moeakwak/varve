@@ -389,6 +389,18 @@ wheels = [
 ]
 
 [[package]]
+name = "tqdm"
+version = "4.68.3"
+source = { registry = "https://mirrors.pku.edu.cn/pypi/web/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://mirrors.pku.edu.cn/pypi/web/packages/87/d7/0535a28b1f5f24f6612fb3ff1e89fb1a8d160fee0f976e0aa6803862134b/tqdm-4.68.3.tar.gz", hash = "sha256:00dfa48452b6b6cfae3dd9885636c23d3422d1ec97c66d96818cbd5e0821d482" }
+wheels = [
+    { url = "https://mirrors.pku.edu.cn/pypi/web/packages/d8/8e/bb97bb0c71802080bfc8952937d174e49cfc50de5c951dd47b2496f0dcdb/tqdm-4.68.3-py3-none-any.whl", hash = "sha256:39832cc2def2789a6f29df83f172db7416cea70052c0907a57801c5f2fdccb03" },
+]
+
+[[package]]
 name = "typing-extensions"
 version = "4.15.0"
 source = { registry = "https://mirrors.pku.edu.cn/pypi/web/simple" }
@@ -416,6 +428,7 @@ source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings", extra = ["yaml"] },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -430,5 +443,6 @@ requires-dist = [
     { name = "pydantic-settings", extras = ["yaml"], specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
+    { name = "tqdm", specifier = ">=4.66.0" },
 ]
 provides-extras = ["dev"]

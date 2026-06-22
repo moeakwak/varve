@@ -383,7 +383,13 @@ async def _drive(
                 touched_existing=previous is not None,
             ),
         )
-        ctx = Ctx(config=config, out=out, store=store, resume_skip=decision.resume_skip)
+        ctx = Ctx(
+            config=config,
+            out=out,
+            store=store,
+            resume_skip=decision.resume_skip,
+            stage_name=stage_name,
+        )
         if stage_spec.kind == "single":
             await _execute_stage(instance, stage_spec, ctx)
             produces = _produced_paths(stage_spec.produces, ctx)

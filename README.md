@@ -41,6 +41,20 @@ Batch stages record the paths they yield. Yield either an absolute path under
 `ctx.out`, or a path relative to `ctx.out`. Relative batch output paths are not
 interpreted relative to the current working directory.
 
+Batch stages get one overall `tqdm` progress bar for the resumed iterable by
+default. The bar is labeled with the stage name and seeds its initial count
+from already-completed indexes, so resumed runs do not restart from zero:
+
+```python
+async for index, item in ctx.resume(items):
+    ...
+```
+
+Pass `progress=False` to disable the bar, `desc=...` to override the label,
+`unit=...` to change the counted noun, `total=...` when the iterable has no
+`len()`, and `postfix=lambda item: ...` to annotate the bar with per-item
+context.
+
 ## Configuration sources
 
 `run`, `status`, and `clean` build an experiment `Config` from multiple sources, in priority order:
