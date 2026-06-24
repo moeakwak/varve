@@ -35,6 +35,21 @@ Commands:
 - `list`: list declared stages.
 - `clean [TARGET] [--out PATH] --yes`: remove store records and artifacts.
 
+Top-level dashboard:
+
+- `varve ls [--root DIR]`: scan a directory tree for varve stores and print an overview.
+- `varve show <experiment_id> [--root DIR]`: print one discovered store's stage details and
+  recorded dependency edges.
+
+The dashboard is read-only and never imports experiment modules. It discovers experiments by
+looking for `.varve/manifest.json` under the scan root. The `experiment_id` is the output root's
+path relative to the scan root with path separators replaced by dots, such as
+`analysis.transform_phases.rewrite_reach`; it is not a Python import path.
+
+Dashboard status is a store snapshot, not a dry-run cache decision. It only includes stages that
+have records in the store, and it does not recompute content keys, so it cannot report that source
+or key inputs changed after the last run.
+
 ## Output paths
 
 Stage outputs are anchored at the experiment output root (`ctx.out`). Static

@@ -7,8 +7,12 @@ requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0.0",
     "pydantic-settings[yaml]>=2.0.0",
+    "rich>=13.0.0",
     "tqdm>=4.66.0",
 ]
+
+[project.scripts]
+varve = "varve.dashboard.cli:main"
 
 [project.optional-dependencies]
 dev = [

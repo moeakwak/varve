@@ -35,6 +35,11 @@ src/varve/
 ├── engine/
 │   ├── state.py         # Pure cache-state decision functions.
 │   └── runner.py        # Stage selection, key computation, execution, and store writes.
+├── dashboard/
+│   ├── discovery.py     # Zero-import store discovery under a scan root.
+│   ├── state.py         # Read-only store snapshot loading and DAG reconstruction.
+│   ├── render.py        # Rich overview and detail rendering.
+│   └── cli.py           # Top-level varve ls/show entry point.
 └── cli/
     ├── app.py           # argparse CLI and pydantic-settings Config construction.
     ├── argmap.py        # Config model to CLI flag mapping.
@@ -55,6 +60,7 @@ flowchart TD
   store["src/varve/store"]
   state["src/varve/engine/state"]
   runner["src/varve/engine/runner"]
+  dashboard["src/varve/dashboard"]
   cli["src/varve/cli"]
 
   keying --> leaves
@@ -64,6 +70,8 @@ flowchart TD
   runner --> store
   runner --> state
   runner --> public
+  dashboard --> store
+  dashboard --> leaves
   cli --> runner
   cli --> store
   cli --> public
@@ -77,6 +85,8 @@ Rules:
   `engine.runner`, public-surface modules, or `cli`.
 - `keying` only depends on leaf top-level modules such as `models`, `log`, and `keyspec`.
 - `engine.runner` composes the lower layers and owns orchestration.
+- `dashboard` is a read-only top-level package. It may read `store` and persisted `models`, but
+  no lower layer imports `dashboard`, and `dashboard` must not depend on `engine.runner`.
 - `cli` is the top layer and may call runner, clean, store, and public-facing modules.
 - `Experiment.cli()` has the only controlled reverse edge. It lazily imports `varve.cli.app.main`
   inside the method body.
@@ -252,6 +262,34 @@ the experiment `Config`, and experiment Config models should not declare `out` o
 Unknown options are strict. Before dynamic config flags are registered, config commands pre-scan
 the selected command's arguments so unknown options or missing option values fail as parser errors
 instead of triggering config registration for the wrong command.
+
+## Dashboard
+
+The top-level `varve` console script provides a read-only dashboard over existing stores:
+
+- `varve ls [--root DIR]` discovers `.varve/manifest.json` files under the scan root and prints
+  an overview table.
+- `varve show <experiment_id> [--root DIR]` prints one store's stage details and dependency edges.
+
+Discovery is intentionally zero-import. The dashboard does not import experiment modules, build a
+`Config`, call runner, or perform dry-run cache decisions. It reads only the store under each
+output root, so the reported status is a latest snapshot of recorded stages:
+
+- `ok`: a success record exists and every recorded artifact path still exists.
+- `artifact-missing`: a success record exists but at least one recorded artifact is missing.
+- `interrupted`: an attempt marker exists, with or without an older success record.
+- `corrupt`: a stage store file is malformed, or the manifest could not provide an experiment
+  name.
+- `empty`: the manifest exists but no stage success or attempt records exist.
+
+Stage discovery uses the union of `.varve/stages/*.json` and `.varve/attempts/*.json`, so a stage
+that interrupted before its first success record is still visible. Single-stage artifacts are read
+from `SuccessRecord.produces`; batch artifacts are read from `SuccessRecord.outputs`.
+
+The detail view rebuilds dependency edges from `SuccessRecord.key_components.upstreams`. The
+topological order only includes stages present in the store, and edges are printed only when both
+endpoints are recorded. The dashboard cannot see stages that were declared but never run, and it
+does not recompute source fingerprints or content keys to detect stale source or key-input changes.
 
 ## Config Sources and Priority
 
