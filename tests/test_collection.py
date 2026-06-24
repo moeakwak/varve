@@ -29,7 +29,7 @@ def test_decorators_capture_stage_metadata() -> None:
 
 
 class DemoConfig(BaseModel):
-    out: Path
+    profile: str = "default"
 
 
 def test_experiment_collects_and_sorts_stages() -> None:
@@ -65,17 +65,35 @@ def test_output_root_default_resolution(tmp_path: Path) -> None:
     class Demo(Experiment):
         Config = DemoConfig
 
+        @classmethod
+        def default_output_root(cls, config: DemoConfig) -> Path:
+            return tmp_path / "default-out"
+
+        @classmethod
+        def resolve_output_root(cls, base: Path, config: DemoConfig) -> Path:
+            return base / config.profile
+
         @stage()
         def sample(self, ctx):  # pragma: no cover - metadata only
             return None
 
-    assert Demo.output_root(DemoConfig(out=tmp_path)) == tmp_path
+    assert Demo.default_output_root(DemoConfig()) == tmp_path / "default-out"
+    assert Demo.resolve_output_root(tmp_path / "base", DemoConfig(profile="resolved")) == (
+        tmp_path / "base" / "resolved"
+    )
+    assert Demo.output_root(DemoConfig(profile="canonical")) == (
+        tmp_path / "default-out" / "canonical"
+    )
+    assert Demo.output_root(DemoConfig(profile="cli"), cli_out=tmp_path / "cli-out") == (
+        tmp_path / "cli-out" / "cli"
+    )
 
-    class OutputRootConfig(BaseModel):
-        output_root: Path
+    class MissingDefault(Experiment):
+        Config = DemoConfig
 
-    assert Demo.output_root(OutputRootConfig(output_root=tmp_path)) == tmp_path
+        @stage()
+        def sample(self, ctx):  # pragma: no cover - metadata only
+            return None
 
-    with pytest.raises(ValueError, match="output_root"):
-        Demo.output_root(object())
-
+    with pytest.raises(NotImplementedError, match="must override default_output_root"):
+        MissingDefault.output_root(DemoConfig())

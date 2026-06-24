@@ -10,11 +10,15 @@ from varve.engine.runner import run
 
 
 class Config(BaseModel):
-    out: Path
+    pass
 
 
 class LogExperiment(Experiment):
     Config = Config
+
+    @classmethod
+    def default_output_root(cls, config: Config) -> Path:
+        return Path("varve-test-output")
 
     @stage(produces="sample.txt")
     def sample(self, ctx):
@@ -23,7 +27,7 @@ class LogExperiment(Experiment):
 
 def test_runner_emits_stage_level_logs(tmp_path: Path, caplog) -> None:
     caplog.set_level(logging.INFO, logger="varve")
-    run(LogExperiment, Config(out=tmp_path))
+    run(LogExperiment, Config(), cli_out=tmp_path)
     messages = [record.getMessage() for record in caplog.records]
     assert "plan: sample" in messages
     assert any("[sample] run · no cache" in message for message in messages)

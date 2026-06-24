@@ -14,11 +14,15 @@ from varve.store.store import Store
 
 
 class Config(BaseModel):
-    out: Path
+    pass
 
 
 class CleanExperiment(Experiment):
     Config = Config
+
+    @classmethod
+    def default_output_root(cls, config: Config) -> Path:
+        return Path("varve-test-output")
 
     @stage(produces="sample.txt")
     def sample(self, ctx):
@@ -32,7 +36,7 @@ class CleanExperiment(Experiment):
 class RestrictedCleanExperiment(CleanExperiment):
     @classmethod
     def clean_roots(cls, config: Config) -> list[Path] | None:
-        return [config.out.parent / "results"]
+        return [Path("/tmp/varve-allowed-results")]
 
 
 def test_validate_destructive_rejects_dangerous_paths(tmp_path: Path) -> None:
@@ -47,67 +51,67 @@ def test_validate_destructive_rejects_dangerous_paths(tmp_path: Path) -> None:
 
 def test_clean_requires_manifest_anchor(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Missing varve manifest"):
-        clean(CleanExperiment, Config(out=tmp_path), yes=True)
+        clean(CleanExperiment, Config(), cli_out=tmp_path, yes=True)
 
 
 def test_clean_full_output_root(tmp_path: Path) -> None:
-    run(CleanExperiment, Config(out=tmp_path))
-    clean(CleanExperiment, Config(out=tmp_path), yes=True, allowed_roots=[tmp_path.parent])
+    run(CleanExperiment, Config(), cli_out=tmp_path)
+    clean(CleanExperiment, Config(), cli_out=tmp_path, yes=True, allowed_roots=[tmp_path.parent])
     assert not tmp_path.exists()
 
 
 def test_clean_full_output_root_rejects_when_confirm_declines(tmp_path: Path) -> None:
     out = tmp_path / "out"
-    run(CleanExperiment, Config(out=out))
+    run(CleanExperiment, Config(), cli_out=out)
 
     def rejecting_confirm(message: str) -> bool:
         assert str(out) in message
         return False
 
     with pytest.raises(ValueError, match="requires confirmation"):
-        clean(CleanExperiment, Config(out=out), confirm=rejecting_confirm)
+        clean(CleanExperiment, Config(), cli_out=out, confirm=rejecting_confirm)
     assert out.exists()
 
 
 def test_clean_full_output_root_accepts_when_confirm_accepts(tmp_path: Path) -> None:
     out = tmp_path / "out"
-    run(CleanExperiment, Config(out=out))
+    run(CleanExperiment, Config(), cli_out=out)
 
     def accepting_confirm(message: str) -> bool:
         assert str(out) in message
         return True
 
-    clean(CleanExperiment, Config(out=out), confirm=accepting_confirm)
+    clean(CleanExperiment, Config(), cli_out=out, confirm=accepting_confirm)
     assert not out.exists()
 
 
 def test_clean_yes_skips_confirm_callback(tmp_path: Path) -> None:
     out = tmp_path / "out"
-    run(CleanExperiment, Config(out=out))
+    run(CleanExperiment, Config(), cli_out=out)
 
     def raising_confirm(message: str) -> bool:
         raise AssertionError(f"unexpected confirmation prompt: {message}")
 
-    clean(CleanExperiment, Config(out=out), yes=True, confirm=raising_confirm)
+    clean(CleanExperiment, Config(), cli_out=out, yes=True, confirm=raising_confirm)
     assert not out.exists()
 
 
 def test_clean_target_keeps_upstream(tmp_path: Path) -> None:
-    run(CleanExperiment, Config(out=tmp_path))
-    clean(CleanExperiment, Config(out=tmp_path), target="summarize", yes=True)
+    run(CleanExperiment, Config(), cli_out=tmp_path)
+    clean(CleanExperiment, Config(), cli_out=tmp_path, target="summarize", yes=True)
     assert (tmp_path / "sample.txt").exists()
     assert not (tmp_path / "summary.txt").exists()
 
 
 def test_clean_respects_output_lock(tmp_path: Path) -> None:
-    run(CleanExperiment, Config(out=tmp_path))
+    run(CleanExperiment, Config(), cli_out=tmp_path)
     with OutputLock(Store(tmp_path).root):
         with pytest.raises(RuntimeError, match="already locked"):
-            clean(CleanExperiment, Config(out=tmp_path), yes=True)
+            clean(CleanExperiment, Config(), cli_out=tmp_path, yes=True)
 
 
 def test_clean_target_preflights_external_outputs(tmp_path: Path) -> None:
-    run(CleanExperiment, Config(out=tmp_path))
+    run(CleanExperiment, Config(), cli_out=tmp_path)
     record = Store(tmp_path).read_success("summarize")
     assert record is not None
     assert record.produces is not None
@@ -115,17 +119,23 @@ def test_clean_target_preflights_external_outputs(tmp_path: Path) -> None:
     Store(tmp_path).write_success(record)
 
     with pytest.raises(ValueError, match="outside root"):
-        clean(CleanExperiment, Config(out=tmp_path), target="sample", yes=True)
+        clean(CleanExperiment, Config(), cli_out=tmp_path, target="sample", yes=True)
     assert (tmp_path / "sample.txt").exists()
 
 
 def test_default_clean_roots_does_not_restrict_full_clean(tmp_path: Path) -> None:
     out = tmp_path / "out"
-    config = Config(out=out)
-    run(CleanExperiment, config)
+    config = Config()
+    run(CleanExperiment, config, cli_out=out)
 
     assert CleanExperiment.clean_roots(config) is None
-    clean(CleanExperiment, config, yes=True, allowed_roots=CleanExperiment.clean_roots(config))
+    clean(
+        CleanExperiment,
+        config,
+        cli_out=out,
+        yes=True,
+        allowed_roots=CleanExperiment.clean_roots(config),
+    )
     assert not out.exists()
 
 

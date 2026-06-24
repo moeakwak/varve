@@ -18,7 +18,7 @@ class ArgmapInner(BaseModel):
 
 
 class ArgmapConfig(BaseModel):
-    out: Path
+    target: Path
     token: str = "abc"
     batch_size: int = 8
     enabled: bool = True
@@ -47,7 +47,7 @@ def test_register_and_collect_config_args(tmp_path: Path) -> None:
 
     namespace = parser.parse_args(
         [
-            "--out",
+            "--target",
             str(tmp_path),
             "--batch-size",
             "16",
@@ -64,7 +64,7 @@ def test_register_and_collect_config_args(tmp_path: Path) -> None:
     assert "inner.age" not in vars(namespace)
     assert "inner.name" not in vars(namespace)
     assert collect_cli_config_namespace(namespace, ArgmapConfig) == {
-        "out": str(tmp_path),
+        "target": str(tmp_path),
         "batch_size": "16",
         "enabled": True,
         "items": [1, 2],
@@ -103,7 +103,7 @@ def test_deep_merge_keeps_nested_fields_from_multiple_sources(
 ) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        f"out: {tmp_path / 'out'}\ninner:\n  name: from-yaml\n",
+        f"target: {tmp_path / 'out'}\ninner:\n  name: from-yaml\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("INNER__AGE", "99")
@@ -132,7 +132,7 @@ def test_priority_cli_gt_env_gt_dotenv_gt_yaml_gt_default(
     config_path.write_text(
         "\n".join(
             [
-                f"out: {tmp_path / 'out'}",
+                f"target: {tmp_path / 'out'}",
                 "token: from-yaml",
                 "env_value: from-yaml",
                 "dotenv_value: from-yaml",

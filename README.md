@@ -1,6 +1,6 @@
 # varve
 
-`varve` is a small Python library for serial experiment orchestration with a materialized, content-addressed cache. It is intentionally thin: experiments own their output paths and file formats, while varve owns the store that records which stage successfully produced which durable artifacts for a given content key.
+`varve` is a small Python library for serial experiment orchestration with a materialized, content-addressed cache. It is intentionally thin: experiments own their output formats and default output-root policy, while varve owns output-root resolution, `ctx.out`, and the store that records which stage successfully produced which durable artifacts for a given content key.
 
 For maintainers, see [ARCHITECTURE.md](ARCHITECTURE.md) for the current package layout and cache model, and [AGENTS.md](AGENTS.md) for development rules and dependency boundaries.
 
@@ -10,11 +10,14 @@ from pydantic import BaseModel
 from varve import Experiment, stage
 
 class Config(BaseModel):
-    out: Path
     seed: int = 1
 
 class Demo(Experiment):
     Config = Config
+
+    @classmethod
+    def default_output_root(cls, config: Config) -> Path:
+        return Path("result/demo")
 
     @stage(produces="sample.txt", key=["seed"])
     def sample(self, ctx):
@@ -26,16 +29,23 @@ if __name__ == "__main__":
 
 Commands:
 
-- `run [TARGET]`: run the selected stage set, using cached artifacts when valid.
-- `status [TARGET]`: show cache state without executing stages.
+- `run [TARGET] [--out PATH]`: run the selected stage set, using cached artifacts when valid.
+- `status [TARGET] [--out PATH]`: show cache state without executing stages.
 - `plan`: print the stage order or graph.
 - `list`: list declared stages.
-- `clean [TARGET] --yes`: remove store records and artifacts.
+- `clean [TARGET] [--out PATH] --yes`: remove store records and artifacts.
 
 ## Output paths
 
 Stage outputs are anchored at the experiment output root (`ctx.out`). Static
 `@stage(produces=...)` entries are interpreted relative to `ctx.out`.
+
+The output root is not a `Config` field. `run`, `status`, and `clean` resolve it
+by taking explicit `--out PATH` when provided, otherwise calling
+`Experiment.default_output_root(config)`, then passing the base path through
+`Experiment.resolve_output_root(base, config)`. Stage code should write through
+`ctx.out`; helper functions that create sidecars should receive `ctx.out` from
+their stage instead of reading an output path from `ctx.config`.
 
 Batch stages record the paths they yield. Yield either an absolute path under
 `ctx.out`, or a path relative to `ctx.out`. Relative batch output paths are not
@@ -65,7 +75,7 @@ CLI flag > env > dotenv (.env) > yaml (--config) > field default
 
 Nested environment variables use `__` as the delimiter, for example `INNER__NAME` for `inner.name`.
 
-The CLI is strict: unknown options fail instead of being ignored. Config flags are generated at runtime from the experiment `Config`, so varve keeps an `argparse` front-end rather than introducing typer or click.
+The CLI is strict: unknown options fail instead of being ignored. Config flags are generated at runtime from the experiment `Config`, while `--out` is a built-in command option owned by varve rather than a generated Config flag. This is why varve keeps an `argparse` front-end rather than introducing typer or click.
 
 ## Known limitations
 

@@ -30,9 +30,10 @@ _COMMAND_OPTION_ARITIES = {
         "-f": 0,
         "--dry": 0,
         "--config": 1,
+        "--out": 1,
     },
-    "status": {"--config": 1},
-    "clean": {"--yes": 0, "-y": 0, "--config": 1},
+    "status": {"--config": 1, "--out": 1},
+    "clean": {"--yes": 0, "-y": 0, "--config": 1, "--out": 1},
 }
 
 
@@ -85,21 +86,20 @@ def _clean_config_from_args(
     *,
     init_kwargs: dict[str, Any],
     yaml_file: Path | None,
+    cli_out: Path | None,
 ) -> Any:
-    """Build a config for clean, tolerating a bare output root.
+    """Build a config for clean, tolerating explicit `--out`.
 
-    clean only needs the output root to locate the store, so when the full
-    Config cannot be built (required fields missing) we fall back to a minimal
-    object carrying just the output root provided on the CLI.
+    When `--out` is provided, clean can locate the store even if unrelated
+    required business fields are missing. Without `--out`, clean must build the
+    full Config so the experiment can derive its default output root.
     """
     try:
         return _config_from_args(config_type, init_kwargs=init_kwargs, yaml_file=yaml_file)
     except ValidationError:
-        out = init_kwargs.get("output_root") or init_kwargs.get("out")
-        if out is None:
+        if cli_out is None:
             raise
-        out_path = Path(out)
-        return SimpleNamespace(out=out_path, output_root=out_path)
+        return SimpleNamespace()
 
 
 def _print_list(experiment: type[Experiment]) -> None:
@@ -145,8 +145,14 @@ def _print_plan(
     print(" -> ".join(name for name in experiment.topo_order() if name in selected))
 
 
-def _print_status(experiment: type[Experiment], config, target: str | None) -> None:
-    outcomes = run(experiment, config, target=target, dry=True)
+def _print_status(
+    experiment: type[Experiment],
+    config,
+    target: str | None,
+    *,
+    cli_out: Path | None,
+) -> None:
+    outcomes = run(experiment, config, target=target, dry=True, cli_out=cli_out)
     for outcome in outcomes:
         print(f"{outcome.stage}\t{outcome.status}\t{outcome.reason}")
 
@@ -239,15 +245,18 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
     run_parser.add_argument("--force", "-f", action="store_true")
     run_parser.add_argument("--dry", action="store_true")
     run_parser.add_argument("--config", type=Path)
+    run_parser.add_argument("--out", type=Path)
 
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("target", nargs="?")
     status_parser.add_argument("--config", type=Path)
+    status_parser.add_argument("--out", type=Path)
 
     clean_parser = subparsers.add_parser("clean")
     clean_parser.add_argument("target", nargs="?")
     clean_parser.add_argument("--yes", "-y", action="store_true")
     clean_parser.add_argument("--config", type=Path)
+    clean_parser.add_argument("--out", type=Path)
 
     plan_parser = subparsers.add_parser("plan")
     plan_parser.add_argument("target", nargs="?")
@@ -288,6 +297,7 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
             experiment.Config,
             init_kwargs=cli_overrides,
             yaml_file=namespace.config,
+            cli_out=namespace.out,
         )
     else:
         config = _config_from_args(
@@ -296,11 +306,12 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
             yaml_file=namespace.config,
         )
     if namespace.command == "status":
-        _print_status(experiment, config, namespace.target)
+        _print_status(experiment, config, namespace.target, cli_out=namespace.out)
     elif namespace.command == "clean":
         clean(
             experiment,
             config,
+            cli_out=namespace.out,
             target=namespace.target,
             yes=namespace.yes,
             allowed_roots=experiment.clean_roots(config),
@@ -315,6 +326,7 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
             downstream=namespace.downstream,
             force=namespace.force,
             dry=namespace.dry,
+            cli_out=namespace.out,
         )
         for outcome in outcomes:
             print(f"{outcome.stage}\t{outcome.status}\t{outcome.reason}")

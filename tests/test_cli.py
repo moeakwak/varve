@@ -5,13 +5,12 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from varve import Experiment, stage
 
 
 class Config(BaseModel):
-    out: Path
     token: str = "a"
     enabled: bool = True
     threshold: float = 0.0
@@ -30,6 +29,10 @@ class NestedConfig(Config):
 
 class CliExperiment(Experiment):
     Config = Config
+
+    @classmethod
+    def default_output_root(cls, config: Config) -> Path:
+        return Path("varve-test-output")
 
     @stage(produces="sample.txt", key=["token"])
     def sample(self, ctx):
@@ -76,12 +79,15 @@ class StringForceCliExperiment(Experiment):
 
 
 class UnsupportedConfig(BaseModel):
-    out: Path
     extra: dict = Field(default_factory=dict)
 
 
 class UnsupportedConfigExperiment(Experiment):
     Config = UnsupportedConfig
+
+    @classmethod
+    def default_output_root(cls, config: UnsupportedConfig) -> Path:
+        return Path("varve-test-output")
 
     @stage(produces="sample.txt")
     def sample(self, ctx):
@@ -110,8 +116,8 @@ def test_cli_run_status_clean(tmp_path: Path, capsys) -> None:
 def test_cli_reads_yaml_config(tmp_path: Path, capsys) -> None:
     config_path = tmp_path / "config.yaml"
     out = tmp_path / "out"
-    config_path.write_text(f"out: {out}\ntoken: yaml\n", encoding="utf-8")
-    assert CliExperiment.cli(["run", "--config", str(config_path)]) == 0
+    config_path.write_text("token: yaml\n", encoding="utf-8")
+    assert CliExperiment.cli(["run", "--config", str(config_path), "--out", str(out)]) == 0
     assert (out / "sample.txt").read_text(encoding="utf-8") == "yaml"
     assert "no-cache" in capsys.readouterr().out
 
@@ -163,12 +169,12 @@ def test_cli_config_commands_with_unsupported_config_still_fast_fail(command: st
 def test_cli_clean_target_after_equals_option_does_not_clean_root(tmp_path: Path) -> None:
     out = tmp_path / "out"
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(f"out: {out}\n", encoding="utf-8")
-    assert CliExperiment.cli(["run", "--config", str(config_path)]) == 0
+    config_path.write_text("token: config\n", encoding="utf-8")
+    assert CliExperiment.cli(["run", "--config", str(config_path), f"--out={out}"]) == 0
     extra = out / "extra.txt"
     extra.write_text("extra", encoding="utf-8")
 
-    assert CliExperiment.cli(["clean", f"--config={config_path}", "sample", "--yes"]) == 0
+    assert CliExperiment.cli(["clean", f"--config={config_path}", f"--out={out}", "sample", "--yes"]) == 0
     assert out.exists()
     assert extra.exists()
     assert not (out / "sample.txt").exists()
@@ -240,6 +246,24 @@ def test_cli_accepts_negative_config_values(
     assert captured[-1].threshold == -1
 
 
+def test_cli_passes_out_as_builtin_runner_argument(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[Config, dict]] = []
+
+    def fake_run(experiment, config, **kwargs):
+        captured.append((config, kwargs))
+        return []
+
+    monkeypatch.setattr("varve.cli.app.run", fake_run)
+    assert CliExperiment.cli(["run", f"--out={tmp_path}"]) == 0
+
+    config, kwargs = captured[-1]
+    assert not hasattr(config, "out")
+    assert kwargs["cli_out"] == tmp_path
+
+
 def test_cli_command_option_wins_when_config_field_has_same_name(tmp_path: Path) -> None:
     assert StringForceCliExperiment.cli(["run", f"--out={tmp_path}", "--force"]) == 0
     assert (tmp_path / "sample.txt").read_text(encoding="utf-8") == "config-default"
@@ -295,7 +319,6 @@ def test_cli_end_to_end_equivalence_with_nested_config(
         ]
     ) == 0
     assert captured[-1] == NestedConfig(
-        out=out,
         enabled=False,
         items=[1, 2],
         inner=InnerConfig(name="cli", age=3),
@@ -304,15 +327,14 @@ def test_cli_end_to_end_equivalence_with_nested_config(
     config_path = tmp_path / "config.yaml"
     yaml_out = tmp_path / "yaml-out"
     config_path.write_text(
-        f"out: {yaml_out}\ntoken: yaml\nitems: [5]\ninner:\n  name: yaml\n  age: 7\n",
+        "token: yaml\nitems: [5]\ninner:\n  name: yaml\n  age: 7\n",
         encoding="utf-8",
     )
 
     assert NestedCliExperiment.cli(
-        ["run", "--config", str(config_path), "--inner.name", "cli"]
+        ["run", "--config", str(config_path), f"--out={yaml_out}", "--inner.name", "cli"]
     ) == 0
     assert captured[-1] == NestedConfig(
-        out=yaml_out,
         token="yaml",
         items=[5],
         inner=InnerConfig(name="cli", age=7),
@@ -338,7 +360,6 @@ def test_cli_priority_cli_gt_env_gt_dotenv_gt_yaml_gt_default(
     config_path.write_text(
         "\n".join(
             [
-                f"out: {tmp_path / 'out'}",
                 "token: from-yaml",
                 "items: [4, 5]",
                 "inner:",
@@ -367,7 +388,6 @@ class Engine(str, Enum):
 
 
 class ChoiceConfig(BaseModel):
-    out: Path
     mode: Literal["fast", "slow"] = "fast"
     engine: Engine = Engine.mathjax
     sample: int | None = 5
@@ -376,18 +396,25 @@ class ChoiceConfig(BaseModel):
 class ChoiceCliExperiment(Experiment):
     Config = ChoiceConfig
 
+    @classmethod
+    def default_output_root(cls, config: ChoiceConfig) -> Path:
+        return Path("varve-test-output")
+
     @stage(produces="sample.txt", key=["mode", "engine", "sample"])
     def sample(self, ctx):
         (ctx.out / "sample.txt").write_text(ctx.config.mode, encoding="utf-8")
 
 
 class RequiredExtraConfig(BaseModel):
-    out: Path
     dataset: str
 
 
 class RequiredExtraCliExperiment(Experiment):
     Config = RequiredExtraConfig
+
+    @classmethod
+    def default_output_root(cls, config: RequiredExtraConfig) -> Path:
+        return Path("varve-test-output")
 
     @stage(produces="sample.txt", key=["dataset"])
     def sample(self, ctx):
@@ -465,3 +492,8 @@ def test_cli_clean_with_bare_output_root_skips_required_fields(tmp_path: Path) -
     # clean only needs the output root, not the unrelated required `dataset` field.
     assert RequiredExtraCliExperiment.cli(["clean", f"--out={out}", "--yes"]) == 0
     assert not out.exists()
+
+
+def test_cli_clean_without_out_requires_full_config() -> None:
+    with pytest.raises(ValidationError):
+        RequiredExtraCliExperiment.cli(["clean", "--yes"])

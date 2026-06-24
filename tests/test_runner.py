@@ -13,7 +13,6 @@ from varve.store.store import Store
 
 
 class Config(BaseModel):
-    out: Path
     token: str = "a"
     batch_size: int = 2
     fail_after: int | None = None
@@ -21,6 +20,10 @@ class Config(BaseModel):
 
 class ToyExperiment(Experiment):
     Config = Config
+
+    @classmethod
+    def default_output_root(cls, config: Config) -> Path:
+        return Path("varve-test-output")
 
     @stage(produces="sample.txt", key=["token"])
     def sample(self, ctx):
@@ -50,6 +53,10 @@ class ToyExperiment(Experiment):
 class MultiOutputBatchExperiment(Experiment):
     Config = Config
 
+    @classmethod
+    def default_output_root(cls, config: Config) -> Path:
+        return Path("varve-test-output")
+
     @batch_stage(partition_key=["batch_size"])
     async def split(self, ctx):
         async for index, item in ctx.resume(["zero", "one"]):
@@ -62,6 +69,10 @@ class MultiOutputBatchExperiment(Experiment):
 
 class CwdRelativeBatchExperiment(Experiment):
     Config = Config
+
+    @classmethod
+    def default_output_root(cls, config: Config) -> Path:
+        return Path("varve-test-output")
 
     @batch_stage(partition_key=["batch_size"])
     async def transform(self, ctx):
@@ -79,37 +90,37 @@ def test_selected_stages() -> None:
 
 
 def test_runner_hit_stale_and_artifact_missing(tmp_path: Path) -> None:
-    config = Config(out=tmp_path)
-    first = run(ToyExperiment, config)
+    config = Config()
+    first = run(ToyExperiment, config, cli_out=tmp_path)
     assert [outcome.status for outcome in first] == ["no-cache", "no-cache", "no-cache"]
-    second = run(ToyExperiment, config)
+    second = run(ToyExperiment, config, cli_out=tmp_path)
     assert [outcome.status for outcome in second] == ["hit", "hit", "hit"]
 
-    changed = run(ToyExperiment, Config(out=tmp_path, token="b"))
+    changed = run(ToyExperiment, Config(token="b"), cli_out=tmp_path)
     assert [outcome.status for outcome in changed] == ["stale", "stale", "stale"]
 
     (tmp_path / "summary.txt").unlink()
-    repaired = run(ToyExperiment, Config(out=tmp_path, token="b"))
+    repaired = run(ToyExperiment, Config(token="b"), cli_out=tmp_path)
     assert repaired[-1].status == "artifact-missing"
 
 
 def test_runner_dry_does_not_initialize_store(tmp_path: Path) -> None:
-    outcomes = run(ToyExperiment, Config(out=tmp_path), dry=True)
+    outcomes = run(ToyExperiment, Config(), cli_out=tmp_path, dry=True)
     assert [outcome.status for outcome in outcomes] == ["no-cache", "no-cache", "no-cache"]
     assert not (tmp_path / ".varve").exists()
 
 
 def test_runner_dry_propagates_current_upstream_keys(tmp_path: Path) -> None:
-    run(ToyExperiment, Config(out=tmp_path, token="a"))
-    dry = run(ToyExperiment, Config(out=tmp_path, token="b"), dry=True)
-    actual = run(ToyExperiment, Config(out=tmp_path, token="b"))
+    run(ToyExperiment, Config(token="a"), cli_out=tmp_path)
+    dry = run(ToyExperiment, Config(token="b"), cli_out=tmp_path, dry=True)
+    actual = run(ToyExperiment, Config(token="b"), cli_out=tmp_path)
     assert [outcome.status for outcome in dry] == [outcome.status for outcome in actual]
 
 
 def test_batch_resume_after_failure(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="planned failure"):
-        run(ToyExperiment, Config(out=tmp_path, fail_after=1), target="transform")
-    resumed = run(ToyExperiment, Config(out=tmp_path), target="transform")
+        run(ToyExperiment, Config(fail_after=1), cli_out=tmp_path, target="transform")
+    resumed = run(ToyExperiment, Config(), cli_out=tmp_path, target="transform")
     assert resumed[-1].status == "resume"
     assert len(list((tmp_path / "transform").glob("part-*.txt"))) == 4
 
@@ -118,14 +129,14 @@ def test_batch_resume_after_failure(tmp_path: Path) -> None:
     assert record.outputs is not None
     assert [output.index for output in record.outputs] == [0, 1, 2, 3]
 
-    summary = run(ToyExperiment, Config(out=tmp_path), only="summarize")
+    summary = run(ToyExperiment, Config(), cli_out=tmp_path, only="summarize")
     assert summary[-1].status == "no-cache"
     assert (tmp_path / "summary.txt").read_text(encoding="utf-8") == "0:a,1:a,2:a,3:a"
 
 
 def test_no_cache_batch_ignores_mismatched_partial_outputs(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="planned failure"):
-        run(ToyExperiment, Config(out=tmp_path, fail_after=0), target="transform")
+        run(ToyExperiment, Config(fail_after=0), cli_out=tmp_path, target="transform")
 
     partial_root = tmp_path / ".varve" / "partial" / "transform"
     current_run_key = next(path.name for path in partial_root.iterdir())
@@ -148,7 +159,7 @@ def test_no_cache_batch_ignores_mismatched_partial_outputs(tmp_path: Path) -> No
         BatchRecord(index=99, yielded=["stale.txt"], committed_at="old"),
     )
 
-    rerun = run(ToyExperiment, Config(out=tmp_path), target="transform")
+    rerun = run(ToyExperiment, Config(), cli_out=tmp_path, target="transform")
     assert rerun[-1].status == "no-cache"
 
     record = Store(tmp_path).read_success("transform")
@@ -164,7 +175,7 @@ def test_no_cache_batch_ignores_mismatched_partial_outputs(tmp_path: Path) -> No
 
 def test_no_cache_failure_does_not_resume_mismatched_partial_outputs(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="planned failure"):
-        run(ToyExperiment, Config(out=tmp_path, fail_after=0), target="transform")
+        run(ToyExperiment, Config(fail_after=0), cli_out=tmp_path, target="transform")
 
     partial_root = tmp_path / ".varve" / "partial" / "transform"
     current_run_key = next(path.name for path in partial_root.iterdir())
@@ -188,9 +199,9 @@ def test_no_cache_failure_does_not_resume_mismatched_partial_outputs(tmp_path: P
     )
 
     with pytest.raises(RuntimeError, match="planned failure"):
-        run(ToyExperiment, Config(out=tmp_path, fail_after=0), target="transform")
+        run(ToyExperiment, Config(fail_after=0), cli_out=tmp_path, target="transform")
 
-    resumed = run(ToyExperiment, Config(out=tmp_path), target="transform")
+    resumed = run(ToyExperiment, Config(), cli_out=tmp_path, target="transform")
     assert resumed[-1].status == "resume"
 
     record = Store(tmp_path).read_success("transform")
@@ -205,9 +216,9 @@ def test_no_cache_failure_does_not_resume_mismatched_partial_outputs(tmp_path: P
 
 
 def test_completed_batch_artifact_missing_and_unrecoverable(tmp_path: Path) -> None:
-    run(ToyExperiment, Config(out=tmp_path), target="transform")
+    run(ToyExperiment, Config(), cli_out=tmp_path, target="transform")
     (tmp_path / "transform" / "part-1.txt").unlink()
-    repaired = run(ToyExperiment, Config(out=tmp_path), target="transform")
+    repaired = run(ToyExperiment, Config(), cli_out=tmp_path, target="transform")
     assert repaired[-1].status == "artifact-missing"
     record = Store(tmp_path).read_success("transform")
     assert record is not None
@@ -216,13 +227,13 @@ def test_completed_batch_artifact_missing_and_unrecoverable(tmp_path: Path) -> N
 
     (tmp_path / "transform" / "part-1.txt").unlink()
     with pytest.raises(RuntimeError, match="partition changed"):
-        run(ToyExperiment, Config(out=tmp_path, batch_size=3), target="transform")
+        run(ToyExperiment, Config(batch_size=3), cli_out=tmp_path, target="transform")
 
 
 def test_force_reruns_all_batch_items_after_partial(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="planned failure"):
-        run(ToyExperiment, Config(out=tmp_path, fail_after=1), target="transform")
-    forced = run(ToyExperiment, Config(out=tmp_path), target="transform", force=True)
+        run(ToyExperiment, Config(fail_after=1), cli_out=tmp_path, target="transform")
+    forced = run(ToyExperiment, Config(), cli_out=tmp_path, target="transform", force=True)
     assert forced[-1].reason == "forced"
     assert len(list((tmp_path / "transform").glob("part-*.txt"))) == 4
     record = Store(tmp_path).read_success("transform")
@@ -232,13 +243,13 @@ def test_force_reruns_all_batch_items_after_partial(tmp_path: Path) -> None:
 
 
 def test_batch_multi_output_index_requires_all_paths(tmp_path: Path) -> None:
-    first = run(MultiOutputBatchExperiment, Config(out=tmp_path))
+    first = run(MultiOutputBatchExperiment, Config(), cli_out=tmp_path)
     assert first[-1].status == "no-cache"
-    second = run(MultiOutputBatchExperiment, Config(out=tmp_path))
+    second = run(MultiOutputBatchExperiment, Config(), cli_out=tmp_path)
     assert second[-1].status == "hit"
 
     (tmp_path / "1-right.txt").unlink()
-    repaired = run(MultiOutputBatchExperiment, Config(out=tmp_path))
+    repaired = run(MultiOutputBatchExperiment, Config(), cli_out=tmp_path)
     assert repaired[-1].status == "artifact-missing"
     assert (tmp_path / "1-right.txt").exists()
 
@@ -259,16 +270,19 @@ def test_batch_rejects_cwd_relative_output_with_actionable_error(
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(ValueError, match="relative to the output root"):
-        run(CwdRelativeBatchExperiment, Config(out=Path("out")))
+        run(CwdRelativeBatchExperiment, Config(), cli_out=Path("out"))
 
 
 class FileKeyConfig(BaseModel):
-    out: Path
     src: Path
 
 
 class FileKeyExperiment(Experiment):
     Config = FileKeyConfig
+
+    @classmethod
+    def default_output_root(cls, config: FileKeyConfig) -> Path:
+        return Path("varve-test-output")
 
     @stage(
         produces="copy.txt",
@@ -283,21 +297,22 @@ class FileKeyExperiment(Experiment):
 def test_hit_refreshes_touched_but_unchanged_file_fingerprint(tmp_path: Path) -> None:
     src = tmp_path / "input.txt"
     src.write_text("payload", encoding="utf-8")
-    config = FileKeyConfig(out=tmp_path / "work", src=src)
+    out = tmp_path / "work"
+    config = FileKeyConfig(src=src)
 
-    first = run(FileKeyExperiment, config)
+    first = run(FileKeyExperiment, config, cli_out=out)
     assert [outcome.status for outcome in first] == ["no-cache"]
 
-    cached_mtime = _cached_src_mtime(config.out)
+    cached_mtime = _cached_src_mtime(out)
 
     # Touch the file without changing its content: bump mtime, same bytes.
     new_mtime = cached_mtime + 100.0
     os.utime(src, (new_mtime, new_mtime))
 
-    second = run(FileKeyExperiment, config)
+    second = run(FileKeyExperiment, config, cli_out=out)
     assert [outcome.status for outcome in second] == ["hit"]
 
-    refreshed_mtime = _cached_src_mtime(config.out)
+    refreshed_mtime = _cached_src_mtime(out)
     assert refreshed_mtime == new_mtime
     assert refreshed_mtime != cached_mtime
 

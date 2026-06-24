@@ -61,6 +61,12 @@ internal store surface and is not exported from `varve.__all__`.
 `Ctx(..., ledger=...)` is only a legacy keyword alias for `Ctx(..., store=...)`. Runner code and
 new call sites must pass `store=`.
 
+The experiment output root is a varve-owned runtime value. Experiment Config models must not
+declare `out` or `output_root` fields for it. Experiments provide a canonical root by overriding
+`Experiment.default_output_root(config)`, and shared base classes may refine the final root by
+overriding `Experiment.resolve_output_root(base, config)`. Stage bodies and helper functions
+must write through `ctx.out`.
+
 ## CLI Responsibilities
 
 The CLI has two layers:
@@ -74,7 +80,8 @@ The only handoff between the layers is argmap output: nested init kwargs collect
 CLI config flags. The settings layer must not parse `argv`.
 
 Do not introduce typer or click. The current CLI intentionally uses strict `argparse` behavior:
-unknown options and missing option values fail instead of being ignored.
+unknown options and missing option values fail instead of being ignored. `--out` is a built-in
+`run` / `status` / `clean` command option, not a generated Config flag.
 
 Only `run`, `status`, and `clean` require a `Config`. `plan` and `list` must keep working even
 when a `Config` contains fields argmap cannot expose.
@@ -93,6 +100,10 @@ working directory through pydantic-settings.
 Nested fields deep-merge at field level across sources. The current `model_config` does not set
 `nested_model_default_partial_update`; the merge behavior comes from pydantic-settings source
 deep merge, not from partial mutation of a default nested model instance.
+
+Config sources are for business configuration only. Output-root selection is resolved separately
+from `--out` or `Experiment.default_output_root(config)`, then normalized through
+`Experiment.resolve_output_root(base, config)`.
 
 ## Clean Safety
 

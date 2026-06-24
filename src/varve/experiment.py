@@ -55,14 +55,17 @@ class Experiment:
         return list(TopologicalSorter(graph).static_order())
 
     @classmethod
-    def output_root(cls, config: Any) -> Path:
-        for field_name in ("out", "output_root"):
-            if hasattr(config, field_name):
-                return Path(getattr(config, field_name))
-        raise ValueError(
-            f"{cls.__name__}.output_root() must be overridden, or config must expose "
-            "'out' or 'output_root'"
-        )
+    def default_output_root(cls, config: Any) -> Path:
+        raise NotImplementedError(f"{cls.__name__} must override default_output_root")
+
+    @classmethod
+    def resolve_output_root(cls, base: Path, config: Any) -> Path:
+        return base
+
+    @classmethod
+    def output_root(cls, config: Any, *, cli_out: Path | None = None) -> Path:
+        base = Path(cli_out) if cli_out is not None else cls.default_output_root(config)
+        return cls.resolve_output_root(base, config)
 
     @classmethod
     def clean_roots(cls, config: Any) -> list[Path] | None:

@@ -102,12 +102,13 @@ def clean(
     experiment: type[Experiment],
     config: Any,
     *,
+    cli_out: Path | None = None,
     target: str | None = None,
     yes: bool = False,
     allowed_roots: list[Path] | None = None,
     confirm: Callable[[str], bool] | None = None,
 ) -> None:
-    root = experiment.output_root(config)
+    root = experiment.output_root(config, cli_out=cli_out)
     store = Store(root)
     with OutputLock(store.root):
         _read_manifest_anchor(store, experiment)

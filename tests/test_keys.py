@@ -20,7 +20,7 @@ from varve.models import (
 
 class Config(BaseModel):
     profile: str
-    out: Path
+    workspace: Path
 
 
 class Ctx:
@@ -51,8 +51,8 @@ def _load_module(path: Path, module_name: str) -> ModuleType:
 
 
 def test_content_key_changes_when_config_changes(tmp_path: Path) -> None:
-    first = compute_key_components(_stage_spec(), Ctx(Config(profile="a", out=tmp_path)), {})
-    second = compute_key_components(_stage_spec(), Ctx(Config(profile="b", out=tmp_path)), {})
+    first = compute_key_components(_stage_spec(), Ctx(Config(profile="a", workspace=tmp_path)), {})
+    second = compute_key_components(_stage_spec(), Ctx(Config(profile="b", workspace=tmp_path)), {})
     assert content_key(first) != content_key(second)
 
 
@@ -82,7 +82,7 @@ def test_content_key_changes_when_value_changes(tmp_path: Path) -> None:
         keyspec=KeySpec(values={"logic": value_two}),
         uses=base.uses,
     )
-    ctx = Ctx(Config(profile="a", out=tmp_path))
+    ctx = Ctx(Config(profile="a", workspace=tmp_path))
     assert content_key(compute_key_components(one, ctx, {})) != content_key(
         compute_key_components(two, ctx, {})
     )
@@ -101,7 +101,7 @@ def test_content_key_files_use_sha_not_mtime(tmp_path: Path) -> None:
         keyspec=KeySpec(files={"data": lambda _ctx: data}),
         uses=(),
     )
-    ctx = Ctx(Config(profile="a", out=tmp_path))
+    ctx = Ctx(Config(profile="a", workspace=tmp_path))
     first = compute_key_components(spec, ctx, {})
     key = content_key(first)
 
@@ -139,12 +139,12 @@ async def partitioned(self, ctx):
     second_module = _load_module(second_module_path, "second_module")
     first = compute_key_components(
         first_module.partitioned.__varve_stage__,
-        Ctx(Config(profile="a", out=tmp_path)),
+        Ctx(Config(profile="a", workspace=tmp_path)),
         {},
     )
     second = compute_key_components(
         second_module.partitioned.__varve_stage__,
-        Ctx(Config(profile="a", out=tmp_path)),
+        Ctx(Config(profile="a", workspace=tmp_path)),
         {},
     )
 
@@ -185,7 +185,7 @@ def helper(value):
         keyspec=base.keyspec,
         uses=(first_module.helper, second_module.helper),
     )
-    components = compute_key_components(spec, Ctx(Config(profile="a", out=tmp_path)), {})
+    components = compute_key_components(spec, Ctx(Config(profile="a", workspace=tmp_path)), {})
 
     assert "uses.uses_first.helper" in components.source
     assert "uses.uses_second.helper" in components.source
@@ -203,7 +203,7 @@ def test_content_key_changes_when_upstream_changes(tmp_path: Path) -> None:
         keyspec=base.keyspec,
         uses=base.uses,
     )
-    ctx = Ctx(Config(profile="a", out=tmp_path))
+    ctx = Ctx(Config(profile="a", workspace=tmp_path))
     one = compute_key_components(spec, ctx, {"sample": "sha256:one"})
     two = compute_key_components(spec, ctx, {"sample": "sha256:two"})
     assert content_key(one) != content_key(two)

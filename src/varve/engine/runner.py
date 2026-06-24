@@ -266,13 +266,13 @@ async def _drive(
     experiment_type: type[Experiment],
     config,
     *,
+    out: Path,
     target: str | None,
     only: str | None,
     downstream: str | None,
     force: bool,
     dry: bool,
 ) -> list[StageOutcome]:
-    out = experiment_type.output_root(config)
     store = Store(out)
     selected = selected_stages(
         experiment_type,
@@ -473,13 +473,15 @@ def run(
     downstream: str | None = None,
     force: bool = False,
     dry: bool = False,
+    cli_out: Path | None = None,
 ) -> list[StageOutcome]:
-    out = experiment.output_root(config)
+    out = experiment.output_root(config, cli_out=cli_out)
     if dry:
         return asyncio.run(
             _drive(
                 experiment,
                 config,
+                out=out,
                 target=target,
                 only=only,
                 downstream=downstream,
@@ -495,6 +497,7 @@ def run(
             _drive(
                 experiment,
                 config,
+                out=out,
                 target=target,
                 only=only,
                 downstream=downstream,

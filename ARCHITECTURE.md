@@ -4,11 +4,12 @@
 
 `varve` is a materialized, content-addressed cache for serial experiment orchestration.
 
-Experiments own output paths and file formats. `varve` owns the store under the output root and
-records which stage successfully produced which durable artifacts for a content key. The runner
-uses stage declarations, source fingerprints, declared key inputs, file fingerprints, values, and
-upstream content keys to decide whether a stage is a cache hit, stale, resumable, dirty, or
-missing cached state.
+Experiments own output formats and default output-root policy. `varve` owns output-root
+resolution, `ctx.out`, and the store under the output root. The store records which stage
+successfully produced which durable artifacts for a content key. The runner uses stage
+declarations, source fingerprints, declared key inputs, file fingerprints, values, and upstream
+content keys to decide whether a stage is a cache hit, stale, resumable, dirty, or missing cached
+state.
 
 The package is intentionally small. The public API is for experiment authors; the `keying`,
 `store`, `engine`, and `cli` packages are internal implementation surfaces.
@@ -20,7 +21,7 @@ src/varve/
 ├── __init__.py          # Public re-export surface.
 ├── context.py           # Runtime Ctx passed to stage methods.
 ├── decorators.py        # @stage, @batch_stage, and StageSpec metadata.
-├── experiment.py        # Experiment base class, stage collection, topo order, clean roots, CLI hook.
+├── experiment.py        # Experiment base class, output-root hooks, stage collection, CLI hook.
 ├── keyspec.py           # JSON type and KeySpec declarations.
 ├── log.py               # Logger and CLI logging helpers.
 ├── models.py            # Pydantic models persisted in the store.
@@ -140,6 +141,12 @@ Recorded artifact paths are output-root-relative. Static `@stage(produces=...)` 
 resolved against `ctx.out`. Batch stages may yield absolute paths under `ctx.out` or paths already
 relative to `ctx.out`; relative batch paths are not current-working-directory-relative.
 
+The output root is not part of the experiment `Config`. `run`, `status`, and `clean` resolve it
+once from explicit `--out`/`cli_out` when present, otherwise from
+`Experiment.default_output_root(config)`, then pass the base through
+`Experiment.resolve_output_root(base, config)`. The resolved value is used for `Store(out)` and
+every stage `Ctx(out=out)`.
+
 `Ctx.resume(iterable, progress=True, desc=..., unit=..., total=..., postfix=...)` keeps resume
 semantics unchanged while showing one `tqdm` progress bar for the whole resumed iterable. The bar
 is enabled by default and labeled with the stage name; skipped indexes seed its initial value, so
@@ -218,9 +225,9 @@ records.
 
 The CLI uses `argparse` for command parsing:
 
-- `run [target]`
-- `status [target]`
-- `clean [target]`
+- `run [target] [--out path]`
+- `status [target] [--out path]`
+- `clean [target] [--out path]`
 - `plan [target]`
 - `list`
 
@@ -239,6 +246,9 @@ Command flags and config fields are kept separate by using private argparse dest
 flags. This prevents command arguments such as `run TARGET` or `--force` from polluting same-named
 config fields.
 
+`--out` is a built-in command option for `run`, `status`, and `clean`. It is not generated from
+the experiment `Config`, and experiment Config models should not declare `out` or `output_root`.
+
 Unknown options are strict. Before dynamic config flags are registered, config commands pre-scan
 the selected command's arguments so unknown options or missing option values fail as parser errors
 instead of triggering config registration for the wrong command.
@@ -247,6 +257,9 @@ instead of triggering config registration for the wrong command.
 
 `cli.app._settings_type()` builds a temporary `BaseSettings` subclass around the experiment
 `Config` model.
+
+Config sources only construct business configuration. Output-root selection is resolved
+separately by the runner and clean paths.
 
 Practical source priority is:
 
