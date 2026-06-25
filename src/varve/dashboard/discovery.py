@@ -26,24 +26,45 @@ def discover_experiments(root: Path) -> list[ExperimentEntry]:
         if not manifest_path.exists():
             continue
         output_root = store_root.parent
+        if _is_temporary_output_root(output_root):
+            continue
+        split = _branch_output_id(root, output_root)
+        if split is None:
+            continue
+        experiment_id, branch = split
         entries.append(
             ExperimentEntry(
                 output_root=output_root,
-                experiment_id=_experiment_id(root, output_root),
+                experiment_id=experiment_id,
                 experiment_name=_read_experiment_name(manifest_path),
+                branch=branch,
             )
         )
-    return sorted(entries, key=lambda entry: entry.experiment_id)
+    return sorted(entries, key=lambda entry: (entry.experiment_id, entry.branch))
 
 
-def _experiment_id(root: Path, output_root: Path) -> str:
+def _relative_parts(root: Path, output_root: Path) -> tuple[str, ...]:
     try:
         relative = output_root.relative_to(root)
     except ValueError:
         relative = output_root
-    if not relative.parts:
-        return output_root.name
-    return ".".join(relative.parts)
+    return relative.parts
+
+
+def _branch_output_id(root: Path, output_root: Path) -> tuple[str, str] | None:
+    parts = _relative_parts(root, output_root)
+    if len(parts) >= 2 and parts[-2] == "out":
+        experiment_parts = parts[:-2]
+        experiment_id = ".".join(experiment_parts) if experiment_parts else output_root.parent.parent.name
+        return experiment_id, parts[-1]
+    if output_root.parent.name == "out":
+        return output_root.parent.parent.name, output_root.name
+    return None
+
+
+def _is_temporary_output_root(output_root: Path) -> bool:
+    parts = output_root.resolve().parts
+    return any(left == "out" and right == ".tmp" for left, right in zip(parts, parts[1:]))
 
 
 def _read_experiment_name(manifest_path: Path) -> str | None:

@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import sys
 from functools import cache
 from graphlib import TopologicalSorter
 from pathlib import Path
 from typing import Any, ClassVar
 
+from pydantic import BaseModel
+
+from varve.branch import validate_branch_name
 from varve.decorators import StageSpec
+
+
+class _EmptyArgs(BaseModel):
+    pass
 
 
 class Experiment:
@@ -18,6 +26,7 @@ class Experiment:
     those declarations.
     """
 
+    Args: ClassVar[type[Any]] = _EmptyArgs
     Config: ClassVar[type[Any]]
 
     @classmethod
@@ -59,13 +68,26 @@ class Experiment:
         raise NotImplementedError(f"{cls.__name__} must override default_output_root")
 
     @classmethod
-    def resolve_output_root(cls, base: Path, config: Any) -> Path:
-        return base
+    def branches_path(cls) -> Path | None:
+        module = sys.modules.get(cls.__module__)
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            return None
+        path = Path(module_file).resolve().parent / "branches.yaml"
+        return path if path.exists() else None
 
     @classmethod
-    def output_root(cls, config: Any, *, cli_out: Path | None = None) -> Path:
+    def output_root(
+        cls,
+        config: Any,
+        *,
+        cli_out: Path | None = None,
+        branch: str = "main",
+        is_temporary: bool = False,
+    ) -> Path:
+        validate_branch_name(branch)
         base = Path(cli_out) if cli_out is not None else cls.default_output_root(config)
-        return cls.resolve_output_root(base, config)
+        return base / ".tmp" / branch if is_temporary else base / branch
 
     @classmethod
     def clean_roots(cls, config: Any) -> list[Path] | None:

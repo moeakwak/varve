@@ -7,11 +7,12 @@ import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any
 
 from pydantic import BaseModel, ValidationError, create_model
-from pydantic_settings import BaseSettings, SettingsConfigDict, YamlConfigSettingsSource
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from varve.branch import derive_override_branch, load_branch
 from varve.cli import argmap
 from varve.cli.clean import clean
 from varve.engine.runner import run, selected_stages
@@ -31,20 +32,29 @@ _COMMAND_OPTION_ARITIES = {
         "--dry": 0,
         "--config": 1,
         "--out": 1,
+        "--branch": 1,
+        "--override": 1,
+        "--name": 1,
     },
-    "status": {"--config": 1, "--out": 1},
-    "clean": {"--yes": 0, "-y": 0, "--config": 1, "--out": 1},
+    "status": {"--config": 1, "--out": 1, "--branch": 1, "--override": 1, "--name": 1},
+    "clean": {
+        "--yes": 0,
+        "-y": 0,
+        "--config": 1,
+        "--out": 1,
+        "--branch": 1,
+        "--override": 1,
+        "--name": 1,
+    },
 }
 
 
-def _settings_type(config_type: type[BaseModel], yaml_file: Path | None = None):
+def _settings_type(config_type: type[BaseModel]):
     class VarveSettings(BaseSettings):
         model_config = SettingsConfigDict(
             env_nested_delimiter="__",
             env_file=".env",
         )
-
-        _yaml_file: ClassVar[Path | None] = yaml_file
 
         @classmethod
         def settings_customise_sources(
@@ -58,8 +68,6 @@ def _settings_type(config_type: type[BaseModel], yaml_file: Path | None = None):
             sources = [init_settings]
             sources.append(env_settings)
             sources.append(dotenv_settings)
-            if cls._yaml_file is not None:
-                sources.append(YamlConfigSettingsSource(settings_cls, yaml_file=cls._yaml_file))
             sources.append(file_secret_settings)
             return tuple(sources)
 
@@ -74,9 +82,8 @@ def _config_from_args(
     config_type: type[BaseModel],
     *,
     init_kwargs: dict[str, Any],
-    yaml_file: Path | None,
 ) -> BaseModel:
-    settings_type = _settings_type(config_type, yaml_file)
+    settings_type = _settings_type(config_type)
     settings = settings_type(**init_kwargs)
     return config_type.model_validate(settings.model_dump())
 
@@ -85,7 +92,6 @@ def _clean_config_from_args(
     config_type: type[BaseModel],
     *,
     init_kwargs: dict[str, Any],
-    yaml_file: Path | None,
     cli_out: Path | None,
 ) -> Any:
     """Build a config for clean, tolerating explicit `--out`.
@@ -95,11 +101,66 @@ def _clean_config_from_args(
     full Config so the experiment can derive its default output root.
     """
     try:
-        return _config_from_args(config_type, init_kwargs=init_kwargs, yaml_file=yaml_file)
+        return _config_from_args(config_type, init_kwargs=init_kwargs)
     except ValidationError:
         if cli_out is None:
             raise
         return SimpleNamespace()
+
+
+def _branch_init_kwargs_from_namespace(
+    experiment: type[Experiment],
+    namespace: argparse.Namespace,
+) -> tuple[dict[str, Any], str, bool]:
+    yaml_path = namespace.config or experiment.branches_path()
+    init_kwargs, is_temporary = load_branch(yaml_path, namespace.branch)
+    branch = namespace.branch
+    if namespace.override is not None:
+        init_kwargs, branch, is_temporary = derive_override_branch(
+            init_kwargs,
+            namespace.override,
+            base_name=branch,
+            name=namespace.name,
+        )
+    elif namespace.name is not None:
+        raise ValueError("--name requires --override")
+    return init_kwargs, branch, is_temporary
+
+
+def _config_branch_from_namespace(
+    experiment: type[Experiment],
+    namespace: argparse.Namespace,
+) -> tuple[BaseModel, str, bool]:
+    init_kwargs, branch, is_temporary = _branch_init_kwargs_from_namespace(
+        experiment,
+        namespace,
+    )
+    config = _config_from_args(experiment.Config, init_kwargs=init_kwargs)
+    return config, branch, is_temporary
+
+
+def _clean_config_branch_from_namespace(
+    experiment: type[Experiment],
+    namespace: argparse.Namespace,
+) -> tuple[Any, str, bool]:
+    init_kwargs, branch, is_temporary = _branch_init_kwargs_from_namespace(
+        experiment,
+        namespace,
+    )
+    config = _clean_config_from_args(
+        experiment.Config,
+        init_kwargs=init_kwargs,
+        cli_out=namespace.out,
+    )
+    return config, branch, is_temporary
+
+
+def _args_from_namespace(
+    experiment: type[Experiment],
+    namespace: argparse.Namespace,
+) -> BaseModel:
+    init_kwargs = argmap.collect_cli_config_namespace(namespace, experiment.Args)
+    return experiment.Args.model_validate(init_kwargs)
 
 
 def _print_list(experiment: type[Experiment]) -> None:
@@ -148,11 +209,23 @@ def _print_plan(
 def _print_status(
     experiment: type[Experiment],
     config,
+    args,
     target: str | None,
     *,
     cli_out: Path | None,
+    branch: str,
+    is_temporary: bool,
 ) -> None:
-    outcomes = run(experiment, config, target=target, dry=True, cli_out=cli_out)
+    outcomes = run(
+        experiment,
+        config,
+        args=args,
+        target=target,
+        dry=True,
+        cli_out=cli_out,
+        branch=branch,
+        is_temporary=is_temporary,
+    )
     for outcome in outcomes:
         print(f"{outcome.stage}\t{outcome.status}\t{outcome.reason}")
 
@@ -246,17 +319,26 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
     run_parser.add_argument("--dry", action="store_true")
     run_parser.add_argument("--config", type=Path)
     run_parser.add_argument("--out", type=Path)
+    run_parser.add_argument("--branch", default="main")
+    run_parser.add_argument("--override")
+    run_parser.add_argument("--name")
 
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("target", nargs="?")
     status_parser.add_argument("--config", type=Path)
     status_parser.add_argument("--out", type=Path)
+    status_parser.add_argument("--branch", default="main")
+    status_parser.add_argument("--override")
+    status_parser.add_argument("--name")
 
     clean_parser = subparsers.add_parser("clean")
     clean_parser.add_argument("target", nargs="?")
     clean_parser.add_argument("--yes", "-y", action="store_true")
     clean_parser.add_argument("--config", type=Path)
     clean_parser.add_argument("--out", type=Path)
+    clean_parser.add_argument("--branch", default="main")
+    clean_parser.add_argument("--override")
+    clean_parser.add_argument("--name")
 
     plan_parser = subparsers.add_parser("plan")
     plan_parser.add_argument("target", nargs="?")
@@ -270,16 +352,16 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
         if _has_unknown_option_before_config_registration(
             command=selected_command,
             command_args=command_args,
-            config_type=experiment.Config,
+            config_type=experiment.Args,
         ):
             parser.error("unknown option or missing option value")
 
     if selected_command == "run":
-        argmap.register_config_args(run_parser, experiment.Config)
+        argmap.register_config_args(run_parser, experiment.Args)
     if selected_command == "status":
-        argmap.register_config_args(status_parser, experiment.Config)
+        argmap.register_config_args(status_parser, experiment.Args)
     if selected_command == "clean":
-        argmap.register_config_args(clean_parser, experiment.Config)
+        argmap.register_config_args(clean_parser, experiment.Args)
 
     namespace = parser.parse_args(raw_argv)
     configure_cli_logging(namespace.verbose)
@@ -291,42 +373,47 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
         _print_plan(experiment, target=namespace.target, mermaid=namespace.mermaid, dot=namespace.dot)
         return 0
 
-    cli_overrides = argmap.collect_cli_config_namespace(namespace, experiment.Config)
     if namespace.command == "clean":
-        config = _clean_config_from_args(
-            experiment.Config,
-            init_kwargs=cli_overrides,
-            yaml_file=namespace.config,
-            cli_out=namespace.out,
-        )
+        config, branch, is_temporary = _clean_config_branch_from_namespace(experiment, namespace)
     else:
-        config = _config_from_args(
-            experiment.Config,
-            init_kwargs=cli_overrides,
-            yaml_file=namespace.config,
-        )
+        config, branch, is_temporary = _config_branch_from_namespace(experiment, namespace)
+    args = _args_from_namespace(experiment, namespace)
     if namespace.command == "status":
-        _print_status(experiment, config, namespace.target, cli_out=namespace.out)
+        _print_status(
+            experiment,
+            config,
+            args,
+            namespace.target,
+            cli_out=namespace.out,
+            branch=branch,
+            is_temporary=is_temporary,
+        )
     elif namespace.command == "clean":
+        allowed_roots = None if isinstance(config, SimpleNamespace) else experiment.clean_roots(config)
         clean(
             experiment,
             config,
             cli_out=namespace.out,
+            branch=branch,
+            is_temporary=is_temporary,
             target=namespace.target,
             yes=namespace.yes,
-            allowed_roots=experiment.clean_roots(config),
+            allowed_roots=allowed_roots,
             confirm=_default_confirm,
         )
     elif namespace.command == "run":
         outcomes = run(
             experiment,
             config,
+            args=args,
             target=namespace.target,
             only=namespace.only,
             downstream=namespace.downstream,
             force=namespace.force,
             dry=namespace.dry,
             cli_out=namespace.out,
+            branch=branch,
+            is_temporary=is_temporary,
         )
         for outcome in outcomes:
             print(f"{outcome.stage}\t{outcome.status}\t{outcome.reason}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 from pydantic import BaseModel
@@ -20,7 +21,7 @@ from varve.models import (
 
 class Config(BaseModel):
     profile: str
-    workspace: Path
+    limit: int = 10
 
 
 class Ctx:
@@ -32,9 +33,18 @@ def helper(value: str) -> str:
     return value.upper()
 
 
-@stage(key=KeySpec(config=("profile",)), uses=[helper])
+@stage(uses=[helper])
 def transform(self, ctx):  # pragma: no cover - inspected only
     return helper(ctx.config.profile)
+
+
+def missing_helper(value: str) -> str:
+    return value.lower()
+
+
+@stage()
+def transform_missing_uses(self, ctx):  # pragma: no cover - inspected only
+    return missing_helper(ctx.config.profile)
 
 
 def _stage_spec() -> StageSpec:
@@ -51,8 +61,14 @@ def _load_module(path: Path, module_name: str) -> ModuleType:
 
 
 def test_content_key_changes_when_config_changes(tmp_path: Path) -> None:
-    first = compute_key_components(_stage_spec(), Ctx(Config(profile="a", workspace=tmp_path)), {})
-    second = compute_key_components(_stage_spec(), Ctx(Config(profile="b", workspace=tmp_path)), {})
+    first = compute_key_components(_stage_spec(), Ctx(Config(profile="a")), {})
+    second = compute_key_components(_stage_spec(), Ctx(Config(profile="b")), {})
+    assert content_key(first) != content_key(second)
+
+
+def test_content_key_uses_all_config_fields() -> None:
+    first = compute_key_components(_stage_spec(), Ctx(Config(profile="a", limit=1)), {})
+    second = compute_key_components(_stage_spec(), Ctx(Config(profile="a", limit=2)), {})
     assert content_key(first) != content_key(second)
 
 
@@ -82,7 +98,7 @@ def test_content_key_changes_when_value_changes(tmp_path: Path) -> None:
         keyspec=KeySpec(values={"logic": value_two}),
         uses=base.uses,
     )
-    ctx = Ctx(Config(profile="a", workspace=tmp_path))
+    ctx = Ctx(Config(profile="a"))
     assert content_key(compute_key_components(one, ctx, {})) != content_key(
         compute_key_components(two, ctx, {})
     )
@@ -99,9 +115,9 @@ def test_content_key_files_use_sha_not_mtime(tmp_path: Path) -> None:
         needs=(),
         produces=None,
         keyspec=KeySpec(files={"data": lambda _ctx: data}),
-        uses=(),
+        uses=(helper,),
     )
-    ctx = Ctx(Config(profile="a", workspace=tmp_path))
+    ctx = Ctx(Config(profile="a"))
     first = compute_key_components(spec, ctx, {})
     key = content_key(first)
 
@@ -139,12 +155,12 @@ async def partitioned(self, ctx):
     second_module = _load_module(second_module_path, "second_module")
     first = compute_key_components(
         first_module.partitioned.__varve_stage__,
-        Ctx(Config(profile="a", workspace=tmp_path)),
+        Ctx(Config(profile="a")),
         {},
     )
     second = compute_key_components(
         second_module.partitioned.__varve_stage__,
-        Ctx(Config(profile="a", workspace=tmp_path)),
+        Ctx(Config(profile="a")),
         {},
     )
 
@@ -183,13 +199,13 @@ def helper(value):
         needs=base.needs,
         produces=base.produces,
         keyspec=base.keyspec,
-        uses=(first_module.helper, second_module.helper),
+        uses=(helper, first_module.helper, second_module.helper),
     )
-    components = compute_key_components(spec, Ctx(Config(profile="a", workspace=tmp_path)), {})
+    components = compute_key_components(spec, Ctx(Config(profile="a")), {})
 
     assert "uses.uses_first.helper" in components.source
     assert "uses.uses_second.helper" in components.source
-    assert len([key for key in components.source if key.startswith("uses.")]) == 2
+    assert len([key for key in components.source if key.startswith("uses.")]) == 3
 
 
 def test_content_key_changes_when_upstream_changes(tmp_path: Path) -> None:
@@ -203,10 +219,60 @@ def test_content_key_changes_when_upstream_changes(tmp_path: Path) -> None:
         keyspec=base.keyspec,
         uses=base.uses,
     )
-    ctx = Ctx(Config(profile="a", workspace=tmp_path))
+    ctx = Ctx(Config(profile="a"))
     one = compute_key_components(spec, ctx, {"sample": "sha256:one"})
     two = compute_key_components(spec, ctx, {"sample": "sha256:two"})
     assert content_key(one) != content_key(two)
+
+
+class PathConfig(BaseModel):
+    profile: str
+    workspace: Path
+
+
+class NestedPathConfig(BaseModel):
+    workspace: Path | None = None
+
+
+class OuterPathConfig(BaseModel):
+    nested: NestedPathConfig = NestedPathConfig()
+
+
+class MappingPathConfig(BaseModel):
+    payload: dict[Any, str]
+
+
+class PathCtx:
+    def __init__(self, config: PathConfig | OuterPathConfig | MappingPathConfig) -> None:
+        self.config = config
+
+
+def test_config_path_fields_are_rejected(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="Config fields must not contain Path"):
+        compute_key_components(_stage_spec(), PathCtx(PathConfig(profile="a", workspace=tmp_path)), {})
+
+
+def test_nested_config_path_fields_are_rejected_even_when_none() -> None:
+    with pytest.raises(TypeError, match="Config fields must not contain Path"):
+        compute_key_components(_stage_spec(), PathCtx(OuterPathConfig()), {})
+
+
+def test_config_path_values_inside_mapping_keys_are_rejected(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="Config fields must not contain Path"):
+        compute_key_components(
+            _stage_spec(),
+            PathCtx(MappingPathConfig(payload={tmp_path: "data"})),
+            {},
+        )
+
+
+def test_unregistered_same_module_helper_is_rejected() -> None:
+    with pytest.raises(ValueError, match="missing_helper"):
+        compute_key_components(
+            transform_missing_uses.__varve_stage__,
+            Ctx(Config(profile="a")),
+            {},
+        )
 
 
 def test_run_key_includes_content_key_and_partition() -> None:

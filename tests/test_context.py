@@ -47,6 +47,16 @@ def _ctx(tmp_path: Path, **kwargs) -> Ctx:
     return Ctx(config={}, out=tmp_path, store=Store(tmp_path), **kwargs)
 
 
+def test_ctx_carries_args_when_provided(tmp_path: Path) -> None:
+    args = object()
+    ctx = _ctx(tmp_path, args=args)
+    assert ctx.args is args
+
+
+def test_ctx_args_defaults_to_none(tmp_path: Path) -> None:
+    assert _ctx(tmp_path).args is None
+
+
 def _collect(ctx: Ctx, iterable, **resume_kwargs) -> list[tuple[int, object]]:
     async def run() -> list[tuple[int, object]]:
         out: list[tuple[int, object]] = []

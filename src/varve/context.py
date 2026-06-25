@@ -54,6 +54,7 @@ class Ctx:
         self,
         *,
         config: Any,
+        args: Any = None,
         out: Path,
         store: Store | None = None,
         ledger: Store | None = None,
@@ -61,6 +62,7 @@ class Ctx:
         stage_name: str | None = None,
     ) -> None:
         self.config = config
+        self.args = args
         self.out = out
         if store is None:
             store = ledger  # Legacy keyword compatibility.

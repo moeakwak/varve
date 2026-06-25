@@ -19,16 +19,13 @@ class KeySpec:
     declaration object.
     """
 
-    config: tuple[str, ...] = ()
     files: Mapping[str, Callable[[Any], Path | list[Path]]] = field(default_factory=dict)
     values: Mapping[str, Callable[[Any], JSON]] = field(default_factory=dict)
 
     @classmethod
-    def coerce(cls, key: list[str] | tuple[str, ...] | KeySpec | None) -> KeySpec:
+    def coerce(cls, key: KeySpec | None) -> KeySpec:
         if key is None:
             return cls()
         if isinstance(key, cls):
             return key
-        if isinstance(key, list | tuple):
-            return cls(config=tuple(key))
         raise TypeError(f"Unsupported key spec: {type(key).__name__}")

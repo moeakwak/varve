@@ -41,7 +41,7 @@ def stage(
     *,
     needs: str | list[str] | tuple[str, ...] | None = None,
     produces: ProducesSpec = None,
-    key: list[str] | tuple[str, ...] | KeySpec | None = None,
+    key: KeySpec | None = None,
     uses: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Declare a single-run stage."""
@@ -65,7 +65,7 @@ def batch_stage(
     *,
     needs: str | list[str] | tuple[str, ...] | None = None,
     produces: ProducesSpec = None,
-    key: list[str] | tuple[str, ...] | KeySpec | None = None,
+    key: KeySpec | None = None,
     uses: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
     partition_key: list[str] | tuple[str, ...] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -91,4 +91,3 @@ def batch_stage(
         return _attach_stage_spec(func, spec)
 
     return decorate
-

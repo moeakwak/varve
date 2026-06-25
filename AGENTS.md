@@ -63,36 +63,41 @@ new call sites must pass `store=`.
 
 The experiment output root is a varve-owned runtime value. Experiment Config models must not
 declare `out` or `output_root` fields for it. Experiments provide a canonical root by overriding
-`Experiment.default_output_root(config)`, and shared base classes may refine the final root by
-overriding `Experiment.resolve_output_root(base, config)`. Stage bodies and helper functions
-must write through `ctx.out`.
+`Experiment.default_output_root(config)`. varve appends the selected branch to that base:
+`base/<branch>` for persistent branches and `base/.tmp/<branch>` for temporary branches. Stage
+bodies and helper functions must write through `ctx.out`.
 
 ## CLI Responsibilities
 
 The CLI has two layers:
 
-- `argparse` front-end: parses `argv`, subcommands, target selection, command flags, and config
-  flags.
-- `pydantic-settings` back-end: merges environment variables, `.env`, YAML, and defaults, then
-  validates the experiment `Config`.
+- `argparse` front-end: parses `argv`, subcommands, target selection, built-in command flags, and
+  generated Args flags.
+- `pydantic-settings` back-end: merges branch values, environment variables, `.env`, and defaults,
+  then validates the experiment `Config`.
 
-The only handoff between the layers is argmap output: nested init kwargs collected from explicit
-CLI config flags. The settings layer must not parse `argv`.
+The handoff between the layers is explicit data: argmap output builds `Args`, and the selected
+branch mapping builds `Config`. The settings layer must not parse `argv`.
 
 Do not introduce typer or click. The current CLI intentionally uses strict `argparse` behavior:
-unknown options and missing option values fail instead of being ignored. `--out` is a built-in
-`run` / `status` / `clean` command option, not a generated Config flag.
+unknown options and missing option values fail instead of being ignored. `--out`, `--branch`,
+`--override`, and `--name` are built-in `run` / `status` / `clean` command options, not generated
+model flags.
 
-Only `run`, `status`, and `clean` require a `Config`. `plan` and `list` must keep working even
-when a `Config` contains fields argmap cannot expose.
+Only `run`, `status`, and `clean` require `Config` and `Args`. `plan` and `list` must keep working
+even when a model contains fields argmap cannot expose.
 
-## Config Sources
+## Args and Config Sources
 
 Config priority is:
 
 ```text
-CLI flag > env > dotenv (.env) > yaml (--config) > field default
+branch or override value > env > dotenv (.env) > field default
 ```
+
+`branches.yaml` is discovered next to the experiment module by default; `--config` points to an
+alternate branches file. `--branch` selects a branch, and `--override` deep-merges JSON over it to
+derive a temporary branch. CLI flags generated from `Args` do not enter the content key.
 
 Nested environment variables use `__` as the delimiter. The `.env` file is read from the current
 working directory through pydantic-settings.
@@ -101,9 +106,9 @@ Nested fields deep-merge at field level across sources. The current `model_confi
 `nested_model_default_partial_update`; the merge behavior comes from pydantic-settings source
 deep merge, not from partial mutation of a default nested model instance.
 
-Config sources are for business configuration only. Output-root selection is resolved separately
-from `--out` or `Experiment.default_output_root(config)`, then normalized through
-`Experiment.resolve_output_root(base, config)`.
+Config sources are for semantic configuration only. Output-root selection is resolved separately
+from `--out` or `Experiment.default_output_root(config)`, then varve appends `branch` /
+`is_temporary`.
 
 ## Clean Safety
 

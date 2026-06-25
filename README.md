@@ -1,6 +1,6 @@
 # varve
 
-`varve` is a small Python library for serial experiment orchestration with a materialized, content-addressed cache. It is intentionally thin: experiments own their output formats and default output-root policy, while varve owns output-root resolution, `ctx.out`, and the store that records which stage successfully produced which durable artifacts for a given content key.
+`varve` is a small Python library for serial experiment orchestration with a materialized, content-addressed cache. It is intentionally thin: experiments own their output formats and default output-base policy, while varve owns branch-aware output-root resolution, `ctx.out`, and the store that records which stage successfully produced which durable artifacts for a given content key.
 
 For maintainers, see [ARCHITECTURE.md](ARCHITECTURE.md) for the current package layout and cache model, and [AGENTS.md](AGENTS.md) for development rules and dependency boundaries.
 
@@ -9,17 +9,21 @@ from pathlib import Path
 from pydantic import BaseModel
 from varve import Experiment, stage
 
+class Args(BaseModel):
+    workers: int = 1
+
 class Config(BaseModel):
     seed: int = 1
 
 class Demo(Experiment):
+    Args = Args
     Config = Config
 
     @classmethod
     def default_output_root(cls, config: Config) -> Path:
         return Path("result/demo")
 
-    @stage(produces="sample.txt", key=["seed"])
+    @stage(produces="sample.txt")
     def sample(self, ctx):
         (ctx.out / "sample.txt").write_text(str(ctx.config.seed))
 
@@ -29,22 +33,23 @@ if __name__ == "__main__":
 
 Commands:
 
-- `run [TARGET] [--out PATH]`: run the selected stage set, using cached artifacts when valid.
-- `status [TARGET] [--out PATH]`: show cache state without executing stages.
+- `run [TARGET] [--out PATH] [--branch NAME] [--override JSON]`: run the selected stage set, using cached artifacts when valid.
+- `status [TARGET] [--out PATH] [--branch NAME] [--override JSON]`: show cache state without executing stages.
 - `plan`: print the stage order or graph.
 - `list`: list declared stages.
-- `clean [TARGET] [--out PATH] --yes`: remove store records and artifacts.
+- `clean [TARGET] [--out PATH] [--branch NAME] [--override JSON] --yes`: remove store records and artifacts.
 
 Top-level dashboard:
 
 - `varve ls [--root DIR]`: scan a directory tree for varve stores and print an overview.
-- `varve show <experiment_id> [--root DIR]`: print one discovered store's stage details and
+- `varve show <experiment_id> [--root DIR] [--branch NAME]`: print one discovered store's stage details and
   recorded dependency edges.
 
 The dashboard is read-only and never imports experiment modules. It discovers experiments by
-looking for `.varve/manifest.json` under the scan root. The `experiment_id` is the output root's
-path relative to the scan root with path separators replaced by dots, such as
-`analysis.transform_phases.rewrite_reach`; it is not a Python import path.
+looking for `.varve/manifest.json` under the scan root. For colocated outputs shaped like
+`<experiment>/out/<branch>`, the `experiment_id` is the experiment path with the trailing
+`out/<branch>` removed, and the branch is tracked separately. Stores outside that layout are not
+shown.
 
 Dashboard status is a store snapshot, not a dry-run cache decision. It only includes stages that
 have records in the store, and it does not recompute content keys, so it cannot report that source
@@ -55,12 +60,12 @@ or key inputs changed after the last run.
 Stage outputs are anchored at the experiment output root (`ctx.out`). Static
 `@stage(produces=...)` entries are interpreted relative to `ctx.out`.
 
-The output root is not a `Config` field. `run`, `status`, and `clean` resolve it
-by taking explicit `--out PATH` when provided, otherwise calling
-`Experiment.default_output_root(config)`, then passing the base path through
-`Experiment.resolve_output_root(base, config)`. Stage code should write through
-`ctx.out`; helper functions that create sidecars should receive `ctx.out` from
-their stage instead of reading an output path from `ctx.config`.
+The output root is not a `Config` field. `run`, `status`, and `clean` first pick
+an output base from explicit `--out PATH` or `Experiment.default_output_root(config)`.
+varve then appends the selected branch: `base/<branch>` for persistent branches
+and `base/.tmp/<branch>` for temporary override branches. Stage code should write
+through `ctx.out`; helper functions that create sidecars should receive `ctx.out`
+from their stage instead of reading an output path from `ctx.config`.
 
 Batch stages record the paths they yield. Yield either an absolute path under
 `ctx.out`, or a path relative to `ctx.out`. Relative batch output paths are not
@@ -82,17 +87,43 @@ context.
 
 ## Configuration sources
 
-`run`, `status`, and `clean` build an experiment `Config` from multiple sources, in priority order:
+Experiments may define two models:
+
+- `Args`: execution options exposed as CLI flags and available at `ctx.args`.
+- `Config`: semantic configuration loaded from `branches.yaml` and available at `ctx.config`.
+
+`branches.yaml` lives next to the experiment module by default. It maps branch names to Config
+values:
+
+```yaml
+main:
+  seed: 1
+smoke:
+  is_temporary: true
+  seed: 2
+```
+
+`--config PATH` points to an alternate branches file. `--branch NAME` selects a branch. `--override
+'{"seed": 3}'` deep-merges JSON over the selected branch and creates a deterministic temporary
+branch unless `--name NAME` is provided.
+
+Config values still receive environment and `.env` fallback for fields not supplied by the selected
+branch:
 
 ```text
-CLI flag > env > dotenv (.env) > yaml (--config) > field default
+branch or override value > env > dotenv (.env) > field default
 ```
 
 Nested environment variables use `__` as the delimiter, for example `INNER__NAME` for `inner.name`.
 
-The CLI is strict: unknown options fail instead of being ignored. Config flags are generated at runtime from the experiment `Config`, while `--out` is a built-in command option owned by varve rather than a generated Config flag. This is why varve keeps an `argparse` front-end rather than introducing typer or click.
+The CLI is strict: unknown options fail instead of being ignored. Args flags are generated at
+runtime from the experiment `Args`, while `--out`, `--branch`, `--override`, and `--name` are
+built-in command options owned by varve. Config fields are not generated as CLI flags.
 
 ## Known limitations
 
-- varve hashes declared key inputs and source ASTs, not arbitrary business artifacts or undeclared helper dependencies. If an output is changed outside varve, use `clean` to reset the affected stages.
+- varve hashes the whole Config, declared file/value inputs, and source ASTs. Same-module helper
+  functions directly called by a stage or helper must be listed in `uses`; aliases, methods,
+  indirect calls, closures, and decorator wrappers are not detected by that guard. If an output is
+  changed outside varve, use `clean` to reset the affected stages.
 - Source AST fingerprints are derived from `ast.dump`, whose output format can change between CPython minor versions. Upgrading the Python interpreter may therefore invalidate every stage's source hash at once, forcing a full rebuild. Run `clean` to reset after such an upgrade.

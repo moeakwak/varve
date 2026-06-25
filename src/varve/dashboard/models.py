@@ -16,6 +16,7 @@ class ExperimentEntry(BaseModel):
     output_root: Path
     experiment_id: str
     experiment_name: str | None
+    branch: str
 
 
 class ArtifactState(BaseModel):

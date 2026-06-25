@@ -23,14 +23,16 @@ def render_overview(states: list[ExperimentState]) -> None:
     console = Console(highlight=False)
     table = Table()
     table.add_column("EXPERIMENT")
+    table.add_column("BRANCH")
     table.add_column("OVERALL")
     table.add_column("STAGES")
     table.add_column("LAST RUN")
 
-    for state in sorted(states, key=lambda item: item.entry.experiment_id):
+    for state in sorted(states, key=lambda item: (item.entry.experiment_id, item.entry.branch)):
         ok_count = sum(1 for stage in state.stages if stage.status == "ok")
         table.add_row(
             state.entry.experiment_id,
+            state.entry.branch,
             _status_text(state.overall),
             f"{ok_count}/{len(state.stages)}",
             _format_datetime(_last_run(state.stages)),
@@ -42,7 +44,9 @@ def render_detail(state: ExperimentState) -> None:
     console = Console(highlight=False)
     experiment_name = state.entry.experiment_name or state.entry.experiment_id
     console.print(f"Experiment: {state.entry.experiment_id}")
-    console.print(f"Output root: {state.entry.output_root}")
+    # soft_wrap keeps long output-root paths on one line; rich would otherwise
+    # hard-wrap them at the console width and split the path mid-string.
+    console.print(f"Output root: {state.entry.output_root}", soft_wrap=True)
     console.print(f"Name: {experiment_name}")
     console.print("Overall: ", _status_text(state.overall), sep="")
     console.print()

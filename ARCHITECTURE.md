@@ -4,12 +4,11 @@
 
 `varve` is a materialized, content-addressed cache for serial experiment orchestration.
 
-Experiments own output formats and default output-root policy. `varve` owns output-root
-resolution, `ctx.out`, and the store under the output root. The store records which stage
+Experiments own output formats and default output-base policy. `varve` owns branch-aware output
+root resolution, `ctx.out`, and the store under the output root. The store records which stage
 successfully produced which durable artifacts for a content key. The runner uses stage
-declarations, source fingerprints, declared key inputs, file fingerprints, values, and upstream
-content keys to decide whether a stage is a cache hit, stale, resumable, dirty, or missing cached
-state.
+declarations, source fingerprints, the full Config, file fingerprints, values, and upstream content
+keys to decide whether a stage is a cache hit, stale, resumable, dirty, or missing cached state.
 
 The package is intentionally small. The public API is for experiment authors; the `keying`,
 `store`, `engine`, and `cli` packages are internal implementation surfaces.
@@ -21,7 +20,8 @@ src/varve/
 ├── __init__.py          # Public re-export surface.
 ├── context.py           # Runtime Ctx passed to stage methods.
 ├── decorators.py        # @stage, @batch_stage, and StageSpec metadata.
-├── experiment.py        # Experiment base class, output-root hooks, stage collection, CLI hook.
+├── branch.py            # Branch name validation, branch config loading, and override merging.
+├── experiment.py        # Experiment base class, branch-aware output roots, stage collection, CLI hook.
 ├── keyspec.py           # JSON type and KeySpec declarations.
 ├── log.py               # Logger and CLI logging helpers.
 ├── models.py            # Pydantic models persisted in the store.
@@ -42,7 +42,7 @@ src/varve/
 │   └── cli.py           # Top-level varve ls/show entry point.
 └── cli/
     ├── app.py           # argparse CLI and pydantic-settings Config construction.
-    ├── argmap.py        # Config model to CLI flag mapping.
+    ├── argmap.py        # Args model to CLI flag mapping.
     └── clean.py         # Destructive clean operations and safety checks.
 ```
 
@@ -151,11 +151,11 @@ Recorded artifact paths are output-root-relative. Static `@stage(produces=...)` 
 resolved against `ctx.out`. Batch stages may yield absolute paths under `ctx.out` or paths already
 relative to `ctx.out`; relative batch paths are not current-working-directory-relative.
 
-The output root is not part of the experiment `Config`. `run`, `status`, and `clean` resolve it
-once from explicit `--out`/`cli_out` when present, otherwise from
-`Experiment.default_output_root(config)`, then pass the base through
-`Experiment.resolve_output_root(base, config)`. The resolved value is used for `Store(out)` and
-every stage `Ctx(out=out)`.
+The output root is not part of the experiment `Config`. `run`, `status`, and `clean` resolve an
+output base from explicit `--out`/`cli_out` when present, otherwise from
+`Experiment.default_output_root(config)`. varve then appends the selected branch: `base/<branch>`
+for persistent branches and `base/.tmp/<branch>` for temporary override branches. The resolved
+value is used for `Store(out)` and every stage `Ctx(out=out, args=args)`.
 
 `Ctx.resume(iterable, progress=True, desc=..., unit=..., total=..., postfix=...)` keeps resume
 semantics unchanged while showing one `tqdm` progress bar for the whole resumed iterable. The bar
@@ -167,13 +167,20 @@ resumed runs do not restart the displayed count from zero. Pass `progress=False`
 `content_key` hashes a canonical JSON view of:
 
 - normalized source hashes for the stage function and any declared `uses` helpers;
-- declared config fields from `KeySpec.config`;
+- the full experiment Config;
 - sha256 digests for declared files from `KeySpec.files`;
 - declared JSON values from `KeySpec.values`;
 - upstream stage content keys.
 
 File fingerprint metadata stores path, size, mtime, and sha256. The content key only folds in file
 digests. On a cache hit, runner may refresh stored size/mtime metadata when digests are unchanged.
+
+Config models must not contain `Path` fields or Path values. Input locations belong in `Args`, and
+input content belongs in the content key through `KeySpec.files`.
+
+Same-module helper functions directly called by a stage or by a declared helper must also be listed
+in `uses`. This guard covers direct same-module global function calls; aliases, methods, indirect
+calls, closures, and decorator wrappers are not detected.
 
 `run_key` hashes the `content_key` together with batch `partition_values`. It is used to locate
 partial batch scratch for resume.
@@ -241,10 +248,10 @@ The CLI uses `argparse` for command parsing:
 - `plan [target]`
 - `list`
 
-`run`, `status`, and `clean` require an experiment `Config`. `plan` and `list` do not construct a
-`Config`; they can still run when the config model contains fields not supported by argmap.
+`run`, `status`, and `clean` require an experiment `Config` and `Args`. `plan` and `list` do not
+construct either model; they can still run when the models contain fields not supported by argmap.
 
-`argmap` registers supported config fields as CLI flags:
+`argmap` registers supported Args fields as CLI flags:
 
 - scalar fields become `--field-name`;
 - nested `BaseModel` fields become dotted flags such as `--inner.name`;
@@ -252,14 +259,15 @@ The CLI uses `argparse` for command parsing:
 - list fields accept JSON through `json.loads`;
 - unsupported dict, mapping, tuple, set, and union shapes fail fast for config commands.
 
-Command flags and config fields are kept separate by using private argparse destinations for config
+Command flags and Args fields are kept separate by using private argparse destinations for generated
 flags. This prevents command arguments such as `run TARGET` or `--force` from polluting same-named
-config fields.
+Args fields.
 
-`--out` is a built-in command option for `run`, `status`, and `clean`. It is not generated from
-the experiment `Config`, and experiment Config models should not declare `out` or `output_root`.
+`--out`, `--branch`, `--override`, and `--name` are built-in command options for `run`, `status`,
+and `clean`. They are not generated from experiment models, and experiment Config models should not
+declare output-root or branch-selection fields.
 
-Unknown options are strict. Before dynamic config flags are registered, config commands pre-scan
+Unknown options are strict. Before dynamic Args flags are registered, config commands pre-scan
 the selected command's arguments so unknown options or missing option values fail as parser errors
 instead of triggering config registration for the wrong command.
 
@@ -267,13 +275,14 @@ instead of triggering config registration for the wrong command.
 
 The top-level `varve` console script provides a read-only dashboard over existing stores:
 
-- `varve ls [--root DIR]` discovers `.varve/manifest.json` files under the scan root and prints
-  an overview table.
-- `varve show <experiment_id> [--root DIR]` prints one store's stage details and dependency edges.
+- `varve ls [--root DIR]` discovers `<experiment>/out/<branch>/.varve/manifest.json` files under
+  the scan root and prints an overview table.
+- `varve show <experiment_id> [--root DIR] [--branch NAME]` prints one store's stage details and dependency edges.
 
 Discovery is intentionally zero-import. The dashboard does not import experiment modules, build a
 `Config`, call runner, or perform dry-run cache decisions. It reads only the store under each
-output root, so the reported status is a latest snapshot of recorded stages:
+branch output root, so the reported status is a latest snapshot of recorded stages. Stores outside
+the branch output layout are skipped.
 
 - `ok`: a success record exists and every recorded artifact path still exists.
 - `artifact-missing`: a success record exists but at least one recorded artifact is missing.
@@ -291,27 +300,30 @@ topological order only includes stages present in the store, and edges are print
 endpoints are recorded. The dashboard cannot see stages that were declared but never run, and it
 does not recompute source fingerprints or content keys to detect stale source or key-input changes.
 
-## Config Sources and Priority
+## Args and Config Sources
 
 `cli.app._settings_type()` builds a temporary `BaseSettings` subclass around the experiment
 `Config` model.
 
-Config sources only construct business configuration. Output-root selection is resolved
-separately by the runner and clean paths.
+Config sources only construct semantic configuration. Output-root selection is resolved separately
+by the runner and clean paths. Args are built directly from generated CLI flags and model defaults.
+
+`branches.yaml` is discovered next to the experiment module by default, unless `--config PATH`
+points to another branches file. The selected branch mapping is passed as settings init kwargs.
+`--override JSON` deep-merges over the selected branch and derives a temporary branch name.
 
 Practical source priority is:
 
 ```text
-CLI flag > env > dotenv (.env) > yaml (--config) > field default
+branch or override value > env > dotenv (.env) > field default
 ```
 
 Implementation details:
 
-- CLI flags are passed as settings init kwargs collected by argmap.
+- Branch values are passed as settings init kwargs.
 - Environment variables are read by pydantic-settings.
 - Nested environment names use `env_nested_delimiter="__"`.
 - `.env` is enabled with `env_file=".env"` and is read from the current working directory.
-- YAML is added through `YamlConfigSettingsSource` only when `--config` is provided.
 - The resulting settings model is dumped and validated back into the experiment `Config` type.
 
 Nested fields deep-merge across sources. The current `model_config` does not enable

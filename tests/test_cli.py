@@ -8,39 +8,44 @@ import pytest
 from pydantic import BaseModel, Field, ValidationError
 
 from varve import Experiment, stage
+from varve.store.store import Store
 
 
 class Config(BaseModel):
     token: str = "a"
+
+
+class Args(BaseModel):
     enabled: bool = True
     threshold: float = 0.0
     items: list[int] = Field(default_factory=list)
 
 
-class InnerConfig(BaseModel):
+class InnerArgs(BaseModel):
     name: str = "inner"
     age: int = 0
     enabled: bool = True
 
 
-class NestedConfig(Config):
-    inner: InnerConfig = Field(default_factory=InnerConfig)
+class NestedArgs(Args):
+    inner: InnerArgs = Field(default_factory=InnerArgs)
 
 
 class CliExperiment(Experiment):
+    Args = Args
     Config = Config
 
     @classmethod
     def default_output_root(cls, config: Config) -> Path:
         return Path("varve-test-output")
 
-    @stage(produces="sample.txt", key=["token"])
+    @stage(produces="sample.txt")
     def sample(self, ctx):
         (ctx.out / "sample.txt").write_text(ctx.config.token, encoding="utf-8")
 
 
 class NestedCliExperiment(CliExperiment):
-    Config = NestedConfig
+    Args = NestedArgs
 
 
 class ConflictingCliConfig(Config):
@@ -48,34 +53,41 @@ class ConflictingCliConfig(Config):
     force: bool = False
 
 
-class StringForceConfig(Config):
+class ConflictingCliArgs(BaseModel):
+    target: str = "default-target"
+    force: bool = False
+
+
+class StringForceArgs(BaseModel):
     force: str = "config-default"
 
 
 class ConflictingCliExperiment(Experiment):
+    Args = ConflictingCliArgs
     Config = ConflictingCliConfig
 
-    @stage(produces="first.txt", key=["target", "force"])
+    @stage(produces="first.txt")
     def first(self, ctx):
         (ctx.out / "first.txt").write_text(
-            f"{ctx.config.target}:{ctx.config.force}",
+            f"{ctx.args.target}:{ctx.args.force}",
             encoding="utf-8",
         )
 
-    @stage(produces="sample.txt", needs="first", key=["target", "force"])
+    @stage(produces="sample.txt", needs="first")
     def sample(self, ctx):
         (ctx.out / "sample.txt").write_text(
-            f"{ctx.config.target}:{ctx.config.force}",
+            f"{ctx.args.target}:{ctx.args.force}",
             encoding="utf-8",
         )
 
 
 class StringForceCliExperiment(Experiment):
-    Config = StringForceConfig
+    Args = StringForceArgs
+    Config = Config
 
-    @stage(produces="sample.txt", key=["force"])
+    @stage(produces="sample.txt")
     def sample(self, ctx):
-        (ctx.out / "sample.txt").write_text(ctx.config.force, encoding="utf-8")
+        (ctx.out / "sample.txt").write_text(ctx.args.force, encoding="utf-8")
 
 
 class UnsupportedConfig(BaseModel):
@@ -83,6 +95,7 @@ class UnsupportedConfig(BaseModel):
 
 
 class UnsupportedConfigExperiment(Experiment):
+    Args = UnsupportedConfig
     Config = UnsupportedConfig
 
     @classmethod
@@ -102,23 +115,41 @@ def test_cli_list_and_plan(capsys) -> None:
 
 
 def test_cli_run_status_clean(tmp_path: Path, capsys) -> None:
-    assert CliExperiment.cli(["run", "--out", str(tmp_path), "--token", "x", "--no-enabled", "--items", "[1,2]"]) == 0
-    assert (tmp_path / "sample.txt").read_text(encoding="utf-8") == "x"
+    override = '{"token":"x"}'
+    assert CliExperiment.cli(
+        [
+            "run",
+            "--out",
+            str(tmp_path),
+            "--override",
+            override,
+            "--name",
+            "quick",
+            "--no-enabled",
+            "--items",
+            "[1,2]",
+        ]
+    ) == 0
+    assert (tmp_path / ".tmp" / "quick" / "sample.txt").read_text(encoding="utf-8") == "x"
     assert "no-cache" in capsys.readouterr().out
 
-    assert CliExperiment.cli(["status", "--out", str(tmp_path), "--token", "x"]) == 0
+    assert CliExperiment.cli(
+        ["status", "--out", str(tmp_path), "--override", override, "--name", "quick"]
+    ) == 0
     assert "hit" in capsys.readouterr().out
 
-    assert CliExperiment.cli(["clean", "--out", str(tmp_path), "--yes"]) == 0
-    assert not tmp_path.exists()
+    assert CliExperiment.cli(
+        ["clean", "--out", str(tmp_path), "--override", override, "--name", "quick", "--yes"]
+    ) == 0
+    assert not (tmp_path / ".tmp" / "quick").exists()
 
 
 def test_cli_reads_yaml_config(tmp_path: Path, capsys) -> None:
     config_path = tmp_path / "config.yaml"
     out = tmp_path / "out"
-    config_path.write_text("token: yaml\n", encoding="utf-8")
+    config_path.write_text("main:\n  token: yaml\n", encoding="utf-8")
     assert CliExperiment.cli(["run", "--config", str(config_path), "--out", str(out)]) == 0
-    assert (out / "sample.txt").read_text(encoding="utf-8") == "yaml"
+    assert (out / "main" / "sample.txt").read_text(encoding="utf-8") == "yaml"
     assert "no-cache" in capsys.readouterr().out
 
 
@@ -161,7 +192,7 @@ def test_cli_option_like_missing_value_does_not_trigger_config_argmap(
 
 
 @pytest.mark.parametrize("command", ["run", "status", "clean"])
-def test_cli_config_commands_with_unsupported_config_still_fast_fail(command: str) -> None:
+def test_cli_config_commands_with_unsupported_args_still_fast_fail(command: str) -> None:
     with pytest.raises(TypeError, match="argmap does not support config field"):
         UnsupportedConfigExperiment.cli([command])
 
@@ -169,75 +200,88 @@ def test_cli_config_commands_with_unsupported_config_still_fast_fail(command: st
 def test_cli_clean_target_after_equals_option_does_not_clean_root(tmp_path: Path) -> None:
     out = tmp_path / "out"
     config_path = tmp_path / "config.yaml"
-    config_path.write_text("token: config\n", encoding="utf-8")
+    config_path.write_text("main:\n  token: config\n", encoding="utf-8")
     assert CliExperiment.cli(["run", "--config", str(config_path), f"--out={out}"]) == 0
-    extra = out / "extra.txt"
+    root = out / "main"
+    extra = root / "extra.txt"
     extra.write_text("extra", encoding="utf-8")
 
     assert CliExperiment.cli(["clean", f"--config={config_path}", f"--out={out}", "sample", "--yes"]) == 0
-    assert out.exists()
+    assert root.exists()
     assert extra.exists()
-    assert not (out / "sample.txt").exists()
+    assert not (root / "sample.txt").exists()
 
 
 def test_cli_clean_target_after_dynamic_config_options_does_not_clean_root(tmp_path: Path) -> None:
     out = tmp_path / "out"
     assert CliExperiment.cli(["run", f"--out={out}"]) == 0
-    extra = out / "extra.txt"
+    root = out / "main"
+    extra = root / "extra.txt"
     extra.write_text("extra", encoding="utf-8")
 
     assert CliExperiment.cli(["clean", f"--out={out}", "--no-enabled", "sample", "--yes"]) == 0
-    assert out.exists()
+    assert root.exists()
     assert extra.exists()
-    assert not (out / "sample.txt").exists()
+    assert not (root / "sample.txt").exists()
 
 
 def test_cli_clean_target_after_nested_equals_option_does_not_clean_root(tmp_path: Path) -> None:
     out = tmp_path / "out"
     assert NestedCliExperiment.cli(["run", f"--out={out}", "--inner.name=custom"]) == 0
-    extra = out / "extra.txt"
+    root = out / "main"
+    extra = root / "extra.txt"
     extra.write_text("extra", encoding="utf-8")
 
     assert NestedCliExperiment.cli(
         ["clean", f"--out={out}", "--inner.name=custom", "sample", "--yes"]
     ) == 0
-    assert out.exists()
+    assert root.exists()
     assert extra.exists()
-    assert not (out / "sample.txt").exists()
+    assert not (root / "sample.txt").exists()
 
 
 def test_cli_clean_target_after_nested_bool_option_does_not_clean_root(tmp_path: Path) -> None:
     out = tmp_path / "out"
     assert NestedCliExperiment.cli(["run", f"--out={out}"]) == 0
-    extra = out / "extra.txt"
+    root = out / "main"
+    extra = root / "extra.txt"
     extra.write_text("extra", encoding="utf-8")
 
     assert NestedCliExperiment.cli(["clean", f"--out={out}", "--no-inner.enabled", "sample", "--yes"]) == 0
-    assert out.exists()
+    assert root.exists()
     assert extra.exists()
-    assert not (out / "sample.txt").exists()
+    assert not (root / "sample.txt").exists()
 
 
-def test_cli_command_args_do_not_pollute_conflicting_config_fields(tmp_path: Path) -> None:
+def test_cli_command_args_do_not_pollute_conflicting_args_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     out = tmp_path / "out"
+    captured: list[ConflictingCliArgs] = []
 
+    def fake_run(experiment, config, **kwargs):
+        captured.append(kwargs["args"])
+        return []
+
+    monkeypatch.setattr("varve.cli.app.run", fake_run)
     assert ConflictingCliExperiment.cli(["run", "sample", f"--out={out}", "--force"]) == 0
-    assert (out / "first.txt").read_text(encoding="utf-8") == "default-target:False"
+    assert captured[-1] == ConflictingCliArgs()
 
     assert ConflictingCliExperiment.cli(
         ["run", "sample", f"--out={out}", "--target", "config"]
     ) == 0
-    assert (out / "first.txt").read_text(encoding="utf-8") == "config:False"
+    assert captured[-1] == ConflictingCliArgs(target="config")
 
 
 def test_cli_accepts_negative_config_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: list[Config] = []
+    captured: list[Args] = []
 
     def fake_run(experiment, config, **kwargs):
-        captured.append(config)
+        captured.append(kwargs["args"])
         return []
 
     monkeypatch.setattr("varve.cli.app.run", fake_run)
@@ -262,45 +306,47 @@ def test_cli_passes_out_as_builtin_runner_argument(
     config, kwargs = captured[-1]
     assert not hasattr(config, "out")
     assert kwargs["cli_out"] == tmp_path
+    assert kwargs["branch"] == "main"
 
 
 def test_cli_command_option_wins_when_config_field_has_same_name(tmp_path: Path) -> None:
     assert StringForceCliExperiment.cli(["run", f"--out={tmp_path}", "--force"]) == 0
-    assert (tmp_path / "sample.txt").read_text(encoding="utf-8") == "config-default"
+    assert (tmp_path / "main" / "sample.txt").read_text(encoding="utf-8") == "config-default"
 
 
 def test_cli_rejects_unknown_options_under_strict_argparse(tmp_path: Path) -> None:
     out = tmp_path / "out"
     assert CliExperiment.cli(["run", f"--out={out}"]) == 0
-    extra = out / "extra.txt"
+    root = out / "main"
+    extra = root / "extra.txt"
     extra.write_text("extra", encoding="utf-8")
 
     with pytest.raises(SystemExit) as exc_info:
         CliExperiment.cli(["clean", f"--out={out}", "--unknown", "sample", "--yes"])
     assert exc_info.value.code != 0
-    assert out.exists()
+    assert root.exists()
     assert extra.exists()
-    assert (out / "sample.txt").exists()
+    assert (root / "sample.txt").exists()
 
 
 def test_cli_uses_sys_argv_when_argv_is_none(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["CliExperiment", "run", "--out", str(tmp_path)])
     assert CliExperiment.cli() == 0
-    assert (tmp_path / "sample.txt").exists()
+    assert (tmp_path / "main" / "sample.txt").exists()
 
 
 def test_cli_preserves_default_factory(tmp_path: Path) -> None:
     assert CliExperiment.cli(["run", "--out", str(tmp_path)]) == 0
-    assert (tmp_path / "sample.txt").exists()
+    assert (tmp_path / "main" / "sample.txt").exists()
 
 
 def test_cli_end_to_end_equivalence_with_nested_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured: list[NestedConfig] = []
+    captured: list[NestedArgs] = []
 
     def fake_run(experiment, config, **kwargs):
-        captured.append(config)
+        captured.append(kwargs["args"])
         return []
 
     monkeypatch.setattr("varve.cli.app.run", fake_run)
@@ -318,68 +364,54 @@ def test_cli_end_to_end_equivalence_with_nested_config(
             "[1,2]",
         ]
     ) == 0
-    assert captured[-1] == NestedConfig(
+    assert captured[-1] == NestedArgs(
         enabled=False,
         items=[1, 2],
-        inner=InnerConfig(name="cli", age=3),
+        inner=InnerArgs(name="cli", age=3),
     )
 
     config_path = tmp_path / "config.yaml"
     yaml_out = tmp_path / "yaml-out"
     config_path.write_text(
-        "token: yaml\nitems: [5]\ninner:\n  name: yaml\n  age: 7\n",
+        "main:\n  token: yaml\n",
         encoding="utf-8",
     )
 
     assert NestedCliExperiment.cli(
         ["run", "--config", str(config_path), f"--out={yaml_out}", "--inner.name", "cli"]
     ) == 0
-    assert captured[-1] == NestedConfig(
-        token="yaml",
-        items=[5],
-        inner=InnerConfig(name="cli", age=7),
-    )
+    assert captured[-1] == NestedArgs(inner=InnerArgs(name="cli"))
 
 
 def test_cli_priority_cli_gt_env_gt_dotenv_gt_yaml_gt_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    captured: list[NestedConfig] = []
+    captured: list[tuple[Config, NestedArgs]] = []
 
     def fake_run(experiment, config, **kwargs):
-        captured.append(config)
+        captured.append((config, kwargs["args"]))
         return []
 
     monkeypatch.setattr("varve.cli.app.run", fake_run)
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
-        "TOKEN=from-dotenv\nINNER__AGE=2\nINNER__NAME=from-dotenv\n",
+        "TOKEN=from-dotenv\n",
         encoding="utf-8",
     )
     config_path = tmp_path / "cfg.yaml"
-    config_path.write_text(
-        "\n".join(
-            [
-                "token: from-yaml",
-                "items: [4, 5]",
-                "inner:",
-                "  name: from-yaml",
-                "  age: 1",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    config_path.write_text("main: {}\n", encoding="utf-8")
     monkeypatch.setenv("TOKEN", "from-env")
-    monkeypatch.setenv("INNER__AGE", "3")
 
-    assert NestedCliExperiment.cli(["run", "--config", str(config_path), "--token", "from-cli"]) == 0
+    assert NestedCliExperiment.cli(
+        ["run", "--config", str(config_path), "--inner.age", "3"]
+    ) == 0
 
-    config = captured[-1]
-    assert config.token == "from-cli"
-    assert config.inner.age == 3
-    assert config.inner.name == "from-dotenv"
-    assert config.items == [4, 5]
-    assert config.enabled is True
+    config, args = captured[-1]
+    assert config.token == "from-env"
+    assert args.inner.age == 3
+    assert args.inner.name == "inner"
+    assert args.items == []
+    assert args.enabled is True
 
 
 class Engine(str, Enum):
@@ -387,22 +419,23 @@ class Engine(str, Enum):
     katex = "katex"
 
 
-class ChoiceConfig(BaseModel):
+class ChoiceArgs(BaseModel):
     mode: Literal["fast", "slow"] = "fast"
     engine: Engine = Engine.mathjax
     sample: int | None = 5
 
 
 class ChoiceCliExperiment(Experiment):
-    Config = ChoiceConfig
+    Args = ChoiceArgs
+    Config = Config
 
     @classmethod
-    def default_output_root(cls, config: ChoiceConfig) -> Path:
+    def default_output_root(cls, config: Config) -> Path:
         return Path("varve-test-output")
 
-    @stage(produces="sample.txt", key=["mode", "engine", "sample"])
+    @stage(produces="sample.txt")
     def sample(self, ctx):
-        (ctx.out / "sample.txt").write_text(ctx.config.mode, encoding="utf-8")
+        (ctx.out / "sample.txt").write_text(ctx.args.mode, encoding="utf-8")
 
 
 class RequiredExtraConfig(BaseModel):
@@ -416,16 +449,22 @@ class RequiredExtraCliExperiment(Experiment):
     def default_output_root(cls, config: RequiredExtraConfig) -> Path:
         return Path("varve-test-output")
 
-    @stage(produces="sample.txt", key=["dataset"])
+    @stage(produces="sample.txt")
     def sample(self, ctx):
         (ctx.out / "sample.txt").write_text(ctx.config.dataset, encoding="utf-8")
 
 
-def _capture_run(monkeypatch: pytest.MonkeyPatch) -> list:
+class StrictCleanRootsExperiment(RequiredExtraCliExperiment):
+    @classmethod
+    def clean_roots(cls, config: RequiredExtraConfig) -> list[Path] | None:
+        return [Path("/tmp") / config.dataset]
+
+
+def _capture_run(monkeypatch: pytest.MonkeyPatch) -> list[tuple[BaseModel, BaseModel, dict]]:
     captured: list = []
 
     def fake_run(experiment, config, **kwargs):
-        captured.append(config)
+        captured.append((config, kwargs["args"], kwargs))
         return []
 
     monkeypatch.setattr("varve.cli.app.run", fake_run)
@@ -437,7 +476,7 @@ def test_cli_literal_field_accepts_valid_choice(
 ) -> None:
     captured = _capture_run(monkeypatch)
     assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--mode", "slow"]) == 0
-    assert captured[-1].mode == "slow"
+    assert captured[-1][1].mode == "slow"
 
 
 def test_cli_literal_field_rejects_invalid_choice(tmp_path: Path) -> None:
@@ -451,7 +490,7 @@ def test_cli_str_enum_field_accepts_value(
 ) -> None:
     captured = _capture_run(monkeypatch)
     assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--engine", "katex"]) == 0
-    assert captured[-1].engine is Engine.katex
+    assert captured[-1][1].engine is Engine.katex
 
 
 def test_cli_str_enum_field_rejects_invalid_value(tmp_path: Path) -> None:
@@ -465,7 +504,7 @@ def test_cli_optional_field_accepts_null_sentinel(
 ) -> None:
     captured = _capture_run(monkeypatch)
     assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--sample", "null"]) == 0
-    assert captured[-1].sample is None
+    assert captured[-1][1].sample is None
 
 
 def test_cli_optional_field_accepts_value(
@@ -473,7 +512,7 @@ def test_cli_optional_field_accepts_value(
 ) -> None:
     captured = _capture_run(monkeypatch)
     assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--sample", "9"]) == 0
-    assert captured[-1].sample == 9
+    assert captured[-1][1].sample == 9
 
 
 @pytest.mark.parametrize("command", ["run", "status", "clean"])
@@ -486,14 +525,27 @@ def test_cli_help_is_handled_by_argparse(command: str, capsys) -> None:
 
 def test_cli_clean_with_bare_output_root_skips_required_fields(tmp_path: Path) -> None:
     out = tmp_path / "out"
-    assert RequiredExtraCliExperiment.cli(["run", f"--out={out}", "--dataset", "alpha"]) == 0
-    assert (out / "sample.txt").exists()
+    assert RequiredExtraCliExperiment.cli(
+        ["run", f"--out={out}", "--override", '{"dataset":"alpha"}', "--name", "alpha"]
+    ) == 0
+    assert (out / ".tmp" / "alpha" / "sample.txt").exists()
 
     # clean only needs the output root, not the unrelated required `dataset` field.
-    assert RequiredExtraCliExperiment.cli(["clean", f"--out={out}", "--yes"]) == 0
-    assert not out.exists()
+    assert RequiredExtraCliExperiment.cli(
+        ["clean", f"--out={out}", "--override", '{"dataset":"alpha"}', "--name", "alpha", "--yes"]
+    ) == 0
+    assert not (out / ".tmp" / "alpha").exists()
 
 
 def test_cli_clean_without_out_requires_full_config() -> None:
     with pytest.raises(ValidationError):
         RequiredExtraCliExperiment.cli(["clean", "--yes"])
+
+
+def test_cli_clean_with_bare_output_root_skips_clean_roots_config_access(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    Store(out / "main").ensure_initialized("StrictCleanRootsExperiment")
+
+    assert StrictCleanRootsExperiment.cli(["clean", f"--out={out}", "--yes"]) == 0
+
+    assert not (out / "main").exists()

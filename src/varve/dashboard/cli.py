@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.command == "show":
-        return _show(args.root, args.experiment)
+        return _show(args.root, args.experiment, args.branch)
     root = args.root if args.command == "ls" else Path.cwd()
     return _ls(root)
 
@@ -30,6 +30,7 @@ def _parser() -> argparse.ArgumentParser:
     show_parser = subparsers.add_parser("show", help="show one experiment store")
     show_parser.add_argument("experiment")
     show_parser.add_argument("--root", type=Path, default=Path.cwd())
+    show_parser.add_argument("--branch", default="main")
     return parser
 
 
@@ -43,16 +44,16 @@ def _ls(root: Path) -> int:
     return 0
 
 
-def _show(root: Path, experiment_id: str) -> int:
+def _show(root: Path, experiment_id: str, branch: str) -> int:
     entries = discover_experiments(root)
-    by_id = {entry.experiment_id: entry for entry in entries}
-    entry = by_id.get(experiment_id)
+    by_key = {(entry.experiment_id, entry.branch): entry for entry in entries}
+    entry = by_key.get((experiment_id, branch))
     if entry is None:
-        print(f"Unknown experiment: {experiment_id}", file=sys.stderr)
-        if by_id:
+        print(f"Unknown experiment: {experiment_id} (branch {branch})", file=sys.stderr)
+        if by_key:
             print("Available experiments:", file=sys.stderr)
-            for known_id in sorted(by_id):
-                print(f"  {known_id}", file=sys.stderr)
+            for known_id, known_branch in sorted(by_key):
+                print(f"  {known_id} --branch {known_branch}", file=sys.stderr)
         else:
             print(f"No experiments found under {root}", file=sys.stderr)
         return 1

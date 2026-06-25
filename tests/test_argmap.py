@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
-from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, Field
@@ -18,7 +17,7 @@ class ArgmapInner(BaseModel):
 
 
 class ArgmapConfig(BaseModel):
-    target: Path
+    target: str
     token: str = "abc"
     batch_size: int = 8
     enabled: bool = True
@@ -27,7 +26,7 @@ class ArgmapConfig(BaseModel):
     ratio: float | None = None
     env_value: str = "default-env"
     dotenv_value: str = "default-dotenv"
-    yaml_value: str = "default-yaml"
+    default_value: str = "default"
 
 
 class ConflictingConfig(BaseModel):
@@ -37,12 +36,11 @@ class ConflictingConfig(BaseModel):
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path)
     register_config_args(parser, ArgmapConfig)
     return parser
 
 
-def test_register_and_collect_config_args(tmp_path: Path) -> None:
+def test_register_and_collect_config_args(tmp_path) -> None:
     parser = _parser()
 
     namespace = parser.parse_args(
@@ -99,63 +97,45 @@ def test_collect_only_uses_explicit_config_flags_when_names_conflict() -> None:
 
 
 def test_deep_merge_keeps_nested_fields_from_multiple_sources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        f"target: {tmp_path / 'out'}\ninner:\n  name: from-yaml\n",
-        encoding="utf-8",
-    )
     monkeypatch.setenv("INNER__AGE", "99")
     parser = _parser()
-    namespace = parser.parse_args(["--config", str(config_path), "--inner.name", "from-cli"])
+    namespace = parser.parse_args(["--target", "out", "--inner.name", "from-cli"])
 
     config = _config_from_args(
         ArgmapConfig,
         init_kwargs=collect_cli_config_namespace(namespace, ArgmapConfig),
-        yaml_file=namespace.config,
     )
 
+    assert config.target == "out"
     assert config.inner.name == "from-cli"
     assert config.inner.age == 99
 
 
-def test_priority_cli_gt_env_gt_dotenv_gt_yaml_gt_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_priority_init_gt_env_gt_dotenv_gt_default(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
         "TOKEN=from-dotenv\nENV_VALUE=from-dotenv\nDOTENV_VALUE=from-dotenv\n",
         encoding="utf-8",
     )
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        "\n".join(
-            [
-                f"target: {tmp_path / 'out'}",
-                "token: from-yaml",
-                "env_value: from-yaml",
-                "dotenv_value: from-yaml",
-                "yaml_value: from-yaml",
-            ]
-        ),
-        encoding="utf-8",
-    )
     monkeypatch.setenv("TOKEN", "from-env")
     monkeypatch.setenv("ENV_VALUE", "from-env")
 
     parser = _parser()
-    namespace = parser.parse_args(["--config", str(config_path), "--token", "from-cli"])
+    namespace = parser.parse_args(["--target", "out", "--token", "from-cli"])
     config = _config_from_args(
         ArgmapConfig,
         init_kwargs=collect_cli_config_namespace(namespace, ArgmapConfig),
-        yaml_file=namespace.config,
     )
 
+    assert config.target == "out"
     assert config.token == "from-cli"
     assert config.env_value == "from-env"
     assert config.dotenv_value == "from-dotenv"
-    assert config.yaml_value == "from-yaml"
+    assert config.default_value == "default"
     assert config.batch_size == 8
 
 

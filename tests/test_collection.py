@@ -9,14 +9,15 @@ from varve import Experiment, KeySpec, batch_stage, stage
 
 
 def test_keyspec_coerce() -> None:
-    original = KeySpec(config=("x",))
-    assert KeySpec.coerce(["a", "b"]).config == ("a", "b")
+    original = KeySpec()
     assert KeySpec.coerce(original) is original
     assert KeySpec.coerce(None) == KeySpec()
+    with pytest.raises(TypeError, match="Unsupported key spec"):
+        KeySpec.coerce(["a", "b"])  # type: ignore[arg-type]
 
 
 def test_decorators_capture_stage_metadata() -> None:
-    @batch_stage(needs="sample", key=["profile"], partition_key=["batch_size"])
+    @batch_stage(needs="sample", partition_key=["batch_size"])
     async def transform(ctx):  # pragma: no cover - metadata only
         yield ctx
 
@@ -24,7 +25,7 @@ def test_decorators_capture_stage_metadata() -> None:
     assert spec.name == "transform"
     assert spec.kind == "batch"
     assert spec.needs == ("sample",)
-    assert spec.keyspec.config == ("profile",)
+    assert spec.keyspec == KeySpec()
     assert spec.partition_key == ("batch_size",)
 
 
@@ -69,24 +70,21 @@ def test_output_root_default_resolution(tmp_path: Path) -> None:
         def default_output_root(cls, config: DemoConfig) -> Path:
             return tmp_path / "default-out"
 
-        @classmethod
-        def resolve_output_root(cls, base: Path, config: DemoConfig) -> Path:
-            return base / config.profile
-
         @stage()
         def sample(self, ctx):  # pragma: no cover - metadata only
             return None
 
     assert Demo.default_output_root(DemoConfig()) == tmp_path / "default-out"
-    assert Demo.resolve_output_root(tmp_path / "base", DemoConfig(profile="resolved")) == (
-        tmp_path / "base" / "resolved"
+    assert Demo.output_root(DemoConfig()) == tmp_path / "default-out" / "main"
+    assert Demo.output_root(DemoConfig(), branch="exp1") == tmp_path / "default-out" / "exp1"
+    assert Demo.output_root(DemoConfig(), branch="quick", is_temporary=True) == (
+        tmp_path / "default-out" / ".tmp" / "quick"
     )
-    assert Demo.output_root(DemoConfig(profile="canonical")) == (
-        tmp_path / "default-out" / "canonical"
+    assert Demo.output_root(DemoConfig(), cli_out=tmp_path / "cli-out") == (
+        tmp_path / "cli-out" / "main"
     )
-    assert Demo.output_root(DemoConfig(profile="cli"), cli_out=tmp_path / "cli-out") == (
-        tmp_path / "cli-out" / "cli"
-    )
+    with pytest.raises(ValueError, match="branch name"):
+        Demo.output_root(DemoConfig(), branch="bad/name")
 
     class MissingDefault(Experiment):
         Config = DemoConfig

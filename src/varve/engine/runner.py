@@ -266,6 +266,7 @@ async def _drive(
     experiment_type: type[Experiment],
     config,
     *,
+    args,
     out: Path,
     target: str | None,
     only: str | None,
@@ -307,7 +308,7 @@ async def _drive(
         )
         previous = store.read_success(stage_name)
         cached_files = previous.key_components.files if previous is not None else None
-        ctx_for_key = Ctx(config=config, out=out, store=store)
+        ctx_for_key = Ctx(config=config, args=args, out=out, store=store)
         components = compute_key_components(stage_spec, ctx_for_key, upstream_keys, cached_files)
         current_key = content_key(components)
         known_content_keys[stage_name] = current_key
@@ -385,6 +386,7 @@ async def _drive(
         )
         ctx = Ctx(
             config=config,
+            args=args,
             out=out,
             store=store,
             resume_skip=decision.resume_skip,
@@ -468,19 +470,30 @@ def run(
     experiment: type[Experiment],
     config,
     *,
+    args=None,
     target: str | None = None,
     only: str | None = None,
     downstream: str | None = None,
     force: bool = False,
     dry: bool = False,
     cli_out: Path | None = None,
+    branch: str = "main",
+    is_temporary: bool = False,
 ) -> list[StageOutcome]:
-    out = experiment.output_root(config, cli_out=cli_out)
+    if args is None:
+        args = experiment.Args()
+    out = experiment.output_root(
+        config,
+        cli_out=cli_out,
+        branch=branch,
+        is_temporary=is_temporary,
+    )
     if dry:
         return asyncio.run(
             _drive(
                 experiment,
                 config,
+                args=args,
                 out=out,
                 target=target,
                 only=only,
@@ -497,6 +510,7 @@ def run(
             _drive(
                 experiment,
                 config,
+                args=args,
                 out=out,
                 target=target,
                 only=only,

@@ -41,7 +41,7 @@ def _write_stage(output_root: Path, stage: str, **kwargs) -> None:
 
 
 def test_ls_and_show_render_experiment_state(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    output_root = tmp_path / "alpha"
+    output_root = tmp_path / "alpha" / "out" / "main"
     Store(output_root).ensure_initialized("Demo")
     _write_stage(output_root, "sample")
 
@@ -60,6 +60,45 @@ def test_ls_and_show_render_experiment_state(tmp_path: Path, capsys: pytest.Capt
     assert "sample.txt" in detail.out
 
 
+def test_show_selects_branch_without_overwriting_same_experiment(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    main_root = tmp_path / "demo" / "out" / "main"
+    exp_root = tmp_path / "demo" / "out" / "exp1"
+    Store(main_root).ensure_initialized("Demo")
+    Store(exp_root).ensure_initialized("Demo")
+    _write_stage(main_root, "main_stage")
+    _write_stage(exp_root, "exp_stage")
+
+    assert main(["show", "demo", "--root", str(tmp_path)]) == 0
+    assert "main_stage" in capsys.readouterr().out
+
+    assert main(["show", "demo", "--branch", "exp1", "--root", str(tmp_path)]) == 0
+    branch_output = capsys.readouterr().out
+    assert "exp_stage" in branch_output
+    assert "main_stage" not in branch_output
+
+
+def test_ls_shows_branch_for_colocated_outputs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    main_root = tmp_path / "demo" / "out" / "main"
+    exp_root = tmp_path / "demo" / "out" / "exp1"
+    Store(main_root).ensure_initialized("Demo")
+    Store(exp_root).ensure_initialized("Demo")
+    _write_stage(main_root, "main_stage")
+    _write_stage(exp_root, "exp_stage")
+
+    assert main(["ls", "--root", str(tmp_path)]) == 0
+
+    output = capsys.readouterr().out
+    assert "demo" in output
+    assert "main" in output
+    assert "exp1" in output
+
+
 def test_ls_returns_nonzero_for_empty_scan_root(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -75,15 +114,15 @@ def test_show_returns_nonzero_and_lists_known_ids_for_unknown_experiment(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    Store(tmp_path / "alpha").ensure_initialized("Alpha")
-    Store(tmp_path / "beta").ensure_initialized("Beta")
+    Store(tmp_path / "alpha" / "out" / "main").ensure_initialized("Alpha")
+    Store(tmp_path / "beta" / "out" / "exp1").ensure_initialized("Beta")
 
     assert main(["show", "missing", "--root", str(tmp_path)]) == 1
 
     captured = capsys.readouterr()
     assert "Unknown experiment: missing" in captured.err
-    assert "alpha" in captured.err
-    assert "beta" in captured.err
+    assert "alpha --branch main" in captured.err
+    assert "beta --branch exp1" in captured.err
 
 
 def test_no_subcommand_defaults_to_ls(
@@ -91,7 +130,7 @@ def test_no_subcommand_defaults_to_ls(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    output_root = tmp_path / "default"
+    output_root = tmp_path / "default" / "out" / "main"
     Store(output_root).ensure_initialized("Demo")
     _write_stage(output_root, "sample")
     monkeypatch.chdir(tmp_path)
@@ -106,7 +145,7 @@ def test_show_plan_lists_real_edges_without_inventing_topological_links(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    output_root = tmp_path / "dag"
+    output_root = tmp_path / "dag" / "out" / "main"
     Store(output_root).ensure_initialized("Demo")
     _write_stage(output_root, "a")
     _write_stage(output_root, "b", upstreams={"a": {"content_key": "sha256:a"}})
@@ -145,6 +184,7 @@ def test_render_detail_styles_overall_status(
             output_root=tmp_path,
             experiment_id="demo",
             experiment_name="Demo",
+            branch="main",
         ),
         stages=[],
         order=[],

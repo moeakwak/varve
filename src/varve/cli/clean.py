@@ -103,12 +103,19 @@ def clean(
     config: Any,
     *,
     cli_out: Path | None = None,
+    branch: str = "main",
+    is_temporary: bool = False,
     target: str | None = None,
     yes: bool = False,
     allowed_roots: list[Path] | None = None,
     confirm: Callable[[str], bool] | None = None,
 ) -> None:
-    root = experiment.output_root(config, cli_out=cli_out)
+    root = experiment.output_root(
+        config,
+        cli_out=cli_out,
+        branch=branch,
+        is_temporary=is_temporary,
+    )
     store = Store(root)
     with OutputLock(store.root):
         _read_manifest_anchor(store, experiment)

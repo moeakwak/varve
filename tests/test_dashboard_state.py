@@ -19,6 +19,7 @@ def _entry(output_root: Path, experiment_name: str | None = "Demo") -> Experimen
         output_root=output_root,
         experiment_id=output_root.name,
         experiment_name=experiment_name,
+        branch="main",
     )
 
 
