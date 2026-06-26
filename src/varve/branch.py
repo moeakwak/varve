@@ -26,7 +26,7 @@ def validate_branch_name(name: str) -> str:
 
 
 def load_branch(yaml_path: Path | None, branch: str) -> tuple[dict[str, Any], bool]:
-    """Load one branch config from a branches.yaml file.
+    """Load one branch config from a varve.yaml file.
 
     Missing `main` falls back to schema defaults, represented as an empty dict.
     Non-main branches must be present.
@@ -35,13 +35,13 @@ def load_branch(yaml_path: Path | None, branch: str) -> tuple[dict[str, Any], bo
     if yaml_path is None or not Path(yaml_path).exists():
         if branch == "main":
             return {}, False
-        raise ValueError(f"Unknown varve branch {branch!r}: no branches.yaml was found")
+        raise ValueError(f"Unknown varve branch {branch!r}: no varve.yaml was found")
 
     raw = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
     if raw is None:
         raw = {}
     if not isinstance(raw, Mapping):
-        raise ValueError(f"branches.yaml must be a mapping of branch names to configs: {yaml_path}")
+        raise ValueError(f"varve.yaml must be a mapping of branch names to configs: {yaml_path}")
     for name in raw:
         validate_branch_name(name)
 

@@ -112,7 +112,7 @@ def _branch_init_kwargs_from_namespace(
     experiment: type[Experiment],
     namespace: argparse.Namespace,
 ) -> tuple[dict[str, Any], str, bool]:
-    yaml_path = namespace.config or experiment.branches_path()
+    yaml_path = namespace.config or experiment.varve_config_path()
     init_kwargs, is_temporary = load_branch(yaml_path, namespace.branch)
     branch = namespace.branch
     if namespace.override is not None:

@@ -21,8 +21,8 @@ def _load_module(path: Path, module_name: str) -> ModuleType:
 
 
 def test_load_branch_reads_named_section_and_temporary_flag(tmp_path: Path) -> None:
-    branches = tmp_path / "branches.yaml"
-    branches.write_text(
+    config_path = tmp_path / "varve.yaml"
+    config_path.write_text(
         "\n".join(
             [
                 "main:",
@@ -35,8 +35,8 @@ def test_load_branch_reads_named_section_and_temporary_flag(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    assert load_branch(branches, "main") == ({"limit": 10}, False)
-    assert load_branch(branches, "smoke") == ({"limit": 2}, True)
+    assert load_branch(config_path, "main") == ({"limit": 10}, False)
+    assert load_branch(config_path, "smoke") == ({"limit": 2}, True)
 
 
 def test_load_branch_defaults_missing_main_to_empty_config(tmp_path: Path) -> None:
@@ -45,19 +45,19 @@ def test_load_branch_defaults_missing_main_to_empty_config(tmp_path: Path) -> No
 
 
 def test_load_branch_rejects_missing_non_main_branch(tmp_path: Path) -> None:
-    branches = tmp_path / "branches.yaml"
-    branches.write_text("main:\n  limit: 10\n", encoding="utf-8")
+    config_path = tmp_path / "varve.yaml"
+    config_path.write_text("main:\n  limit: 10\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="Unknown varve branch"):
-        load_branch(branches, "smoke")
+        load_branch(config_path, "smoke")
 
 
 def test_load_branch_rejects_non_boolean_temporary_flag(tmp_path: Path) -> None:
-    branches = tmp_path / "branches.yaml"
-    branches.write_text("main:\n  is_temporary: 'false'\n", encoding="utf-8")
+    config_path = tmp_path / "varve.yaml"
+    config_path.write_text("main:\n  is_temporary: 'false'\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="non-boolean is_temporary"):
-        load_branch(branches, "main")
+        load_branch(config_path, "main")
 
 
 def test_derive_override_branch_deep_merges_and_names_deterministically() -> None:
@@ -87,8 +87,47 @@ def test_derive_override_branch_accepts_explicit_name() -> None:
     assert is_temporary is True
 
 
-def test_cli_discovers_adjacent_branches_yaml(tmp_path: Path) -> None:
+def test_cli_discovers_adjacent_varve_yaml(tmp_path: Path) -> None:
     module_path = tmp_path / "demo_exp.py"
+    module_path.write_text(
+        '''
+from pathlib import Path
+
+from pydantic import BaseModel
+
+from varve import Experiment, stage
+
+
+class Config(BaseModel):
+    token: str = "default"
+
+
+class DemoExperiment(Experiment):
+    Config = Config
+
+    @classmethod
+    def default_output_root(cls, config: Config) -> Path:
+        return Path(__file__).resolve().parent / "out"
+
+    @stage(produces="sample.txt")
+    def sample(self, ctx):
+        (ctx.out / "sample.txt").write_text(ctx.config.token, encoding="utf-8")
+''',
+        encoding="utf-8",
+    )
+    (tmp_path / "varve.yaml").write_text(
+        "alt:\n  token: branch\n",
+        encoding="utf-8",
+    )
+    module = _load_module(module_path, "demo_exp")
+
+    assert module.DemoExperiment.cli(["run", "--branch", "alt"]) == 0
+
+    assert (tmp_path / "out" / "alt" / "sample.txt").read_text(encoding="utf-8") == "branch"
+
+
+def test_cli_does_not_discover_adjacent_branches_yaml(tmp_path: Path) -> None:
+    module_path = tmp_path / "demo_exp_legacy.py"
     module_path.write_text(
         '''
 from pathlib import Path
@@ -119,8 +158,7 @@ class DemoExperiment(Experiment):
         "alt:\n  token: branch\n",
         encoding="utf-8",
     )
-    module = _load_module(module_path, "demo_exp")
+    module = _load_module(module_path, "demo_exp_legacy")
 
-    assert module.DemoExperiment.cli(["run", "--branch", "alt"]) == 0
-
-    assert (tmp_path / "out" / "alt" / "sample.txt").read_text(encoding="utf-8") == "branch"
+    with pytest.raises(ValueError, match="no varve.yaml was found"):
+        module.DemoExperiment.cli(["run", "--branch", "alt"])

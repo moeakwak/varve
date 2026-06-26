@@ -68,12 +68,12 @@ class Experiment:
         raise NotImplementedError(f"{cls.__name__} must override default_output_root")
 
     @classmethod
-    def branches_path(cls) -> Path | None:
+    def varve_config_path(cls) -> Path | None:
         module = sys.modules.get(cls.__module__)
         module_file = getattr(module, "__file__", None)
         if module_file is None:
             return None
-        path = Path(module_file).resolve().parent / "branches.yaml"
+        path = Path(module_file).resolve().parent / "varve.yaml"
         return path if path.exists() else None
 
     @classmethod
@@ -95,7 +95,7 @@ class Experiment:
 
         Returning None (default) keeps current behavior: only the dangerous blacklist
         (/, home, cwd) and manifest anchor guard a full clean. Override to declare
-        experiment-specific allowed roots (e.g. studies/results, /tmp).
+        experiment-specific allowed roots (for example, experiment outputs and /tmp).
         """
         return None
 
