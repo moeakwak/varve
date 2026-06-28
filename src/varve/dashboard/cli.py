@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "show":
         return _show(args.root, args.experiment, args.branch, args.include_temp)
     if args.command == "refresh":
-        return _refresh(args.root, args.include_temp)
+        return _refresh(args.root, args.include_temp, args.prefix)
     root = args.root if args.command == "ls" else Path.cwd()
     include_temp = args.include_temp
     return _ls(root, include_temp)
@@ -58,6 +58,10 @@ def _parser() -> argparse.ArgumentParser:
     refresh_parser = subparsers.add_parser("refresh", help="run stale discovered experiments")
     refresh_parser.add_argument("--root", type=Path, default=Path.cwd())
     refresh_parser.add_argument(
+        "--prefix",
+        help="only refresh experiments whose module starts with this prefix",
+    )
+    refresh_parser.add_argument(
         "--include-temp",
         action="store_true",
         default=argparse.SUPPRESS,
@@ -93,8 +97,14 @@ def _show(root: Path, experiment_id: str, branch: str, include_temp: bool) -> in
     return 0
 
 
-def _refresh(root: Path, include_temp: bool) -> int:
+def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
     entries = discover_experiments(root, include_temporary=include_temp)
+    if prefix is not None:
+        entries = [
+            entry
+            for entry in entries
+            if entry.module is not None and entry.module.startswith(prefix)
+        ]
     if not entries:
         print(f"No experiments found under {root}", file=sys.stderr)
         return 1

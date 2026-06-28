@@ -227,12 +227,13 @@ Unknown options are strict. Before dynamic Args flags are registered, config com
 
 ## Dashboard
 
-The top-level `varve` console script provides a read-only dashboard over existing stores:
+The top-level `varve` console script provides a dashboard over existing stores:
 
 - `varve ls [--root DIR]` discovers `<experiment>/out/<branch>/.varve/manifest.json` files under the scan root and prints an overview table.
 - `varve show <experiment_id> [--root DIR] [--branch NAME]` prints one store's stage details and dependency edges.
+- `varve refresh [--root DIR] [--prefix MODULE_PREFIX]` runs stale discovered experiment branches. With `--prefix`, it only considers manifest modules starting with that prefix.
 
-Discovery is intentionally zero-import in the current dashboard. The dashboard does not import experiment modules, build a `Config`, call runner, or perform engine cache decisions yet. It reads only the store under each branch output root, so the reported status is a latest snapshot of recorded stages. The experiment `status` command is the authoritative read-only cache decision view until the dashboard status-validity redesign lands. Stores outside the branch output layout are skipped.
+Discovery is intentionally zero-import. Read-only dashboard commands import experiment modules only when engine state evaluation needs the manifest module; `refresh` imports matching stale experiments before calling the runner. Stores outside the branch output layout are skipped.
 
 - `ok`: a success record exists and every recorded artifact path still exists.
 - `artifact-missing`: a success record exists but at least one recorded artifact is missing.

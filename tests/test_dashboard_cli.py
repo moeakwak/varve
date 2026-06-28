@@ -214,6 +214,57 @@ def test_refresh_runs_only_stale_entries_in_discovery_order(
     assert "Refreshing stale --branch main" in captured.out
 
 
+def test_refresh_prefix_filters_entries_by_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = [
+        ExperimentEntry(
+            output_root=tmp_path / "match" / "out" / "main",
+            experiment_id="match",
+            experiment_name="Match",
+            branch="main",
+            module="studies.exp.analysis.match",
+        ),
+        ExperimentEntry(
+            output_root=tmp_path / "other" / "out" / "main",
+            experiment_id="other",
+            experiment_name="Other",
+            branch="main",
+            module="studies.exp.audit.other",
+        ),
+        ExperimentEntry(
+            output_root=tmp_path / "legacy" / "out" / "main",
+            experiment_id="legacy",
+            experiment_name="Legacy",
+            branch="main",
+            module=None,
+        ),
+    ]
+
+    monkeypatch.setattr(
+        "varve.dashboard.cli.discover_experiments",
+        lambda root, *, include_temporary=False: entries,
+    )
+    checked: list[str] = []
+
+    def fake_state(entry: ExperimentEntry):
+        checked.append(entry.experiment_id)
+        return ExperimentState(entry=entry, stages=[], status="stale", error=None)
+
+    refreshed: list[str] = []
+    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
+    monkeypatch.setattr(
+        "varve.dashboard.cli._run_entry",
+        lambda entry: refreshed.append(entry.experiment_id),
+    )
+
+    assert main(["refresh", "--root", str(tmp_path), "--prefix", "studies.exp.analysis"]) == 0
+
+    assert checked == ["match"]
+    assert refreshed == ["match"]
+
+
 def test_refresh_noops_when_no_entries_are_stale(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
