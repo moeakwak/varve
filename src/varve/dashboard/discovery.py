@@ -12,7 +12,7 @@ from varve.dashboard.models import ExperimentEntry
 from varve.models import Manifest
 
 
-def discover_experiments(root: Path) -> list[ExperimentEntry]:
+def discover_experiments(root: Path, *, include_temporary: bool = False) -> list[ExperimentEntry]:
     """Return all discovered varve stores under root, sorted by stable id."""
     root = Path(root).resolve()
     if not root.exists():
@@ -26,7 +26,7 @@ def discover_experiments(root: Path) -> list[ExperimentEntry]:
         if not manifest_path.exists():
             continue
         output_root = store_root.parent
-        if _is_temporary_output_root(output_root):
+        if _is_temporary_output_root(output_root) and not include_temporary:
             continue
         split = _branch_output_id(root, output_root)
         if split is None:
@@ -56,6 +56,16 @@ def _relative_parts(root: Path, output_root: Path) -> tuple[str, ...]:
 
 def _branch_output_id(root: Path, output_root: Path) -> tuple[str, str] | None:
     parts = _relative_parts(root, output_root)
+    if len(parts) >= 3 and parts[-3] == "out" and parts[-2] == ".tmp":
+        experiment_parts = parts[:-3]
+        experiment_id = (
+            ".".join(experiment_parts)
+            if experiment_parts
+            else output_root.parent.parent.parent.name
+        )
+        return experiment_id, parts[-1]
+    if output_root.parent.name == ".tmp" and output_root.parent.parent.name == "out":
+        return output_root.parent.parent.parent.name, output_root.name
     if len(parts) >= 2 and parts[-2] == "out":
         experiment_parts = parts[:-2]
         experiment_id = ".".join(experiment_parts) if experiment_parts else output_root.parent.parent.name

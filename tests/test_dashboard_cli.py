@@ -11,7 +11,7 @@ from varve import Experiment, stage
 from varve.dashboard import render
 from varve.dashboard.cli import main
 from varve.dashboard.models import ExperimentEntry, ExperimentState, StateError
-from varve.dashboard.render import render_detail
+from varve.dashboard.render import render_detail, render_overview
 from varve.engine.runner import run
 from varve.store.store import Store
 
@@ -76,6 +76,50 @@ def test_show_renders_error_diagnostics(
     output = capsys.readouterr().out
     assert "Status: error" in output
     assert "Error: import:" in output
+
+
+def test_ls_and_show_can_include_temporary_branches(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    Store(tmp_path / "demo" / "out" / "main").ensure_initialized(
+        "Demo",
+        module="varve.no_such_main",
+    )
+    Store(tmp_path / "demo" / "out" / ".tmp" / "quick").ensure_initialized(
+        "Demo",
+        module="varve.no_such_temp",
+        temporary_config={},
+    )
+
+    assert main(["ls", "--root", str(tmp_path)]) == 0
+    default_output = capsys.readouterr().out
+    assert "quick" not in default_output
+
+    assert main(["ls", "--root", str(tmp_path), "--include-temp"]) == 0
+    include_temp_output = capsys.readouterr().out
+    assert "demo" in include_temp_output
+    assert "main" in include_temp_output
+    assert "quick" in include_temp_output
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.chdir(tmp_path)
+        assert main(["--include-temp"]) == 0
+    finally:
+        monkeypatch.undo()
+    default_command_output = capsys.readouterr().out
+    assert "quick" in default_command_output
+
+    assert main(["show", "demo", "--branch", "quick", "--root", str(tmp_path)]) == 1
+    assert "Unknown experiment: demo (branch quick)" in capsys.readouterr().err
+
+    assert main(
+        ["show", "demo", "--branch", "quick", "--root", str(tmp_path), "--include-temp"]
+    ) == 0
+    detail = capsys.readouterr().out
+    assert "Status: error" in detail
+    assert "Error: import:" in detail
 
 
 def test_ls_returns_nonzero_for_empty_scan_root(
@@ -157,3 +201,51 @@ def test_render_detail_styles_status(
 
     assert "Status: \x1b[31merror\x1b[0m" in buffer.getvalue()
     assert "Error: import: missing" in buffer.getvalue()
+
+
+def test_render_overview_groups_repeated_experiment_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = StringIO()
+
+    def console_factory(**kwargs):
+        return Console(
+            file=buffer,
+            force_terminal=False,
+            width=120,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(render, "Console", console_factory)
+    states = [
+        ExperimentState(
+            entry=ExperimentEntry(
+                output_root=tmp_path / "demo" / "out" / "main",
+                experiment_id="demo",
+                experiment_name="Demo",
+                branch="main",
+            ),
+            stages=[],
+            status="hit",
+            error=None,
+        ),
+        ExperimentState(
+            entry=ExperimentEntry(
+                output_root=tmp_path / "demo" / "out" / ".tmp" / "quick",
+                experiment_id="demo",
+                experiment_name="Demo",
+                branch="quick",
+            ),
+            stages=[],
+            status="hit",
+            error=None,
+        ),
+    ]
+
+    render_overview(states)
+
+    output = buffer.getvalue()
+    assert output.count("demo") == 1
+    assert "main" in output
+    assert "quick" in output

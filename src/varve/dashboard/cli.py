@@ -15,27 +15,46 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.command == "show":
-        return _show(args.root, args.experiment, args.branch)
+        return _show(args.root, args.experiment, args.branch, args.include_temp)
     root = args.root if args.command == "ls" else Path.cwd()
-    return _ls(root)
+    include_temp = args.include_temp
+    return _ls(root, include_temp)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="varve")
+    parser.add_argument(
+        "--include-temp",
+        action="store_true",
+        default=False,
+        help="include temporary override branches under out/.tmp",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     ls_parser = subparsers.add_parser("ls", help="list discovered experiment stores")
     ls_parser.add_argument("--root", type=Path, default=Path.cwd())
+    ls_parser.add_argument(
+        "--include-temp",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="include temporary override branches under out/.tmp",
+    )
 
     show_parser = subparsers.add_parser("show", help="show one experiment store")
     show_parser.add_argument("experiment")
     show_parser.add_argument("--root", type=Path, default=Path.cwd())
     show_parser.add_argument("--branch", default="main")
+    show_parser.add_argument(
+        "--include-temp",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="include temporary override branches under out/.tmp",
+    )
     return parser
 
 
-def _ls(root: Path) -> int:
-    entries = discover_experiments(root)
+def _ls(root: Path, include_temp: bool) -> int:
+    entries = discover_experiments(root, include_temporary=include_temp)
     if not entries:
         print(f"No experiments found under {root}", file=sys.stderr)
         return 1
@@ -44,8 +63,8 @@ def _ls(root: Path) -> int:
     return 0
 
 
-def _show(root: Path, experiment_id: str, branch: str) -> int:
-    entries = discover_experiments(root)
+def _show(root: Path, experiment_id: str, branch: str, include_temp: bool) -> int:
+    entries = discover_experiments(root, include_temporary=include_temp)
     by_key = {(entry.experiment_id, entry.branch): entry for entry in entries}
     entry = by_key.get((experiment_id, branch))
     if entry is None:

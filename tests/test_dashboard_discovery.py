@@ -45,6 +45,22 @@ def test_discover_experiments_splits_colocated_output_branch_and_filters_tempora
     )
 
 
+def test_discover_experiments_can_include_temporary_branches(
+    tmp_path: Path,
+) -> None:
+    Store(tmp_path / "analysis" / "demo" / "out" / "main").ensure_initialized("Demo")
+    Store(tmp_path / "analysis" / "demo" / "out" / ".tmp" / "quick").ensure_initialized("Demo")
+
+    entries = discover_experiments(tmp_path, include_temporary=True)
+
+    by_key = {(entry.experiment_id, entry.branch): entry for entry in entries}
+    assert ("analysis.demo", "main") in by_key
+    assert ("analysis.demo", "quick") in by_key
+    assert by_key[("analysis.demo", "quick")].output_root == (
+        tmp_path / "analysis" / "demo" / "out" / ".tmp" / "quick"
+    )
+
+
 def test_discover_experiments_filters_temporary_when_scan_root_is_out_dir(
     tmp_path: Path,
 ) -> None:
@@ -55,6 +71,22 @@ def test_discover_experiments_filters_temporary_when_scan_root_is_out_dir(
     entries = discover_experiments(out)
 
     assert [(entry.experiment_id, entry.branch) for entry in entries] == [("demo", "main")]
+
+
+def test_discover_experiments_can_include_temporary_when_scan_root_is_out_dir(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "demo" / "out"
+    Store(out / "main").ensure_initialized("Demo")
+    Store(out / ".tmp" / "quick").ensure_initialized("Demo")
+
+    entries = discover_experiments(out, include_temporary=True)
+
+    assert [(entry.experiment_id, entry.branch) for entry in entries] == [
+        ("demo", "main"),
+        ("demo", "quick"),
+    ]
+
 
 
 def test_discover_experiments_keeps_scanning_when_manifest_is_not_readable(

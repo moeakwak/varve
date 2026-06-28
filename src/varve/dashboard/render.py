@@ -33,15 +33,22 @@ def render_overview(states: list[ExperimentState]) -> None:
     table.add_column("STAGES")
     table.add_column("LAST RUN")
 
+    previous_experiment_id: str | None = None
     for state in sorted(states, key=lambda item: (item.entry.experiment_id, item.entry.branch)):
         hit_count = sum(1 for stage in state.stages if stage.status == "hit")
+        experiment_id = (
+            state.entry.experiment_id
+            if state.entry.experiment_id != previous_experiment_id
+            else ""
+        )
         table.add_row(
-            state.entry.experiment_id,
+            experiment_id,
             state.entry.branch,
             _status_text(state.status),
             f"{hit_count}/{len(state.stages)}",
             _format_datetime(_last_run(state.stages)),
         )
+        previous_experiment_id = state.entry.experiment_id
     console.print(table)
 
 
