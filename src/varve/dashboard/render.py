@@ -8,33 +8,38 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from varve.dashboard.models import ExperimentState, OverallStatus, StageState, StageStatus
+from varve.dashboard.models import ExperimentState, ExperimentStatus, StageState
+from varve.engine.state import Status
 
-_STATUS_STYLES: dict[StageStatus | OverallStatus, str] = {
-    "ok": "green",
+_STATUS_STYLES: dict[Status | ExperimentStatus, str] = {
+    "hit": "green",
     "artifact-missing": "yellow",
-    "interrupted": "yellow",
-    "corrupt": "red",
-    "empty": "dim",
+    "resume": "yellow",
+    "no-cache": "yellow",
+    "stale": "yellow",
+    "dirty": "red",
+    "unrecoverable": "red",
+    "corrupt-store": "red",
+    "error": "red",
 }
 
 
 def render_overview(states: list[ExperimentState]) -> None:
     console = Console(highlight=False)
-    table = Table()
+    table = Table(box=None)
     table.add_column("EXPERIMENT")
     table.add_column("BRANCH")
-    table.add_column("OVERALL")
+    table.add_column("STATUS")
     table.add_column("STAGES")
     table.add_column("LAST RUN")
 
     for state in sorted(states, key=lambda item: (item.entry.experiment_id, item.entry.branch)):
-        ok_count = sum(1 for stage in state.stages if stage.status == "ok")
+        hit_count = sum(1 for stage in state.stages if stage.status == "hit")
         table.add_row(
             state.entry.experiment_id,
             state.entry.branch,
-            _status_text(state.overall),
-            f"{ok_count}/{len(state.stages)}",
+            _status_text(state.status),
+            f"{hit_count}/{len(state.stages)}",
             _format_datetime(_last_run(state.stages)),
         )
     console.print(table)
@@ -48,21 +53,25 @@ def render_detail(state: ExperimentState) -> None:
     # hard-wrap them at the console width and split the path mid-string.
     console.print(f"Output root: {state.entry.output_root}", soft_wrap=True)
     console.print(f"Name: {experiment_name}")
-    console.print("Overall: ", _status_text(state.overall), sep="")
+    console.print("Status: ", _status_text(state.status), sep="")
+    if state.error is not None:
+        console.print(f"Error: {state.error.phase}: {state.error.message}")
     console.print()
 
     stage_by_name = {stage.name: stage for stage in state.stages}
-    stage_table = Table(title="Stages")
+    stage_table = Table(title="Stages", box=None)
     stage_table.add_column("STAGE")
     stage_table.add_column("STATUS")
+    stage_table.add_column("REASON")
     stage_table.add_column("ARTIFACTS")
     stage_table.add_column("COMMITTED")
     stage_table.add_column("UPSTREAMS")
-    for name in state.order:
+    for name in stage_by_name:
         stage = stage_by_name[name]
         stage_table.add_row(
             stage.name,
             _status_text(stage.status),
+            stage.reason,
             _format_artifacts(stage),
             _format_datetime(stage.committed_at),
             ", ".join(stage.upstreams) if stage.upstreams else "-",
@@ -71,12 +80,12 @@ def render_detail(state: ExperimentState) -> None:
     console.print()
 
     console.print("Plan")
-    if not state.order:
+    if not state.stages:
         console.print("  No recorded stages.")
         return
     nodes = set(stage_by_name)
     printed_any = False
-    for name in state.order:
+    for name in stage_by_name:
         stage = stage_by_name[name]
         upstreams = [upstream for upstream in stage.upstreams if upstream in nodes]
         if not upstreams:
@@ -90,7 +99,7 @@ def render_detail(state: ExperimentState) -> None:
         console.print("  No recorded dependencies.")
 
 
-def _status_text(status: StageStatus | OverallStatus) -> Text:
+def _status_text(status: ExperimentStatus) -> Text:
     return Text(status, style=_STATUS_STYLES[status])
 
 

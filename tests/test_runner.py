@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -117,6 +118,27 @@ def test_evaluate_state_does_not_initialize_store(tmp_path: Path) -> None:
     outcomes = evaluate_state(ToyExperiment, Config(), cli_out=tmp_path)
     assert [outcome.status for outcome in outcomes] == ["no-cache", "no-cache", "no-cache"]
     assert not (_out(tmp_path) / ".varve").exists()
+
+
+def test_run_writes_importable_main_module_to_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MainExperiment(ToyExperiment):
+        pass
+
+    class Spec:
+        name = "pkg.demo.__main__"
+
+    module = type("Module", (), {"__spec__": Spec()})()
+    MainExperiment.__module__ = "__main__"
+    monkeypatch.setitem(sys.modules, "__main__", module)
+
+    run(MainExperiment, Config(), cli_out=tmp_path, upto="sample")
+
+    manifest = Store(_out(tmp_path)).read_manifest()
+    assert manifest is not None
+    assert manifest.module == "pkg.demo.__main__"
 
 
 def test_evaluate_state_propagates_current_upstream_keys(tmp_path: Path) -> None:

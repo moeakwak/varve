@@ -1,90 +1,112 @@
-"""Load read-only dashboard state from a varve store."""
+"""Load read-only dashboard state using the engine state evaluator."""
 
 from __future__ import annotations
 
+import importlib
 from datetime import datetime
 from pathlib import Path
 
+from varve.branch_config import resolve_branch
 from varve.dashboard.models import (
     ArtifactState,
+    ErrorPhase,
     ExperimentEntry,
     ExperimentState,
-    OverallStatus,
     StageState,
-    StageStatus,
+    StateError,
 )
+from varve.engine.runner import evaluate_state
+from varve.engine.state import Status
+from varve.experiment import Experiment
 from varve.models import SuccessRecord
-from varve.store.store import CorruptStore, Store
+from varve.store.store import Store
 
-_STATUS_PRIORITY: dict[StageStatus, int] = {
-    "ok": 0,
-    "artifact-missing": 1,
-    "interrupted": 2,
-    "corrupt": 3,
-}
+STATUS_PRIORITY: tuple[Status, ...] = (
+    "hit",
+    "artifact-missing",
+    "resume",
+    "no-cache",
+    "stale",
+    "dirty",
+    "corrupt-store",
+    "unrecoverable",
+)
+_STATUS_PRIORITY = {status: index for index, status in enumerate(STATUS_PRIORITY)}
 
 
 def load_state(entry: ExperimentEntry) -> ExperimentState:
-    """Load one experiment's dashboard state from its latest store snapshot."""
+    """Load one experiment branch's current cache state."""
+    if entry.manifest_error:
+        return _error(entry, "manifest", entry.manifest_error)
+    if entry.experiment_name is None:
+        return _error(entry, "manifest", "Manifest is missing experiment")
+    if entry.module is None:
+        return _error(entry, "manifest", "Manifest is missing module")
+
+    try:
+        experiment = _import_experiment(entry.module, entry.experiment_name)
+    except Exception as error:  # noqa: BLE001 - dashboard must keep scanning after import failures.
+        return _error(entry, "import", str(error))
+
+    try:
+        resolved = resolve_branch(
+            experiment,
+            branch=entry.branch,
+            override_json=None,
+            cli_out=_output_base(entry),
+        )
+    except Exception as error:  # noqa: BLE001 - dashboard reports resolver diagnostics.
+        return _error(entry, "resolve", str(error))
+
+    try:
+        outcomes = evaluate_state(
+            experiment,
+            resolved.config,
+            args=experiment.Args(),
+            cli_out=resolved.output_base,
+            branch=resolved.branch,
+            is_temporary=resolved.is_temporary,
+        )
+    except Exception as error:  # noqa: BLE001 - dashboard reports evaluator diagnostics.
+        return _error(entry, "evaluate", str(error))
+
+    outcomes_by_stage = {outcome.stage: outcome for outcome in outcomes}
     store = Store(entry.output_root)
     stages: list[StageState] = []
-    for name in _stage_names(store):
-        stage = _load_stage(entry, store, name)
-        if stage is not None:
-            stages.append(stage)
-
-    order = _topological_order(stages)
-    overall = _overall(entry, stages)
-    return ExperimentState(entry=entry, stages=stages, order=order, overall=overall)
-
-
-def _stage_names(store: Store) -> list[str]:
-    names: set[str] = set()
-    for directory_name in ("stages", "attempts"):
-        directory = store.root / directory_name
-        if directory.exists():
-            names.update(path.stem for path in directory.glob("*.json") if path.is_file())
-    return sorted(names)
-
-
-def _load_stage(entry: ExperimentEntry, store: Store, name: str) -> StageState | None:
-    try:
+    for name in experiment.topo_order():
+        outcome = outcomes_by_stage[name]
         success = store.read_success(name)
-        attempt = store.read_attempt(name)
-    except CorruptStore:
-        return StageState(
-            name=name,
-            status="corrupt",
-            artifacts=[],
-            committed_at=None,
-            upstreams=[],
+        stages.append(
+            StageState(
+                name=name,
+                status=outcome.status,
+                reason=outcome.reason,
+                artifacts=_artifacts(entry, success) if success is not None else [],
+                committed_at=_parse_datetime(success.committed_at) if success is not None else None,
+                upstreams=list(experiment.stages()[name].needs),
+            )
         )
 
-    if success is None and attempt is None:
-        return None
-
-    artifacts: list[ArtifactState] = []
-    committed_at: datetime | None = None
-    upstreams: list[str] = []
-    if success is not None:
-        artifacts = _artifacts(entry, success)
-        committed_at = _parse_datetime(success.committed_at)
-        upstreams = sorted(success.key_components.upstreams)
-
-    if attempt is not None:
-        status: StageStatus = "interrupted"
-    elif success is not None:
-        status = "ok" if all(artifact.exists for artifact in artifacts) else "artifact-missing"
-    else:
-        return None
-
-    return StageState(
-        name=name,
-        status=status,
-        artifacts=artifacts,
-        committed_at=committed_at,
-        upstreams=upstreams,
+    return ExperimentState(
+        entry=entry,
+        stages=stages,
+        status=_aggregate_status(stages),
+        error=None,
     )
+
+
+def _import_experiment(module_name: str, class_name: str) -> type[Experiment]:
+    module = importlib.import_module(module_name)
+    value = getattr(module, class_name)
+    if not isinstance(value, type) or not issubclass(value, Experiment):
+        raise TypeError(f"{module_name}.{class_name} is not a varve Experiment")
+    return value
+
+
+def _output_base(entry: ExperimentEntry) -> Path:
+    if entry.output_root.parent.name == ".tmp":
+        return entry.output_root.parent.parent
+    return entry.output_root.parent
 
 
 def _artifacts(entry: ExperimentEntry, success: SuccessRecord) -> list[ArtifactState]:
@@ -107,33 +129,20 @@ def _parse_datetime(value: str) -> datetime | None:
         return None
 
 
-def _topological_order(stages: list[StageState]) -> list[str]:
-    nodes = {stage.name for stage in stages}
-    incoming = {name: set[str]() for name in nodes}
-    outgoing = {name: set[str]() for name in nodes}
-    for stage in stages:
-        for upstream in stage.upstreams:
-            if upstream not in nodes:
-                continue
-            incoming[stage.name].add(upstream)
-            outgoing[upstream].add(stage.name)
-
-    ready = sorted(name for name, upstreams in incoming.items() if not upstreams)
-    order: list[str] = []
-    while ready:
-        name = ready.pop(0)
-        order.append(name)
-        for downstream in sorted(outgoing[name]):
-            incoming[downstream].remove(name)
-            if not incoming[downstream]:
-                ready.append(downstream)
-        ready.sort()
-    return order if len(order) == len(nodes) else sorted(nodes)
-
-
-def _overall(entry: ExperimentEntry, stages: list[StageState]) -> OverallStatus:
-    if entry.experiment_name is None:
-        return "corrupt"
+def _aggregate_status(stages: list[StageState]) -> Status:
     if not stages:
-        return "empty"
+        return "hit"
     return max(stages, key=lambda stage: _STATUS_PRIORITY[stage.status]).status
+
+
+def _error(
+    entry: ExperimentEntry,
+    phase: ErrorPhase,
+    message: str,
+) -> ExperimentState:
+    return ExperimentState(
+        entry=entry,
+        stages=[],
+        status="error",
+        error=StateError(phase=phase, message=message),
+    )

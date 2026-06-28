@@ -85,13 +85,3 @@ def test_output_root_default_resolution(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="branch name"):
         Demo.output_root(DemoConfig(), branch="bad/name")
-
-    class MissingDefault(Experiment):
-        Config = DemoConfig
-
-        @stage()
-        def sample(self, ctx):  # pragma: no cover - metadata only
-            return None
-
-    with pytest.raises(NotImplementedError, match="must override default_output_root"):
-        MissingDefault.output_root(DemoConfig())

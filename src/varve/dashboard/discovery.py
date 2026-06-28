@@ -32,12 +32,15 @@ def discover_experiments(root: Path) -> list[ExperimentEntry]:
         if split is None:
             continue
         experiment_id, branch = split
+        manifest, manifest_error = _read_manifest(manifest_path)
         entries.append(
             ExperimentEntry(
                 output_root=output_root,
                 experiment_id=experiment_id,
-                experiment_name=_read_experiment_name(manifest_path),
+                experiment_name=manifest.experiment if manifest is not None else None,
                 branch=branch,
+                module=manifest.module if manifest is not None else None,
+                manifest_error=manifest_error,
             )
         )
     return sorted(entries, key=lambda entry: (entry.experiment_id, entry.branch))
@@ -67,9 +70,9 @@ def _is_temporary_output_root(output_root: Path) -> bool:
     return any(left == "out" and right == ".tmp" for left, right in zip(parts, parts[1:]))
 
 
-def _read_experiment_name(manifest_path: Path) -> str | None:
+def _read_manifest(manifest_path: Path) -> tuple[Manifest | None, str | None]:
     try:
         data: Any = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return Manifest.model_validate(data).experiment
-    except (json.JSONDecodeError, OSError, ValidationError):
-        return None
+        return Manifest.model_validate(data), None
+    except (json.JSONDecodeError, OSError, ValidationError) as error:
+        return None, str(error)

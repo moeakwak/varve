@@ -8,8 +8,15 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-StageStatus = Literal["ok", "artifact-missing", "interrupted", "corrupt"]
-OverallStatus = Literal["ok", "artifact-missing", "interrupted", "corrupt", "empty"]
+from varve.engine.state import Status
+
+ExperimentStatus = Status | Literal["error"]
+ErrorPhase = Literal["manifest", "import", "resolve", "evaluate"]
+
+
+class StateError(BaseModel):
+    phase: ErrorPhase
+    message: str
 
 
 class ExperimentEntry(BaseModel):
@@ -17,6 +24,8 @@ class ExperimentEntry(BaseModel):
     experiment_id: str
     experiment_name: str | None
     branch: str
+    module: str | None = None
+    manifest_error: str | None = None
 
 
 class ArtifactState(BaseModel):
@@ -26,7 +35,8 @@ class ArtifactState(BaseModel):
 
 class StageState(BaseModel):
     name: str
-    status: StageStatus
+    status: Status
+    reason: str
     artifacts: list[ArtifactState]
     committed_at: datetime | None
     upstreams: list[str]
@@ -35,5 +45,5 @@ class StageState(BaseModel):
 class ExperimentState(BaseModel):
     entry: ExperimentEntry
     stages: list[StageState]
-    order: list[str]
-    overall: OverallStatus
+    status: ExperimentStatus
+    error: StateError | None = None

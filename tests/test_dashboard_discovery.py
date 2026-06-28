@@ -11,7 +11,10 @@ def test_discover_experiments_requires_branch_output_layout(
 ) -> None:
     Store(tmp_path).ensure_initialized("RootExperiment")
     Store(tmp_path / "simple").ensure_initialized("SimpleExperiment")
-    Store(tmp_path / "nested" / "child" / "out" / "main").ensure_initialized("NestedExperiment")
+    Store(tmp_path / "nested" / "child" / "out" / "main").ensure_initialized(
+        "NestedExperiment",
+        module="pkg.nested",
+    )
 
     entries = discover_experiments(tmp_path)
 
@@ -19,6 +22,8 @@ def test_discover_experiments_requires_branch_output_layout(
     assert set(by_id) == {"nested.child"}
     assert by_id["nested.child"].output_root == tmp_path / "nested" / "child" / "out" / "main"
     assert by_id["nested.child"].experiment_name == "NestedExperiment"
+    assert by_id["nested.child"].module == "pkg.nested"
+    assert by_id["nested.child"].manifest_error is None
     assert by_id["nested.child"].branch == "main"
 
 
@@ -69,8 +74,22 @@ def test_discover_experiments_keeps_scanning_when_manifest_is_not_readable(
 
     by_id = {entry.experiment_id: entry for entry in entries}
     assert by_id["bad-json"].experiment_name is None
+    assert by_id["bad-json"].manifest_error
     assert by_id["missing-field"].experiment_name is None
+    assert by_id["missing-field"].manifest_error
     assert by_id["good"].experiment_name == "GoodExperiment"
+
+
+def test_discover_experiments_keeps_manifest_without_module(
+    tmp_path: Path,
+) -> None:
+    Store(tmp_path / "legacy" / "out" / "main").ensure_initialized("LegacyExperiment")
+
+    entries = discover_experiments(tmp_path)
+
+    assert entries[0].experiment_name == "LegacyExperiment"
+    assert entries[0].module is None
+    assert entries[0].manifest_error is None
 
 
 def test_discover_experiments_returns_empty_for_missing_root(tmp_path: Path) -> None:
@@ -92,3 +111,4 @@ def test_discover_experiments_treats_manifest_schema_errors_as_unreadable(
     assert entries[0].experiment_id == "bad-schema"
     assert entries[0].branch == "main"
     assert entries[0].experiment_name is None
+    assert entries[0].manifest_error

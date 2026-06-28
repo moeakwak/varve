@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from functools import cache
 from graphlib import TopologicalSorter
@@ -64,13 +65,33 @@ class Experiment:
         return list(TopologicalSorter(graph).static_order())
 
     @classmethod
+    def import_module_name(cls) -> str:
+        if cls.__module__ != "__main__":
+            return cls.__module__
+        module = sys.modules.get("__main__")
+        spec = getattr(module, "__spec__", None)
+        spec_name = getattr(spec, "name", None)
+        return spec_name or cls.__module__
+
+    @classmethod
+    def _module_file(cls) -> str | None:
+        module = sys.modules.get(cls.__module__)
+        module_file = getattr(module, "__file__", None)
+        if module_file is not None:
+            return module_file
+        spec = importlib.util.find_spec(cls.import_module_name())
+        return getattr(spec, "origin", None)
+
+    @classmethod
     def default_output_root(cls, config: Any) -> Path:
-        raise NotImplementedError(f"{cls.__name__} must override default_output_root")
+        module_file = cls._module_file()
+        if module_file is None:
+            raise ValueError(f"Cannot locate module file for {cls.__module__}")
+        return Path(module_file).resolve().parent / "out"
 
     @classmethod
     def varve_config_path(cls) -> Path | None:
-        module = sys.modules.get(cls.__module__)
-        module_file = getattr(module, "__file__", None)
+        module_file = cls._module_file()
         if module_file is None:
             return None
         path = Path(module_file).resolve().parent / "varve.yaml"

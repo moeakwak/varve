@@ -59,6 +59,7 @@ class Store:
         self,
         experiment: str,
         *,
+        module: str | None = None,
         temporary_config: dict[str, Any] | None = None,
     ) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -69,13 +70,37 @@ class Store:
         if manifest is None:
             _atomic_write_json(
                 manifest_path,
-                Manifest(experiment=experiment, temporary_config=temporary_config),
+                Manifest(
+                    experiment=experiment,
+                    module=module,
+                    temporary_config=temporary_config,
+                ),
             )
             return
         if manifest.experiment != experiment:
             raise ValueError(
                 f"Varve store belongs to {manifest.experiment}, not {experiment}: "
                 f"{manifest_path}"
+            )
+        if (
+            temporary_config is not None
+            and manifest.temporary_config is not None
+            and manifest.temporary_config != temporary_config
+        ):
+            raise ValueError(f"Varve store has a different temporary config: {manifest_path}")
+        if (
+            (module is not None and manifest.module != module)
+            or (temporary_config is not None and manifest.temporary_config is None)
+        ):
+            _atomic_write_json(
+                manifest_path,
+                Manifest(
+                    experiment=manifest.experiment,
+                    module=module if module is not None else manifest.module,
+                    temporary_config=temporary_config
+                    if temporary_config is not None
+                    else manifest.temporary_config,
+                ),
             )
 
     def read_success(self, stage: str) -> SuccessRecord | None:

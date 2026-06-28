@@ -485,7 +485,11 @@ def run(
     store = Store(out)
     store.root.mkdir(parents=True, exist_ok=True)
     with OutputLock(store.root):
-        store.ensure_initialized(experiment.__name__, temporary_config=temporary_config)
+        store.ensure_initialized(
+            experiment.__name__,
+            module=experiment.import_module_name(),
+            temporary_config=temporary_config,
+        )
         return asyncio.run(
             _drive(
                 experiment,

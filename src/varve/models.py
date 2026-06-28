@@ -16,6 +16,7 @@ class VarveModel(BaseModel):
 class Manifest(VarveModel):
     schema_version: int = SCHEMA_VERSION
     experiment: str
+    module: str | None = None
     temporary_config: dict[str, Any] | None = None
 
 
