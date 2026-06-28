@@ -7,8 +7,10 @@ import sys
 from pathlib import Path
 
 from varve.dashboard.discovery import discover_experiments
+from varve.dashboard.models import ExperimentEntry
 from varve.dashboard.render import render_detail, render_overview
-from varve.dashboard.state import load_state
+from varve.dashboard.state import import_entry_experiment, load_state, resolve_entry_branch
+from varve.engine.runner import run
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -16,6 +18,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "show":
         return _show(args.root, args.experiment, args.branch, args.include_temp)
+    if args.command == "refresh":
+        return _refresh(args.root, args.include_temp)
     root = args.root if args.command == "ls" else Path.cwd()
     include_temp = args.include_temp
     return _ls(root, include_temp)
@@ -50,6 +54,15 @@ def _parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="include temporary override branches under out/.tmp",
     )
+
+    refresh_parser = subparsers.add_parser("refresh", help="run stale discovered experiments")
+    refresh_parser.add_argument("--root", type=Path, default=Path.cwd())
+    refresh_parser.add_argument(
+        "--include-temp",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="include temporary override branches under out/.tmp",
+    )
     return parser
 
 
@@ -78,3 +91,46 @@ def _show(root: Path, experiment_id: str, branch: str, include_temp: bool) -> in
         return 1
     render_detail(load_state(entry))
     return 0
+
+
+def _refresh(root: Path, include_temp: bool) -> int:
+    entries = discover_experiments(root, include_temporary=include_temp)
+    if not entries:
+        print(f"No experiments found under {root}", file=sys.stderr)
+        return 1
+
+    refreshed = 0
+    failed = 0
+    for entry in entries:
+        state = load_state(entry)
+        if state.status != "stale":
+            continue
+        print(f"Refreshing {entry.experiment_id} --branch {entry.branch}")
+        try:
+            _run_entry(entry)
+        except Exception as error:  # noqa: BLE001 - refresh should continue with later stores.
+            failed += 1
+            print(
+                f"Failed to refresh {entry.experiment_id} --branch {entry.branch}: {error}",
+                file=sys.stderr,
+            )
+        else:
+            refreshed += 1
+
+    if refreshed == 0 and failed == 0:
+        print("No stale experiments found")
+    return 1 if failed else 0
+
+
+def _run_entry(entry: ExperimentEntry) -> None:
+    experiment = import_entry_experiment(entry)
+    resolved = resolve_entry_branch(entry, experiment)
+    run(
+        experiment,
+        resolved.config,
+        args=experiment.Args(),
+        cli_out=resolved.output_base,
+        branch=resolved.branch,
+        is_temporary=resolved.is_temporary,
+        temporary_config=resolved.temporary_config,
+    )

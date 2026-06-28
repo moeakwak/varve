@@ -38,8 +38,9 @@ Top-level dashboard:
 
 - `varve ls [--root DIR]`: scan a directory tree for varve stores and print an overview.
 - `varve show <experiment_id> [--root DIR] [--branch NAME]`: print one discovered store's stage details and recorded dependency edges.
+- `varve refresh [--root DIR]`: run discovered experiment branches whose dashboard status is `stale`.
 
-The dashboard is read-only. It discovers experiments by looking for `.varve/manifest.json` under the scan root, imports the experiment module recorded in the manifest, resolves the selected branch, and uses the same engine state evaluator as the experiment `status` command. For colocated outputs shaped like `<experiment>/out/<branch>`, the `experiment_id` is the experiment path with the trailing `out/<branch>` removed, and the branch is tracked separately. Stores outside that layout are not shown.
+`varve ls` and `varve show` are read-only. The dashboard discovers experiments by looking for `.varve/manifest.json` under the scan root, imports the experiment module recorded in the manifest, resolves the selected branch, and uses the same engine state evaluator as the experiment `status` command. `varve refresh` executes stale experiments in discovery order. For colocated outputs shaped like `<experiment>/out/<branch>`, the `experiment_id` is the experiment path with the trailing `out/<branch>` removed, and the branch is tracked separately. Stores outside that layout are not shown.
 
 Dashboard overview uses a `STATUS` column. Each experiment + branch status is one of the engine `Status` values, or `error` when manifest parsing, experiment import, branch/config resolution, or engine evaluation fails. `varve show` prints the diagnostic phase and message for those failures, and includes each stage's engine `STATUS` and `REASON`.
 

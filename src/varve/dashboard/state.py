@@ -6,7 +6,7 @@ import importlib
 from datetime import datetime
 from pathlib import Path
 
-from varve.branch_config import resolve_branch
+from varve.branch_config import ResolvedBranch, resolve_branch
 from varve.dashboard.models import (
     ArtifactState,
     ErrorPhase,
@@ -44,17 +44,12 @@ def load_state(entry: ExperimentEntry) -> ExperimentState:
         return _error(entry, "manifest", "Manifest is missing module")
 
     try:
-        experiment = _import_experiment(entry.module, entry.experiment_name)
+        experiment = import_entry_experiment(entry)
     except Exception as error:  # noqa: BLE001 - dashboard must keep scanning after import failures.
         return _error(entry, "import", str(error))
 
     try:
-        resolved = resolve_branch(
-            experiment,
-            branch=entry.branch,
-            override_json=None,
-            cli_out=_output_base(entry),
-        )
+        resolved = resolve_entry_branch(entry, experiment)
     except Exception as error:  # noqa: BLE001 - dashboard reports resolver diagnostics.
         return _error(entry, "resolve", str(error))
 
@@ -92,6 +87,28 @@ def load_state(entry: ExperimentEntry) -> ExperimentState:
         stages=stages,
         status=_aggregate_status(stages),
         error=None,
+    )
+
+
+def import_entry_experiment(entry: ExperimentEntry) -> type[Experiment]:
+    if entry.manifest_error:
+        raise ValueError(entry.manifest_error)
+    if entry.experiment_name is None:
+        raise ValueError("Manifest is missing experiment")
+    if entry.module is None:
+        raise ValueError("Manifest is missing module")
+    return _import_experiment(entry.module, entry.experiment_name)
+
+
+def resolve_entry_branch(
+    entry: ExperimentEntry,
+    experiment: type[Experiment],
+) -> ResolvedBranch:
+    return resolve_branch(
+        experiment,
+        branch=entry.branch,
+        override_json=None,
+        cli_out=_output_base(entry),
     )
 
 

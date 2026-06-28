@@ -168,6 +168,84 @@ def test_no_subcommand_defaults_to_ls(
     assert "default" in captured.out
 
 
+def test_refresh_runs_only_stale_entries_in_discovery_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entries = [
+        ExperimentEntry(
+            output_root=tmp_path / "stale" / "out" / "main",
+            experiment_id="stale",
+            experiment_name="Stale",
+            branch="main",
+            module="tests.demo",
+        ),
+        ExperimentEntry(
+            output_root=tmp_path / "hit" / "out" / "main",
+            experiment_id="hit",
+            experiment_name="Hit",
+            branch="main",
+            module="tests.demo",
+        ),
+    ]
+
+    def fake_discover(root: Path, *, include_temporary: bool = False):
+        assert root == tmp_path
+        assert include_temporary is True
+        return entries
+
+    def fake_state(entry: ExperimentEntry):
+        status = "stale" if entry.experiment_id == "stale" else "hit"
+        return ExperimentState(entry=entry, stages=[], status=status, error=None)
+
+    refreshed: list[tuple[str, str]] = []
+    monkeypatch.setattr("varve.dashboard.cli.discover_experiments", fake_discover)
+    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
+    monkeypatch.setattr(
+        "varve.dashboard.cli._run_entry",
+        lambda entry: refreshed.append((entry.experiment_id, entry.branch)),
+    )
+
+    assert main(["refresh", "--root", str(tmp_path), "--include-temp"]) == 0
+
+    captured = capsys.readouterr()
+    assert refreshed == [("stale", "main")]
+    assert "Refreshing stale --branch main" in captured.out
+
+
+def test_refresh_noops_when_no_entries_are_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entry = ExperimentEntry(
+        output_root=tmp_path / "hit" / "out" / "main",
+        experiment_id="hit",
+        experiment_name="Hit",
+        branch="main",
+        module="tests.demo",
+    )
+
+    monkeypatch.setattr(
+        "varve.dashboard.cli.discover_experiments",
+        lambda root, *, include_temporary=False: [entry],
+    )
+    monkeypatch.setattr(
+        "varve.dashboard.cli.load_state",
+        lambda item: ExperimentState(entry=item, stages=[], status="hit", error=None),
+    )
+    monkeypatch.setattr(
+        "varve.dashboard.cli._run_entry",
+        lambda item: pytest.fail("refresh should skip non-stale entries"),
+    )
+
+    assert main(["refresh", "--root", str(tmp_path)]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "No stale experiments found\n"
+
+
 def test_render_detail_styles_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
