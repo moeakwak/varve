@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -206,6 +207,36 @@ def helper(value):
     assert "uses.uses_first.helper" in components.source
     assert "uses.uses_second.helper" in components.source
     assert len([key for key in components.source if key.startswith("uses.")]) == 3
+
+
+def test_main_module_uses_stable_spec_name_for_helper_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Spec:
+        name = "pkg.demo.__main__"
+
+    module = type("Module", (), {"__spec__": Spec()})()
+    monkeypatch.setitem(sys.modules, "__main__", module)
+    original_module = helper.__module__
+    helper.__module__ = "__main__"
+    try:
+        base = _stage_spec()
+        spec = StageSpec(
+            name=base.name,
+            kind=base.kind,
+            func=base.func,
+            needs=base.needs,
+            produces=base.produces,
+            keyspec=base.keyspec,
+            uses=(helper,),
+        )
+
+        components = compute_key_components(spec, Ctx(Config(profile="a")), {})
+    finally:
+        helper.__module__ = original_module
+
+    assert "uses.pkg.demo.__main__.helper" in components.source
+    assert "uses.__main__.helper" not in components.source
 
 
 def test_content_key_changes_when_upstream_changes(tmp_path: Path) -> None:
