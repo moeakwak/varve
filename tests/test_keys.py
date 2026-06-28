@@ -280,7 +280,9 @@ class PathCtx:
 
 def test_config_path_fields_are_rejected(tmp_path: Path) -> None:
     with pytest.raises(TypeError, match="Config fields must not contain Path"):
-        compute_key_components(_stage_spec(), PathCtx(PathConfig(profile="a", workspace=tmp_path)), {})
+        compute_key_components(
+            _stage_spec(), PathCtx(PathConfig(profile="a", workspace=tmp_path)), {}
+        )
 
 
 def test_nested_config_path_fields_are_rejected_even_when_none() -> None:

@@ -90,7 +90,7 @@ def test_derive_override_branch_accepts_explicit_name() -> None:
 def test_cli_discovers_adjacent_varve_yaml(tmp_path: Path) -> None:
     module_path = tmp_path / "demo_exp.py"
     module_path.write_text(
-        '''
+        """
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -112,7 +112,7 @@ class DemoExperiment(Experiment):
     @stage(produces="sample.txt")
     def sample(self, ctx):
         (ctx.out / "sample.txt").write_text(ctx.config.token, encoding="utf-8")
-''',
+""",
         encoding="utf-8",
     )
     (tmp_path / "varve.yaml").write_text(
@@ -129,7 +129,7 @@ class DemoExperiment(Experiment):
 def test_cli_does_not_discover_adjacent_branches_yaml(tmp_path: Path) -> None:
     module_path = tmp_path / "demo_exp_legacy.py"
     module_path.write_text(
-        '''
+        """
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -151,7 +151,7 @@ class DemoExperiment(Experiment):
     @stage(produces="sample.txt")
     def sample(self, ctx):
         (ctx.out / "sample.txt").write_text(ctx.config.token, encoding="utf-8")
-''',
+""",
         encoding="utf-8",
     )
     (tmp_path / "branches.yaml").write_text(

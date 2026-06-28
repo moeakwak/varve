@@ -134,10 +134,7 @@ def _artifacts(entry: ExperimentEntry, success: SuccessRecord) -> list[ArtifactS
     else:
         assert success.outputs is not None
         paths = [Path(output.path) for output in success.outputs]
-    return [
-        ArtifactState(path=path, exists=(entry.output_root / path).exists())
-        for path in paths
-    ]
+    return [ArtifactState(path=path, exists=(entry.output_root / path).exists()) for path in paths]
 
 
 def _parse_datetime(value: str) -> datetime | None:

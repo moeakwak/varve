@@ -196,15 +196,21 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
     )
     run_stage = run_parser.add_mutually_exclusive_group()
     run_stage.add_argument("--upto", metavar="STAGE", help="Run STAGE and all upstream stages.")
-    run_stage.add_argument("--downstream", metavar="STAGE", help="Run STAGE and all downstream stages.")
-    run_parser.add_argument("--force", "-f", action="store_true", help="Ignore cache for selected stages.")
+    run_stage.add_argument(
+        "--downstream", metavar="STAGE", help="Run STAGE and all downstream stages."
+    )
+    run_parser.add_argument(
+        "--force", "-f", action="store_true", help="Ignore cache for selected stages."
+    )
     run_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
 
     status_parser = subparsers.add_parser("status", help="show read-only stage status")
     status_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
     status_stage = status_parser.add_mutually_exclusive_group()
     status_stage.add_argument("--upto", metavar="STAGE", help="Show STAGE and all upstream stages.")
-    status_stage.add_argument("--downstream", metavar="STAGE", help="Show STAGE and all downstream stages.")
+    status_stage.add_argument(
+        "--downstream", metavar="STAGE", help="Show STAGE and all downstream stages."
+    )
     status_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
 
     clean_parser = subparsers.add_parser("clean", help="delete selected store records and outputs")
@@ -220,7 +226,9 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
     plan_parser = subparsers.add_parser("plan", help="print selected stage order")
     plan_stage = plan_parser.add_mutually_exclusive_group()
     plan_stage.add_argument("--upto", metavar="STAGE", help="Print STAGE and all upstream stages.")
-    plan_stage.add_argument("--downstream", metavar="STAGE", help="Print STAGE and all downstream stages.")
+    plan_stage.add_argument(
+        "--downstream", metavar="STAGE", help="Print STAGE and all downstream stages."
+    )
 
     subparsers.add_parser("list")
 
@@ -274,7 +282,9 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
             is_temporary=resolved.is_temporary,
         )
     elif namespace.command == "clean":
-        allowed_roots = None if isinstance(config, SimpleNamespace) else experiment.clean_roots(config)
+        allowed_roots = (
+            None if isinstance(config, SimpleNamespace) else experiment.clean_roots(config)
+        )
         clean(
             experiment,
             config,

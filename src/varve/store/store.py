@@ -79,8 +79,7 @@ class Store:
             return
         if manifest.experiment != experiment:
             raise ValueError(
-                f"Varve store belongs to {manifest.experiment}, not {experiment}: "
-                f"{manifest_path}"
+                f"Varve store belongs to {manifest.experiment}, not {experiment}: {manifest_path}"
             )
         if (
             temporary_config is not None
@@ -88,9 +87,8 @@ class Store:
             and manifest.temporary_config != temporary_config
         ):
             raise ValueError(f"Varve store has a different temporary config: {manifest_path}")
-        if (
-            (module is not None and manifest.module != module)
-            or (temporary_config is not None and manifest.temporary_config is None)
+        if (module is not None and manifest.module != module) or (
+            temporary_config is not None and manifest.temporary_config is None
         ):
             _atomic_write_json(
                 manifest_path,

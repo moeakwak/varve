@@ -38,7 +38,9 @@ def file_set(
 
         if missing and not allow_empty:
             listed = ", ".join(missing)
-            raise FileNotFoundError(f"file_set pattern(s) matched no files under {root_path}: {listed}")
+            raise FileNotFoundError(
+                f"file_set pattern(s) matched no files under {root_path}: {listed}"
+            )
 
         return sorted(paths, key=str)
 

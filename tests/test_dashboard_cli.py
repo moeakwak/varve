@@ -114,9 +114,9 @@ def test_ls_and_show_can_include_temporary_branches(
     assert main(["show", "demo", "--branch", "quick", "--root", str(tmp_path)]) == 1
     assert "Unknown experiment: demo (branch quick)" in capsys.readouterr().err
 
-    assert main(
-        ["show", "demo", "--branch", "quick", "--root", str(tmp_path), "--include-temp"]
-    ) == 0
+    assert (
+        main(["show", "demo", "--branch", "quick", "--root", str(tmp_path), "--include-temp"]) == 0
+    )
     detail = capsys.readouterr().out
     assert "Status: error" in detail
     assert "Error: import:" in detail

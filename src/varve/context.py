@@ -82,7 +82,9 @@ class Ctx:
             paths = [self.out / item.path for item in record.produces]
             return paths[0] if len(paths) == 1 else paths
         assert record.outputs is not None
-        return [self.out / item.path for item in sorted(record.outputs, key=lambda item: item.index)]
+        return [
+            self.out / item.path for item in sorted(record.outputs, key=lambda item: item.index)
+        ]
 
     async def resume(
         self,

@@ -31,9 +31,7 @@ def test_file_fingerprint_missing_file_fails_fast(tmp_path: Path) -> None:
 
 
 def test_canonical_json_is_stable_and_rejects_unknown_objects() -> None:
-    assert canonical_json({"b": 2, "a": [1.0, True]}) == canonical_json(
-        {"a": [1.0, True], "b": 2}
-    )
+    assert canonical_json({"b": 2, "a": [1.0, True]}) == canonical_json({"a": [1.0, True], "b": 2})
     with pytest.raises(TypeError, match="string keys"):
         canonical_json({1: "not-json"})
     with pytest.raises(TypeError):
@@ -52,6 +50,4 @@ def test_files_fingerprints_are_order_independent(tmp_path: Path) -> None:
 
     one = files_fingerprints(Ctx(), {"datasets": lambda _ctx: [b, a]})
     two = files_fingerprints(Ctx(), {"datasets": lambda _ctx: [a, b]})
-    assert [item.sha256 for item in one["datasets"]] == [
-        item.sha256 for item in two["datasets"]
-    ]
+    assert [item.sha256 for item in one["datasets"]] == [item.sha256 for item in two["datasets"]]

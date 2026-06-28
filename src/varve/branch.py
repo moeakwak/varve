@@ -119,6 +119,9 @@ def derive_override_branch(
     """Apply an override JSON object and derive a temporary branch name."""
     validate_branch_name(base_name)
     merged = merge_override(base_config, override_json)
-    branch = name or f"{base_name}_override_{hashlib.sha256(canonical_config_json(merged).encode('utf-8')).hexdigest()[:12]}"
+    branch = (
+        name
+        or f"{base_name}_override_{hashlib.sha256(canonical_config_json(merged).encode('utf-8')).hexdigest()[:12]}"
+    )
     validate_branch_name(branch)
     return merged, branch, True

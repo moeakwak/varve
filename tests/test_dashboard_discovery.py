@@ -88,7 +88,6 @@ def test_discover_experiments_can_include_temporary_when_scan_root_is_out_dir(
     ]
 
 
-
 def test_discover_experiments_keeps_scanning_when_manifest_is_not_readable(
     tmp_path: Path,
 ) -> None:

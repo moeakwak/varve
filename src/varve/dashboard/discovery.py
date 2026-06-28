@@ -68,7 +68,9 @@ def _branch_output_id(root: Path, output_root: Path) -> tuple[str, str] | None:
         return output_root.parent.parent.parent.name, output_root.name
     if len(parts) >= 2 and parts[-2] == "out":
         experiment_parts = parts[:-2]
-        experiment_id = ".".join(experiment_parts) if experiment_parts else output_root.parent.parent.name
+        experiment_id = (
+            ".".join(experiment_parts) if experiment_parts else output_root.parent.parent.name
+        )
         return experiment_id, parts[-1]
     if output_root.parent.name == "out":
         return output_root.parent.parent.name, output_root.name

@@ -71,7 +71,9 @@ def decide_batch(
 
     if success is not None:
         if success.content_key != current_key:
-            return Decision("stale", invalidation_reason(success.key_components, current_components))
+            return Decision(
+                "stale", invalidation_reason(success.key_components, current_components)
+            )
         assert success.outputs is not None
         output_paths_by_index: dict[int, list[str]] = {}
         for output in success.outputs:

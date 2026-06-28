@@ -48,10 +48,7 @@ def _settings_type(config_type: type[BaseModel]):
         ):
             return (init_settings, env_settings, dotenv_settings, file_secret_settings)
 
-    fields = {
-        name: (field.annotation, field)
-        for name, field in config_type.model_fields.items()
-    }
+    fields = {name: (field.annotation, field) for name, field in config_type.model_fields.items()}
     return create_model(f"{config_type.__name__}VarveSettings", __base__=VarveSettings, **fields)
 
 

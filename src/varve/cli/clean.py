@@ -28,7 +28,9 @@ def _validate_destructive(root: Path, allowed_roots: list[Path] | None = None) -
     dangerous = {Path("/").resolve(), Path.home().resolve(), Path.cwd().resolve()}
     if resolved in dangerous:
         raise ValueError(f"Refusing to clean dangerous path: {resolved}")
-    if allowed_roots is not None and not any(_is_relative_to(resolved, allowed) for allowed in allowed_roots):
+    if allowed_roots is not None and not any(
+        _is_relative_to(resolved, allowed) for allowed in allowed_roots
+    ):
         raise ValueError(f"Refusing to clean path outside allowed roots: {resolved}")
 
 

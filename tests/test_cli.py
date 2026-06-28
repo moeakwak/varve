@@ -116,20 +116,23 @@ def test_cli_list_and_plan(capsys) -> None:
 
 def test_cli_run_status_clean(tmp_path: Path, capsys) -> None:
     override = '{"token":"x"}'
-    assert CliExperiment.cli(
-        [
-            "run",
-            "--out",
-            str(tmp_path),
-            "--branch",
-            "quick",
-            "--override",
-            override,
-            "--no-enabled",
-            "--items",
-            "[1,2]",
-        ]
-    ) == 0
+    assert (
+        CliExperiment.cli(
+            [
+                "run",
+                "--out",
+                str(tmp_path),
+                "--branch",
+                "quick",
+                "--override",
+                override,
+                "--no-enabled",
+                "--items",
+                "[1,2]",
+            ]
+        )
+        == 0
+    )
     assert (tmp_path / ".tmp" / "quick" / "sample.txt").read_text(encoding="utf-8") == "x"
     assert "no-cache" in capsys.readouterr().out
 
@@ -218,9 +221,12 @@ def test_cli_clean_target_after_dynamic_config_options_does_not_clean_root(tmp_p
     extra = root / "extra.txt"
     extra.write_text("extra", encoding="utf-8")
 
-    assert CliExperiment.cli(
-        ["clean", f"--out={out}", "--no-enabled", "--downstream", "sample", "--yes"]
-    ) == 0
+    assert (
+        CliExperiment.cli(
+            ["clean", f"--out={out}", "--no-enabled", "--downstream", "sample", "--yes"]
+        )
+        == 0
+    )
     assert root.exists()
     assert extra.exists()
     assert not (root / "sample.txt").exists()
@@ -233,9 +239,12 @@ def test_cli_clean_target_after_nested_equals_option_does_not_clean_root(tmp_pat
     extra = root / "extra.txt"
     extra.write_text("extra", encoding="utf-8")
 
-    assert NestedCliExperiment.cli(
-        ["clean", f"--out={out}", "--inner.name=custom", "--downstream", "sample", "--yes"]
-    ) == 0
+    assert (
+        NestedCliExperiment.cli(
+            ["clean", f"--out={out}", "--inner.name=custom", "--downstream", "sample", "--yes"]
+        )
+        == 0
+    )
     assert root.exists()
     assert extra.exists()
     assert not (root / "sample.txt").exists()
@@ -248,9 +257,12 @@ def test_cli_clean_target_after_nested_bool_option_does_not_clean_root(tmp_path:
     extra = root / "extra.txt"
     extra.write_text("extra", encoding="utf-8")
 
-    assert NestedCliExperiment.cli(
-        ["clean", f"--out={out}", "--no-inner.enabled", "--downstream", "sample", "--yes"]
-    ) == 0
+    assert (
+        NestedCliExperiment.cli(
+            ["clean", f"--out={out}", "--no-inner.enabled", "--downstream", "sample", "--yes"]
+        )
+        == 0
+    )
     assert root.exists()
     assert extra.exists()
     assert not (root / "sample.txt").exists()
@@ -271,9 +283,12 @@ def test_cli_command_args_do_not_pollute_conflicting_args_fields(
     assert ConflictingCliExperiment.cli(["run", "--upto", "sample", f"--out={out}", "--force"]) == 0
     assert captured[-1] == ConflictingCliArgs()
 
-    assert ConflictingCliExperiment.cli(
-        ["run", "--upto", "sample", f"--out={out}", "--target", "config"]
-    ) == 0
+    assert (
+        ConflictingCliExperiment.cli(
+            ["run", "--upto", "sample", f"--out={out}", "--target", "config"]
+        )
+        == 0
+    )
     assert captured[-1] == ConflictingCliArgs(target="config")
 
 
@@ -355,18 +370,21 @@ def test_cli_end_to_end_equivalence_with_nested_config(
     monkeypatch.setattr("varve.cli.app.run", fake_run)
 
     out = tmp_path / "out"
-    assert NestedCliExperiment.cli(
-        [
-            "run",
-            f"--out={out}",
-            "--inner.name=cli",
-            "--inner.age=3",
-            "--enabled",
-            "--no-enabled",
-            "--items",
-            "[1,2]",
-        ]
-    ) == 0
+    assert (
+        NestedCliExperiment.cli(
+            [
+                "run",
+                f"--out={out}",
+                "--inner.name=cli",
+                "--inner.age=3",
+                "--enabled",
+                "--no-enabled",
+                "--items",
+                "[1,2]",
+            ]
+        )
+        == 0
+    )
     assert captured[-1] == NestedArgs(
         enabled=False,
         items=[1, 2],
@@ -494,9 +512,7 @@ def test_cli_literal_field_rejects_invalid_choice(tmp_path: Path) -> None:
     assert exc_info.value.code != 0
 
 
-def test_cli_str_enum_field_accepts_value(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cli_str_enum_field_accepts_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _capture_run(monkeypatch)
     assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--engine", "katex"]) == 0
     assert captured[-1][1].engine is Engine.katex
@@ -516,9 +532,7 @@ def test_cli_optional_field_accepts_null_sentinel(
     assert captured[-1][1].sample is None
 
 
-def test_cli_optional_field_accepts_value(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cli_optional_field_accepts_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _capture_run(monkeypatch)
     assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--sample", "9"]) == 0
     assert captured[-1][1].sample == 9
@@ -579,17 +593,20 @@ def test_cli_rejects_mutually_exclusive_stage_filters(argv: list[str]) -> None:
 
 def test_cli_clean_with_bare_output_root_skips_required_fields(tmp_path: Path) -> None:
     out = tmp_path / "out"
-    assert RequiredExtraCliExperiment.cli(
-        ["run", f"--out={out}", "--branch", "alpha", "--override", '{"dataset":"alpha"}']
-    ) == 0
+    assert (
+        RequiredExtraCliExperiment.cli(
+            ["run", f"--out={out}", "--branch", "alpha", "--override", '{"dataset":"alpha"}']
+        )
+        == 0
+    )
     assert (out / ".tmp" / "alpha" / "sample.txt").exists()
 
     assert RequiredExtraCliExperiment.cli(["status", f"--out={out}", "--branch", "alpha"]) == 0
 
     # clean only needs the output root, not the unrelated required `dataset` field.
-    assert RequiredExtraCliExperiment.cli(
-        ["clean", f"--out={out}", "--branch", "alpha", "--yes"]
-    ) == 0
+    assert (
+        RequiredExtraCliExperiment.cli(["clean", f"--out={out}", "--branch", "alpha", "--yes"]) == 0
+    )
     assert not (out / ".tmp" / "alpha").exists()
 
 
@@ -606,7 +623,9 @@ def test_cli_named_override_branch_reuses_manifest_and_guards_config(
     assert "hit" in capsys.readouterr().out
 
     with pytest.raises(ValueError, match="different config"):
-        CliExperiment.cli(["run", f"--out={out}", "--branch", "quick", "--override", '{"token":"y"}'])
+        CliExperiment.cli(
+            ["run", f"--out={out}", "--branch", "quick", "--override", '{"token":"y"}']
+        )
 
 
 def test_cli_hash_override_branch_uses_validated_config_not_json_order(
@@ -627,9 +646,12 @@ def test_cli_status_and_clean_locate_named_override_without_override(
     tmp_path: Path,
 ) -> None:
     out = tmp_path / "out"
-    assert CliExperiment.cli(
-        ["run", f"--out={out}", "--branch", "quick", "--override", '{"token":"x"}']
-    ) == 0
+    assert (
+        CliExperiment.cli(
+            ["run", f"--out={out}", "--branch", "quick", "--override", '{"token":"x"}']
+        )
+        == 0
+    )
     assert CliExperiment.cli(["clean", f"--out={out}", "--branch", "quick", "--yes"]) == 0
     assert not (out / ".tmp" / "quick").exists()
 

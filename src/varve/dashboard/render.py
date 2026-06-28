@@ -38,9 +38,7 @@ def render_overview(states: list[ExperimentState]) -> None:
     for state in sorted(states, key=lambda item: (item.entry.experiment_id, item.entry.branch)):
         hit_count = sum(1 for stage in state.stages if stage.status == "hit")
         experiment_id = (
-            state.entry.experiment_id
-            if state.entry.experiment_id != previous_experiment_id
-            else ""
+            state.entry.experiment_id if state.entry.experiment_id != previous_experiment_id else ""
         )
         table.add_row(
             experiment_id,
