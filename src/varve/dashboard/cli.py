@@ -11,6 +11,9 @@ from varve.dashboard.models import ExperimentEntry
 from varve.dashboard.render import render_detail, render_overview
 from varve.dashboard.state import import_entry_experiment, load_state, resolve_entry_branch
 from varve.engine.runner import run
+from varve.log import configure_cli_logging
+
+_EXECUTABLE_STATUSES = {"artifact-missing", "dirty", "no-cache", "resume", "stale"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -55,7 +58,7 @@ def _parser() -> argparse.ArgumentParser:
         help="include temporary override branches under out/.tmp",
     )
 
-    refresh_parser = subparsers.add_parser("refresh", help="run stale discovered experiments")
+    refresh_parser = subparsers.add_parser("refresh", help="run executable discovered experiments")
     refresh_parser.add_argument("--root", type=Path, default=Path.cwd())
     refresh_parser.add_argument(
         "--prefix",
@@ -111,11 +114,15 @@ def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
 
     refreshed = 0
     failed = 0
+    logging_configured = False
     for entry in entries:
         state = load_state(entry)
-        if state.status != "stale":
+        if state.status not in _EXECUTABLE_STATUSES:
             continue
         print(f"Refreshing {entry.experiment_id} --branch {entry.branch}")
+        if not logging_configured:
+            configure_cli_logging()
+            logging_configured = True
         try:
             _run_entry(entry)
         except Exception as error:  # noqa: BLE001 - refresh should continue with later stores.
@@ -128,7 +135,7 @@ def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
             refreshed += 1
 
     if refreshed == 0 and failed == 0:
-        print("No stale experiments found")
+        print("No executable experiments found")
     return 1 if failed else 0
 
 

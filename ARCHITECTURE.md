@@ -231,9 +231,9 @@ The top-level `varve` console script provides a dashboard over existing stores:
 
 - `varve ls [--root DIR]` discovers `<experiment>/out/<branch>/.varve/manifest.json` files under the scan root and prints an overview table.
 - `varve show <experiment_id> [--root DIR] [--branch NAME]` prints one store's stage details and dependency edges.
-- `varve refresh [--root DIR] [--prefix MODULE_PREFIX]` runs stale discovered experiment branches. With `--prefix`, it only considers manifest modules starting with that prefix.
+- `varve refresh [--root DIR] [--prefix MODULE_PREFIX]` runs executable discovered experiment branches. With `--prefix`, it only considers manifest modules starting with that prefix.
 
-Discovery is intentionally zero-import. Read-only dashboard commands import experiment modules only when engine state evaluation needs the manifest module; `refresh` imports matching stale experiments before calling the runner. Stores outside the branch output layout are skipped.
+Discovery is intentionally zero-import. Read-only dashboard commands import experiment modules only when engine state evaluation needs the manifest module; `refresh` imports matching experiments with `artifact-missing`, `dirty`, `no-cache`, `resume`, or `stale` status before calling the runner. Stores outside the branch output layout are skipped.
 
 - `ok`: a success record exists and every recorded artifact path still exists.
 - `artifact-missing`: a success record exists but at least one recorded artifact is missing.
