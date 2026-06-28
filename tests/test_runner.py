@@ -7,7 +7,7 @@ import pytest
 from pydantic import BaseModel
 
 from varve import Experiment, KeySpec, batch_stage, stage
-from varve.engine.runner import run, selected_stages
+from varve.engine.runner import evaluate_state, run, selected_stages
 from varve.models import BatchRecord, PartialMeta
 from varve.store.store import Store
 
@@ -94,8 +94,7 @@ def _out(base: Path) -> Path:
 
 
 def test_selected_stages() -> None:
-    assert selected_stages(ToyExperiment, target="transform") == {"sample", "transform"}
-    assert selected_stages(ToyExperiment, only="transform") == {"transform"}
+    assert selected_stages(ToyExperiment, upto="transform") == {"sample", "transform"}
     assert selected_stages(ToyExperiment, downstream="transform") == {"transform", "summarize"}
 
 
@@ -114,15 +113,15 @@ def test_runner_hit_stale_and_artifact_missing(tmp_path: Path) -> None:
     assert repaired[-1].status == "artifact-missing"
 
 
-def test_runner_dry_does_not_initialize_store(tmp_path: Path) -> None:
-    outcomes = run(ToyExperiment, Config(), cli_out=tmp_path, dry=True)
+def test_evaluate_state_does_not_initialize_store(tmp_path: Path) -> None:
+    outcomes = evaluate_state(ToyExperiment, Config(), cli_out=tmp_path)
     assert [outcome.status for outcome in outcomes] == ["no-cache", "no-cache", "no-cache"]
     assert not (_out(tmp_path) / ".varve").exists()
 
 
-def test_runner_dry_propagates_current_upstream_keys(tmp_path: Path) -> None:
+def test_evaluate_state_propagates_current_upstream_keys(tmp_path: Path) -> None:
     run(ToyExperiment, Config(token="a"), cli_out=tmp_path)
-    dry = run(ToyExperiment, Config(token="b"), cli_out=tmp_path, dry=True)
+    dry = evaluate_state(ToyExperiment, Config(token="b"), cli_out=tmp_path)
     actual = run(ToyExperiment, Config(token="b"), cli_out=tmp_path)
     assert [outcome.status for outcome in dry] == [outcome.status for outcome in actual]
 
@@ -134,9 +133,9 @@ def test_batch_resume_after_failure(tmp_path: Path) -> None:
             Config(),
             args=Args(fail_after=1),
             cli_out=tmp_path,
-            target="transform",
+            upto="transform",
         )
-    resumed = run(ToyExperiment, Config(), cli_out=tmp_path, target="transform")
+    resumed = run(ToyExperiment, Config(), cli_out=tmp_path, upto="transform")
     assert resumed[-1].status == "resume"
     assert len(list((_out(tmp_path) / "transform").glob("part-*.txt"))) == 4
 
@@ -145,7 +144,7 @@ def test_batch_resume_after_failure(tmp_path: Path) -> None:
     assert record.outputs is not None
     assert [output.index for output in record.outputs] == [0, 1, 2, 3]
 
-    summary = run(ToyExperiment, Config(), cli_out=tmp_path, only="summarize")
+    summary = run(ToyExperiment, Config(), cli_out=tmp_path, downstream="summarize")
     assert summary[-1].status == "no-cache"
     assert (_out(tmp_path) / "summary.txt").read_text(encoding="utf-8") == "0:a,1:a,2:a,3:a"
 
@@ -157,7 +156,7 @@ def test_no_cache_batch_ignores_mismatched_partial_outputs(tmp_path: Path) -> No
             Config(),
             args=Args(fail_after=0),
             cli_out=tmp_path,
-            target="transform",
+            upto="transform",
         )
 
     partial_root = _out(tmp_path) / ".varve" / "partial" / "transform"
@@ -181,7 +180,7 @@ def test_no_cache_batch_ignores_mismatched_partial_outputs(tmp_path: Path) -> No
         BatchRecord(index=99, yielded=["stale.txt"], committed_at="old"),
     )
 
-    rerun = run(ToyExperiment, Config(), cli_out=tmp_path, target="transform")
+    rerun = run(ToyExperiment, Config(), cli_out=tmp_path, upto="transform")
     assert rerun[-1].status == "no-cache"
 
     record = Store(_out(tmp_path)).read_success("transform")
@@ -202,7 +201,7 @@ def test_no_cache_failure_does_not_resume_mismatched_partial_outputs(tmp_path: P
             Config(),
             args=Args(fail_after=0),
             cli_out=tmp_path,
-            target="transform",
+            upto="transform",
         )
 
     partial_root = _out(tmp_path) / ".varve" / "partial" / "transform"
@@ -232,10 +231,10 @@ def test_no_cache_failure_does_not_resume_mismatched_partial_outputs(tmp_path: P
             Config(),
             args=Args(fail_after=0),
             cli_out=tmp_path,
-            target="transform",
+            upto="transform",
         )
 
-    resumed = run(ToyExperiment, Config(), cli_out=tmp_path, target="transform")
+    resumed = run(ToyExperiment, Config(), cli_out=tmp_path, upto="transform")
     assert resumed[-1].status == "resume"
 
     record = Store(_out(tmp_path)).read_success("transform")
@@ -250,9 +249,9 @@ def test_no_cache_failure_does_not_resume_mismatched_partial_outputs(tmp_path: P
 
 
 def test_completed_batch_artifact_missing_and_unrecoverable(tmp_path: Path) -> None:
-    run(ToyExperiment, Config(), cli_out=tmp_path, target="transform")
+    run(ToyExperiment, Config(), cli_out=tmp_path, upto="transform")
     (_out(tmp_path) / "transform" / "part-1.txt").unlink()
-    repaired = run(ToyExperiment, Config(), cli_out=tmp_path, target="transform")
+    repaired = run(ToyExperiment, Config(), cli_out=tmp_path, upto="transform")
     assert repaired[-1].status == "artifact-missing"
     record = Store(_out(tmp_path)).read_success("transform")
     assert record is not None
@@ -260,7 +259,7 @@ def test_completed_batch_artifact_missing_and_unrecoverable(tmp_path: Path) -> N
     assert [output.index for output in record.outputs] == [0, 1, 2, 3]
 
     (_out(tmp_path) / "transform" / "part-1.txt").unlink()
-    changed_partition = run(ToyExperiment, Config(batch_size=3), cli_out=tmp_path, target="transform")
+    changed_partition = run(ToyExperiment, Config(batch_size=3), cli_out=tmp_path, upto="transform")
     assert changed_partition[-1].status == "stale"
     assert (_out(tmp_path) / "transform" / "part-1.txt").exists()
 
@@ -272,9 +271,9 @@ def test_force_reruns_all_batch_items_after_partial(tmp_path: Path) -> None:
             Config(),
             args=Args(fail_after=1),
             cli_out=tmp_path,
-            target="transform",
+            upto="transform",
         )
-    forced = run(ToyExperiment, Config(), cli_out=tmp_path, target="transform", force=True)
+    forced = run(ToyExperiment, Config(), cli_out=tmp_path, upto="transform", force=True)
     assert forced[-1].reason == "forced"
     assert len(list((_out(tmp_path) / "transform").glob("part-*.txt"))) == 4
     record = Store(_out(tmp_path)).read_success("transform")

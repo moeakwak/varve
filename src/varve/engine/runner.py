@@ -151,24 +151,21 @@ def _closure(seed: str, graph: dict[str, set[str]]) -> set[str]:
 def selected_stages(
     experiment_type: type[Experiment],
     *,
-    target: str | None = None,
-    only: str | None = None,
+    upto: str | None = None,
     downstream: str | None = None,
 ) -> set[str]:
-    specified = [item is not None for item in (target, only, downstream)]
+    specified = [item is not None for item in (upto, downstream)]
     if sum(specified) > 1:
-        raise ValueError("target, only, and downstream are mutually exclusive")
+        raise ValueError("upto and downstream are mutually exclusive")
     stages = experiment_type.stages()
-    for name in (target, only, downstream):
+    for name in (upto, downstream):
         if name is not None and name not in stages:
             raise ValueError(f"Unknown varve stage: {name}")
     ancestors, descendants = _stage_sets(experiment_type)
-    if only is not None:
-        return {only}
     if downstream is not None:
         return _closure(downstream, descendants)
-    if target is not None:
-        return _closure(target, ancestors)
+    if upto is not None:
+        return _closure(upto, ancestors)
     return set(stages)
 
 
@@ -268,20 +265,18 @@ async def _drive(
     *,
     args,
     out: Path,
-    target: str | None,
-    only: str | None,
+    upto: str | None,
     downstream: str | None,
     force: bool,
-    dry: bool,
+    execute: bool,
 ) -> list[StageOutcome]:
     store = Store(out)
     selected = selected_stages(
         experiment_type,
-        target=target,
-        only=only,
+        upto=upto,
         downstream=downstream,
     )
-    if not dry:
+    if execute:
         _validate_external_upstreams(experiment_type, selected, store, out)
 
     instance = experiment_type()
@@ -296,14 +291,14 @@ async def _drive(
         if stage_name not in selected:
             continue
         stage_spec = experiment_type.stages()[stage_name]
-        if dry:
+        if not execute:
             missing_upstream = any(store.read_success(name) is None for name in stage_spec.needs)
             if missing_upstream:
                 outcomes.append(StageOutcome(stage_name, "no-cache", "no cache", None))
                 continue
         upstream_keys = (
             _upstream_keys_from_known(stage_spec, store, known_content_keys)
-            if dry
+            if not execute
             else _upstream_keys(stage_spec, store)
         )
         previous = store.read_success(stage_name)
@@ -353,14 +348,14 @@ async def _drive(
 
         if force:
             decision = Decision("stale" if previous else "no-cache", "forced")
-        if not dry and decision.status == "hit":
+        if execute and decision.status == "hit":
             _refresh_fingerprint_cache(
                 store=store,
                 stage_name=stage_name,
                 previous=previous,
                 components=components,
             )
-        if dry or decision.status == "hit":
+        if not execute or decision.status == "hit":
             logger.info(
                 "[%s] %s%s",
                 stage_name,
@@ -471,11 +466,47 @@ def run(
     config,
     *,
     args=None,
-    target: str | None = None,
-    only: str | None = None,
+    upto: str | None = None,
     downstream: str | None = None,
     force: bool = False,
-    dry: bool = False,
+    cli_out: Path | None = None,
+    branch: str = "main",
+    is_temporary: bool = False,
+    temporary_config: dict[str, Any] | None = None,
+) -> list[StageOutcome]:
+    if args is None:
+        args = experiment.Args()
+    out = experiment.output_root(
+        config,
+        cli_out=cli_out,
+        branch=branch,
+        is_temporary=is_temporary,
+    )
+    store = Store(out)
+    store.root.mkdir(parents=True, exist_ok=True)
+    with OutputLock(store.root):
+        store.ensure_initialized(experiment.__name__, temporary_config=temporary_config)
+        return asyncio.run(
+            _drive(
+                experiment,
+                config,
+                args=args,
+                out=out,
+                upto=upto,
+                downstream=downstream,
+                force=force,
+                execute=True,
+            )
+        )
+
+
+def evaluate_state(
+    experiment: type[Experiment],
+    config,
+    *,
+    args=None,
+    upto: str | None = None,
+    downstream: str | None = None,
     cli_out: Path | None = None,
     branch: str = "main",
     is_temporary: bool = False,
@@ -488,34 +519,15 @@ def run(
         branch=branch,
         is_temporary=is_temporary,
     )
-    if dry:
-        return asyncio.run(
-            _drive(
-                experiment,
-                config,
-                args=args,
-                out=out,
-                target=target,
-                only=only,
-                downstream=downstream,
-                force=force,
-                dry=True,
-            )
+    return asyncio.run(
+        _drive(
+            experiment,
+            config,
+            args=args,
+            out=out,
+            upto=upto,
+            downstream=downstream,
+            force=False,
+            execute=False,
         )
-    store = Store(out)
-    store.root.mkdir(parents=True, exist_ok=True)
-    with OutputLock(store.root):
-        store.ensure_initialized(experiment.__name__)
-        return asyncio.run(
-            _drive(
-                experiment,
-                config,
-                args=args,
-                out=out,
-                target=target,
-                only=only,
-                downstream=downstream,
-                force=force,
-                dry=False,
-            )
-        )
+    )

@@ -23,8 +23,11 @@ def _components() -> KeyComponents:
 
 def test_store_initializes_gitignore_and_manifest(tmp_path: Path) -> None:
     store = Store(tmp_path)
-    store.ensure_initialized("Demo")
+    store.ensure_initialized("Demo", temporary_config={"token": "x"})
     assert (tmp_path / ".varve" / ".gitignore").read_text(encoding="utf-8") == "*\n"
+    manifest = store.read_manifest()
+    assert manifest is not None
+    assert manifest.temporary_config == {"token": "x"}
     with pytest.raises(ValueError, match="belongs to Demo"):
         store.ensure_initialized("Other")
 

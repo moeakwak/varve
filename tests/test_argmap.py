@@ -7,7 +7,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from varve.cli.app import _config_from_args
-from varve.cli.argmap import collect_cli_config_namespace, register_config_args
+from varve.cli.argmap import collect_cli_args_namespace, register_args
 
 
 class ArgmapInner(BaseModel):
@@ -18,7 +18,7 @@ class ArgmapInner(BaseModel):
 
 class ArgmapConfig(BaseModel):
     target: str
-    token: str = "abc"
+    token: str = Field(default="abc", description="Authentication token.")
     batch_size: int = 8
     enabled: bool = True
     items: list[int] = Field(default_factory=list)
@@ -36,11 +36,11 @@ class ConflictingConfig(BaseModel):
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    register_config_args(parser, ArgmapConfig)
+    register_args(parser, ArgmapConfig)
     return parser
 
 
-def test_register_and_collect_config_args(tmp_path) -> None:
+def test_register_and_collect_args(tmp_path) -> None:
     parser = _parser()
 
     namespace = parser.parse_args(
@@ -61,7 +61,7 @@ def test_register_and_collect_config_args(tmp_path) -> None:
     assert "token" not in vars(namespace)
     assert "inner.age" not in vars(namespace)
     assert "inner.name" not in vars(namespace)
-    assert collect_cli_config_namespace(namespace, ArgmapConfig) == {
+    assert collect_cli_args_namespace(namespace, ArgmapConfig) == {
         "target": str(tmp_path),
         "batch_size": "16",
         "enabled": True,
@@ -74,8 +74,8 @@ def test_register_and_collect_config_args(tmp_path) -> None:
 def test_bool_fields_support_positive_and_negative_flags() -> None:
     parser = _parser()
 
-    enabled = collect_cli_config_namespace(parser.parse_args(["--enabled"]), ArgmapConfig)
-    disabled = collect_cli_config_namespace(parser.parse_args(["--no-enabled"]), ArgmapConfig)
+    enabled = collect_cli_args_namespace(parser.parse_args(["--enabled"]), ArgmapConfig)
+    disabled = collect_cli_args_namespace(parser.parse_args(["--no-enabled"]), ArgmapConfig)
 
     assert enabled == {"enabled": True}
     assert disabled == {"enabled": False}
@@ -85,13 +85,13 @@ def test_collect_only_uses_explicit_config_flags_when_names_conflict() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("target", nargs="?")
     parser.add_argument("--force", action="store_true")
-    register_config_args(parser, ConflictingConfig)
+    register_args(parser, ConflictingConfig)
 
     command_only = parser.parse_args(["sample", "--force"])
     explicit_config = parser.parse_args(["sample", "--force", "--target", "config"])
 
-    assert collect_cli_config_namespace(command_only, ConflictingConfig) == {}
-    assert collect_cli_config_namespace(explicit_config, ConflictingConfig) == {
+    assert collect_cli_args_namespace(command_only, ConflictingConfig) == {}
+    assert collect_cli_args_namespace(explicit_config, ConflictingConfig) == {
         "target": "config",
     }
 
@@ -105,7 +105,7 @@ def test_deep_merge_keeps_nested_fields_from_multiple_sources(
 
     config = _config_from_args(
         ArgmapConfig,
-        init_kwargs=collect_cli_config_namespace(namespace, ArgmapConfig),
+        init_kwargs=collect_cli_args_namespace(namespace, ArgmapConfig),
     )
 
     assert config.target == "out"
@@ -128,7 +128,7 @@ def test_priority_init_gt_env_gt_dotenv_gt_default(
     namespace = parser.parse_args(["--target", "out", "--token", "from-cli"])
     config = _config_from_args(
         ArgmapConfig,
-        init_kwargs=collect_cli_config_namespace(namespace, ArgmapConfig),
+        init_kwargs=collect_cli_args_namespace(namespace, ArgmapConfig),
     )
 
     assert config.target == "out"
@@ -233,5 +233,17 @@ def test_priority_init_gt_env_gt_dotenv_gt_default(
     ],
 )
 def test_fast_fail_for_unsupported_field_types(config_type: type[BaseModel]) -> None:
-    with pytest.raises(TypeError, match="argmap does not support config field"):
-        register_config_args(argparse.ArgumentParser(), config_type)
+    with pytest.raises(TypeError, match="argmap does not support args field"):
+        register_args(argparse.ArgumentParser(), config_type)
+
+
+def test_help_uses_readable_metavar_and_field_descriptions() -> None:
+    help_text = _parser().format_help()
+
+    assert "__VARVE_CONFIG__" not in help_text
+    assert "__VARVE_ARGS__" not in help_text
+    assert "--target TARGET" in help_text
+    assert "--batch-size BATCH_SIZE" in help_text
+    assert "--inner.name INNER_NAME" in help_text
+    assert "Authentication token." in help_text
+    assert "Set Args.batch_size." in help_text

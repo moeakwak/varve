@@ -160,5 +160,5 @@ class DemoExperiment(Experiment):
     )
     module = _load_module(module_path, "demo_exp_legacy")
 
-    with pytest.raises(ValueError, match="no varve.yaml was found"):
+    with pytest.raises(ValueError, match="Unknown varve branch"):
         module.DemoExperiment.cli(["run", "--branch", "alt"])

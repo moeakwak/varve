@@ -33,11 +33,11 @@ if __name__ == "__main__":
 
 Commands:
 
-- `run [TARGET] [--out PATH] [--branch NAME] [--override JSON]`: run the selected stage set, using cached artifacts when valid.
-- `status [TARGET] [--out PATH] [--branch NAME] [--override JSON]`: show cache state without executing stages.
-- `plan`: print the stage order or graph.
+- `run [--branch NAME] [--override JSON] [--upto STAGE | --downstream STAGE] [--force] [--out PATH]`: run the selected stage set, using cached artifacts when valid.
+- `status [--branch NAME] [--upto STAGE | --downstream STAGE] [--out PATH]`: show cache state without executing stages.
+- `plan [--upto STAGE | --downstream STAGE]`: print the selected stage order.
 - `list`: list declared stages.
-- `clean [TARGET] [--out PATH] [--branch NAME] [--override JSON] --yes`: remove store records and artifacts.
+- `clean [--branch NAME] [--downstream STAGE] [--out PATH] [--yes]`: remove store records and artifacts.
 
 Top-level dashboard:
 
@@ -46,7 +46,7 @@ Top-level dashboard:
 
 The dashboard is read-only and never imports experiment modules. It discovers experiments by looking for `.varve/manifest.json` under the scan root. For colocated outputs shaped like `<experiment>/out/<branch>`, the `experiment_id` is the experiment path with the trailing `out/<branch>` removed, and the branch is tracked separately. Stores outside that layout are not shown.
 
-Dashboard status is a store snapshot, not a dry-run cache decision. It only includes stages that have records in the store, and it does not recompute content keys, so it cannot report that source or key inputs changed after the last run.
+The experiment `status` command is the authoritative read-only cache decision view. Dashboard status is still a store snapshot until the dashboard status-validity redesign lands; it only includes stages that have records in the store, and it does not recompute content keys, so it cannot report that source or key inputs changed after the last run.
 
 ## Output paths
 
@@ -82,7 +82,9 @@ smoke:
   seed: 2
 ```
 
-`--config PATH` points to an alternate varve config file. `--branch NAME` selects a branch. `--override '{"seed": 3}'` deep-merges JSON over the selected branch and creates a deterministic temporary branch unless `--name NAME` is provided.
+`--branch NAME` is the only branch selector. `--override '{"seed": 3}'` is only accepted by `run`; it deep-merges JSON over `main` and creates or reuses a temporary branch under `.tmp/`. Without an explicit non-main `--branch`, the temporary branch is named from the canonical JSON of the fully validated Config, such as `main_override_<hash>`. With `--branch quick --override ...`, `quick` is a named temporary branch, and later `status --branch quick` or `clean --branch quick` can locate it without repeating the override.
+
+If a temporary branch was created with a custom `--out PATH`, later `status` or `clean` calls must pass the same `--out PATH`.
 
 Config values still receive environment and `.env` fallback for fields not supplied by the selected branch:
 
@@ -92,7 +94,7 @@ branch or override value > env > dotenv (.env) > field default
 
 Nested environment variables use `__` as the delimiter, for example `INNER__NAME` for `inner.name`.
 
-The CLI is strict: unknown options fail instead of being ignored. Args flags are generated at runtime from the experiment `Args`, while `--out`, `--branch`, `--override`, and `--name` are built-in command options owned by varve. Config fields are not generated as CLI flags.
+The CLI is strict: unknown options fail instead of being ignored. Args flags are generated at runtime from the experiment `Args`, while `--out`, `--branch`, and `--override` are built-in command options owned by varve. Config fields are not generated as CLI flags.
 
 ## Known limitations
 

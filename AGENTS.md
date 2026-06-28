@@ -58,7 +58,7 @@ The CLI has two layers:
 
 The handoff between the layers is explicit data: argmap output builds `Args`, and the selected branch mapping builds `Config`. The settings layer must not parse `argv`.
 
-Do not introduce typer or click. The current CLI intentionally uses strict `argparse` behavior: unknown options and missing option values fail instead of being ignored. `--out`, `--branch`, `--override`, and `--name` are built-in `run` / `status` / `clean` command options, not generated model flags.
+Do not introduce typer or click. The current CLI intentionally uses strict `argparse` behavior: unknown options and missing option values fail instead of being ignored. `--out`, `--branch`, and `--override` are built-in command options, not generated model flags. `--override` belongs to `run` only.
 
 Only `run`, `status`, and `clean` require `Config` and `Args`. `plan` and `list` must keep working even when a model contains fields argmap cannot expose.
 
@@ -70,7 +70,7 @@ Config priority is:
 branch or override value > env > dotenv (.env) > field default
 ```
 
-`varve.yaml` is discovered next to the experiment module by default; missing files are allowed for `main`, which then uses Config defaults. `--config` points to an alternate varve config file. `--branch` selects a branch, and `--override` deep-merges JSON over it to derive a temporary branch. CLI flags generated from `Args` do not enter the content key.
+`varve.yaml` is discovered next to the experiment module by default; missing files are allowed for `main`, which then uses Config defaults. `--branch` is the only branch selector. `--override` deep-merges JSON over `main` and creates or reuses a temporary branch under `.tmp/`; `status` and `clean` locate temporary branches with `--branch NAME` and never accept `--override`. CLI flags generated from `Args` do not enter the content key.
 
 Nested environment variables use `__` as the delimiter. The `.env` file is read from the current working directory through pydantic-settings.
 

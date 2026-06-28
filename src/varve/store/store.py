@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from pydantic import ValidationError
 
@@ -52,14 +52,25 @@ class Store:
         self.output_root = output_root
         self.root = output_root / ".varve"
 
-    def ensure_initialized(self, experiment: str) -> None:
+    def read_manifest(self) -> Manifest | None:
+        return _read_model(self.root / "manifest.json", Manifest)
+
+    def ensure_initialized(
+        self,
+        experiment: str,
+        *,
+        temporary_config: dict[str, Any] | None = None,
+    ) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / ".gitignore").write_text("*\n", encoding="utf-8")
 
         manifest_path = self.root / "manifest.json"
-        manifest = _read_model(manifest_path, Manifest)
+        manifest = self.read_manifest()
         if manifest is None:
-            _atomic_write_json(manifest_path, Manifest(experiment=experiment))
+            _atomic_write_json(
+                manifest_path,
+                Manifest(experiment=experiment, temporary_config=temporary_config),
+            )
             return
         if manifest.experiment != experiment:
             raise ValueError(

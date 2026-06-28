@@ -183,7 +183,7 @@ Cache decisions are pure functions in `engine.state` and are driven by:
 - batch partial records and `run_key`;
 - batch partition values.
 
-Runner adds orchestration-specific inputs around those decisions: selected stages, upstream success records, `force`, `dry`, output locking, and actual stage execution.
+Runner adds orchestration-specific inputs around those decisions: selected stages, upstream success records, `force`, output locking, and actual stage execution. The engine-level `evaluate_state(...)` entry point computes the same decisions without executing stages or writing store records.
 
 ### Decision Boundaries
 
@@ -195,7 +195,7 @@ Runner adds orchestration-specific inputs around those decisions: selected stage
 - `resume`: a batch stage has matching partial scratch and no success record.
 - `unrecoverable`: a batch success key matches but artifacts are missing after partition values changed, so runner cannot safely map existing artifacts to current partitions.
 
-`force=True` overrides the decision to rerun as `stale` when a previous success exists or `no-cache` when it does not. `dry=True` computes status without executing stages or writing store records.
+`force=True` overrides the decision to rerun as `stale` when a previous success exists or `no-cache` when it does not.
 
 ## CLI Architecture
 
@@ -203,10 +203,10 @@ Runner adds orchestration-specific inputs around those decisions: selected stage
 
 The CLI uses `argparse` for command parsing:
 
-- `run [target] [--out path]`
-- `status [target] [--out path]`
-- `clean [target] [--out path]`
-- `plan [target]`
+- `run [--branch name] [--override json] [--upto stage | --downstream stage] [--force] [--out path]`
+- `status [--branch name] [--upto stage | --downstream stage] [--out path]`
+- `clean [--branch name] [--downstream stage] [--out path] [--yes]`
+- `plan [--upto stage | --downstream stage]`
 - `list`
 
 `run`, `status`, and `clean` require an experiment `Config` and `Args`. `plan` and `list` do not construct either model; they can still run when the models contain fields not supported by argmap.
@@ -219,9 +219,9 @@ The CLI uses `argparse` for command parsing:
 - list fields accept JSON through `json.loads`;
 - unsupported dict, mapping, tuple, set, and union shapes fail fast for config commands.
 
-Command flags and Args fields are kept separate by using private argparse destinations for generated flags. This prevents command arguments such as `run TARGET` or `--force` from polluting same-named Args fields.
+Command flags and Args fields are kept separate by using private argparse destinations for generated flags. This prevents command arguments such as `--force` or `--out` from polluting same-named Args fields.
 
-`--out`, `--branch`, `--override`, and `--name` are built-in command options for `run`, `status`, and `clean`. They are not generated from experiment models, and experiment Config models should not declare output-root or branch-selection fields.
+`--out`, `--branch`, and `--override` are built-in command options. `--override` is accepted only by `run`; `status` and `clean` locate temporary branches with `--branch NAME`. Built-in options are not generated from experiment models, and experiment Config models should not declare output-root or branch-selection fields.
 
 Unknown options are strict. Before dynamic Args flags are registered, config commands pre-scan the selected command's arguments so unknown options or missing option values fail as parser errors instead of triggering config registration for the wrong command.
 
@@ -232,7 +232,7 @@ The top-level `varve` console script provides a read-only dashboard over existin
 - `varve ls [--root DIR]` discovers `<experiment>/out/<branch>/.varve/manifest.json` files under the scan root and prints an overview table.
 - `varve show <experiment_id> [--root DIR] [--branch NAME]` prints one store's stage details and dependency edges.
 
-Discovery is intentionally zero-import. The dashboard does not import experiment modules, build a `Config`, call runner, or perform dry-run cache decisions. It reads only the store under each branch output root, so the reported status is a latest snapshot of recorded stages. Stores outside the branch output layout are skipped.
+Discovery is intentionally zero-import in the current dashboard. The dashboard does not import experiment modules, build a `Config`, call runner, or perform engine cache decisions yet. It reads only the store under each branch output root, so the reported status is a latest snapshot of recorded stages. The experiment `status` command is the authoritative read-only cache decision view until the dashboard status-validity redesign lands. Stores outside the branch output layout are skipped.
 
 - `ok`: a success record exists and every recorded artifact path still exists.
 - `artifact-missing`: a success record exists but at least one recorded artifact is missing.
@@ -250,7 +250,7 @@ The detail view rebuilds dependency edges from `SuccessRecord.key_components.ups
 
 Config sources only construct semantic configuration. Output-root selection is resolved separately by the runner and clean paths. Args are built directly from generated CLI flags and model defaults.
 
-`branches.yaml` is discovered next to the experiment module by default, unless `--config PATH` points to another branches file. The selected branch mapping is passed as settings init kwargs. `--override JSON` deep-merges over the selected branch and derives a temporary branch name.
+`varve.yaml` is discovered next to the experiment module by default. The selected branch mapping is passed as settings init kwargs. `--override JSON` deep-merges over `main` and derives a temporary branch name from the canonical JSON of the fully validated Config, unless a non-main temporary `--branch NAME` is provided.
 
 Practical source priority is:
 

@@ -222,7 +222,9 @@ def test_cli_clean_target_ignores_clean_roots_restriction(tmp_path: Path) -> Non
     out = tmp_path / "out"
     assert RestrictedCleanExperiment.cli(["run", f"--out={out}"]) == 0
 
-    assert RestrictedCleanExperiment.cli(["clean", f"--out={out}", "summarize", "--yes"]) == 0
+    assert RestrictedCleanExperiment.cli(
+        ["clean", f"--out={out}", "--downstream", "summarize", "--yes"]
+    ) == 0
     root = out / "main"
     assert root.exists()
     assert (root / "sample.txt").exists()

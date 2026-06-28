@@ -16,6 +16,7 @@ class VarveModel(BaseModel):
 class Manifest(VarveModel):
     schema_version: int = SCHEMA_VERSION
     experiment: str
+    temporary_config: dict[str, Any] | None = None
 
 
 class FileFingerprint(VarveModel):

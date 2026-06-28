@@ -25,17 +25,10 @@ def validate_branch_name(name: str) -> str:
     return name
 
 
-def load_branch(yaml_path: Path | None, branch: str) -> tuple[dict[str, Any], bool]:
-    """Load one branch config from a varve.yaml file.
-
-    Missing `main` falls back to schema defaults, represented as an empty dict.
-    Non-main branches must be present.
-    """
-    validate_branch_name(branch)
+def load_branches(yaml_path: Path | None) -> dict[str, tuple[dict[str, Any], bool]]:
+    """Load all branch configs from a varve.yaml file."""
     if yaml_path is None or not Path(yaml_path).exists():
-        if branch == "main":
-            return {}, False
-        raise ValueError(f"Unknown varve branch {branch!r}: no varve.yaml was found")
+        return {}
 
     raw = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
     if raw is None:
@@ -45,22 +38,36 @@ def load_branch(yaml_path: Path | None, branch: str) -> tuple[dict[str, Any], bo
     for name in raw:
         validate_branch_name(name)
 
-    if branch not in raw:
-        if branch == "main":
-            return {}, False
-        raise ValueError(f"Unknown varve branch {branch!r} in {yaml_path}")
+    result: dict[str, tuple[dict[str, Any], bool]] = {}
+    for branch, section in raw.items():
+        if section is None:
+            section = {}
+        if not isinstance(section, Mapping):
+            raise ValueError(f"Varve branch {branch!r} must be a mapping in {yaml_path}")
 
-    section = raw[branch]
-    if section is None:
-        section = {}
-    if not isinstance(section, Mapping):
-        raise ValueError(f"Varve branch {branch!r} must be a mapping in {yaml_path}")
+        config = dict(section)
+        is_temporary = config.pop("is_temporary", False)
+        if not isinstance(is_temporary, bool):
+            raise ValueError(f"Varve branch {branch!r} has non-boolean is_temporary in {yaml_path}")
+        result[branch] = (config, is_temporary)
+    return result
 
-    config = dict(section)
-    is_temporary = config.pop("is_temporary", False)
-    if not isinstance(is_temporary, bool):
-        raise ValueError(f"Varve branch {branch!r} has non-boolean is_temporary in {yaml_path}")
-    return config, is_temporary
+
+def load_branch(yaml_path: Path | None, branch: str) -> tuple[dict[str, Any], bool]:
+    """Load one branch config from a varve.yaml file.
+
+    Missing `main` falls back to schema defaults, represented as an empty dict.
+    Non-main branches must be present.
+    """
+    validate_branch_name(branch)
+    branches = load_branches(yaml_path)
+    if branch in branches:
+        return branches[branch]
+    if branch == "main":
+        return {}, False
+    if yaml_path is None or not Path(yaml_path).exists():
+        raise ValueError(f"Unknown varve branch {branch!r}: no varve.yaml was found")
+    raise ValueError(f"Unknown varve branch {branch!r} in {yaml_path}")
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -74,6 +81,34 @@ def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[st
     return merged
 
 
+def merge_override(base_config: Mapping[str, Any], override_json: str) -> dict[str, Any]:
+    """Apply an override JSON object to a raw config mapping."""
+    override = json.loads(override_json)
+    if not isinstance(override, Mapping):
+        raise ValueError("--override must be a JSON object")
+    return _deep_merge(base_config, override)
+
+
+def canonical_config_json(config: Mapping[str, Any]) -> str:
+    """Return stable JSON for a validated config snapshot."""
+    return json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def override_branch_name(config: Mapping[str, Any]) -> str:
+    """Derive the hash override branch name from a complete config snapshot."""
+    digest = hashlib.sha256(canonical_config_json(config).encode("utf-8")).hexdigest()[:12]
+    return f"main_override_{digest}"
+
+
+def assert_same_config(left: Mapping[str, Any], right: Mapping[str, Any], *, branch: str) -> None:
+    """Raise when a named temporary branch is reused with a different config."""
+    if canonical_config_json(left) != canonical_config_json(right):
+        raise ValueError(
+            f"Temporary varve branch {branch!r} was created with a different config; "
+            "use a different --branch name or clean the existing temporary branch first."
+        )
+
+
 def derive_override_branch(
     base_config: Mapping[str, Any],
     override_json: str,
@@ -83,11 +118,7 @@ def derive_override_branch(
 ) -> tuple[dict[str, Any], str, bool]:
     """Apply an override JSON object and derive a temporary branch name."""
     validate_branch_name(base_name)
-    override = json.loads(override_json)
-    if not isinstance(override, Mapping):
-        raise ValueError("--override must be a JSON object")
-
-    normalized = json.dumps(override, sort_keys=True, separators=(",", ":"))
-    branch = name or f"{base_name}_override_{hashlib.sha256(normalized.encode('utf-8')).hexdigest()[:12]}"
+    merged = merge_override(base_config, override_json)
+    branch = name or f"{base_name}_override_{hashlib.sha256(canonical_config_json(merged).encode('utf-8')).hexdigest()[:12]}"
     validate_branch_name(branch)
-    return _deep_merge(base_config, override), branch, True
+    return merged, branch, True
