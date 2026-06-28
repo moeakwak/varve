@@ -390,6 +390,7 @@ async def _drive(
         if stage_spec.kind == "single":
             await _execute_stage(instance, stage_spec, ctx)
             produces = _produced_paths(stage_spec.produces, ctx)
+            elapsed = time.monotonic() - started
             store.write_success(
                 SuccessRecord(
                     experiment=experiment_type.__name__,
@@ -399,6 +400,7 @@ async def _drive(
                     key_components=components,
                     produces=produces,
                     committed_at=_now(),
+                    elapsed=elapsed,
                 )
             )
         else:
@@ -442,6 +444,7 @@ async def _drive(
                 for index, paths in sorted(outputs_by_index.items())
                 for path in paths
             ]
+            elapsed = time.monotonic() - started
             store.write_success(
                 SuccessRecord(
                     experiment=experiment_type.__name__,
@@ -452,10 +455,10 @@ async def _drive(
                     partition_values=partition,
                     outputs=outputs,
                     committed_at=_now(),
+                    elapsed=elapsed,
                 )
             )
         store.clear_attempt(stage_name)
-        elapsed = time.monotonic() - started
         logger.info("[%s] done · %.2fs", stage_name, elapsed)
         outcomes.append(StageOutcome(stage_name, decision.status, decision.reason, elapsed))
     return outcomes

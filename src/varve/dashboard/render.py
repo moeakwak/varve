@@ -31,6 +31,7 @@ def render_overview(states: list[ExperimentState]) -> None:
     table.add_column("BRANCH")
     table.add_column("STATUS")
     table.add_column("STAGES")
+    table.add_column("DURATION")
     table.add_column("LAST RUN")
 
     previous_experiment_id: str | None = None
@@ -46,6 +47,7 @@ def render_overview(states: list[ExperimentState]) -> None:
             state.entry.branch,
             _status_text(state.status),
             f"{hit_count}/{len(state.stages)}",
+            _format_elapsed(_total_elapsed(state.stages)),
             _format_datetime(_last_run(state.stages)),
         )
         previous_experiment_id = state.entry.experiment_id
@@ -121,6 +123,16 @@ def _format_artifacts(stage: StageState) -> str:
 
 def _format_datetime(value: datetime | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M") if value is not None else ""
+
+
+def _format_elapsed(value: float | None) -> str:
+    return f"{value:.2f}s" if value is not None else ""
+
+
+def _total_elapsed(stages: list[StageState]) -> float | None:
+    if not stages or any(stage.elapsed is None for stage in stages):
+        return None
+    return sum(stage.elapsed for stage in stages if stage.elapsed is not None)
 
 
 def _last_run(stages: list[StageState]) -> datetime | None:

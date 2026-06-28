@@ -40,6 +40,7 @@ class StageState(BaseModel):
     artifacts: list[ArtifactState]
     committed_at: datetime | None
     upstreams: list[str]
+    elapsed: float | None = None
 
 
 class ExperimentState(BaseModel):

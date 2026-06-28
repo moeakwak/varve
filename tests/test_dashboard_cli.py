@@ -10,7 +10,7 @@ from rich.console import Console
 from varve import Experiment, stage
 from varve.dashboard import render
 from varve.dashboard.cli import main
-from varve.dashboard.models import ExperimentEntry, ExperimentState, StateError
+from varve.dashboard.models import ExperimentEntry, ExperimentState, StageState, StateError
 from varve.dashboard.render import render_detail, render_overview
 from varve.engine.runner import run
 from varve.store.store import Store
@@ -327,3 +327,56 @@ def test_render_overview_groups_repeated_experiment_names(
     assert output.count("demo") == 1
     assert "main" in output
     assert "quick" in output
+
+
+def test_render_overview_shows_total_stage_elapsed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = StringIO()
+
+    def console_factory(**kwargs):
+        return Console(
+            file=buffer,
+            force_terminal=False,
+            width=120,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(render, "Console", console_factory)
+    state = ExperimentState(
+        entry=ExperimentEntry(
+            output_root=tmp_path / "demo" / "out" / "main",
+            experiment_id="demo",
+            experiment_name="Demo",
+            branch="main",
+        ),
+        stages=[
+            StageState(
+                name="sample",
+                status="hit",
+                reason="hit",
+                artifacts=[],
+                committed_at=None,
+                upstreams=[],
+                elapsed=1.25,
+            ),
+            StageState(
+                name="summary",
+                status="hit",
+                reason="hit",
+                artifacts=[],
+                committed_at=None,
+                upstreams=["sample"],
+                elapsed=2.5,
+            ),
+        ],
+        status="hit",
+        error=None,
+    )
+
+    render_overview([state])
+
+    output = buffer.getvalue()
+    assert "DURATION" in output
+    assert "3.75s" in output

@@ -141,6 +141,17 @@ def test_run_writes_importable_main_module_to_manifest(
     assert manifest.module == "pkg.demo.__main__"
 
 
+def test_run_persists_stage_elapsed(
+    tmp_path: Path,
+) -> None:
+    run(ToyExperiment, Config(), cli_out=tmp_path, upto="sample")
+
+    record = Store(_out(tmp_path)).read_success("sample")
+    assert record is not None
+    assert record.elapsed is not None
+    assert record.elapsed >= 0
+
+
 def test_evaluate_state_propagates_current_upstream_keys(tmp_path: Path) -> None:
     run(ToyExperiment, Config(token="a"), cli_out=tmp_path)
     dry = evaluate_state(ToyExperiment, Config(token="b"), cli_out=tmp_path)

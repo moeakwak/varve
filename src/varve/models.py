@@ -56,6 +56,7 @@ class SuccessRecord(VarveModel):
     outputs: list[OutputHandle] | None = None
     produces: list[ProducedPath] | None = None
     committed_at: str
+    elapsed: float | None = None
 
     @model_validator(mode="after")
     def validate_outputs_shape(self) -> SuccessRecord:

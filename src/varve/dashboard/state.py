@@ -78,6 +78,7 @@ def load_state(entry: ExperimentEntry) -> ExperimentState:
                 reason=outcome.reason,
                 artifacts=_artifacts(entry, success) if success is not None else [],
                 committed_at=_parse_datetime(success.committed_at) if success is not None else None,
+                elapsed=success.elapsed if success is not None else None,
                 upstreams=list(experiment.stages()[name].needs),
             )
         )

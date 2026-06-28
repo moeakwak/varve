@@ -48,7 +48,7 @@ def _components() -> KeyComponents:
     return KeyComponents(source={}, config={}, files={}, values={}, upstreams={})
 
 
-def _single(stage_name: str) -> SuccessRecord:
+def _single(stage_name: str, *, elapsed: float | None = None) -> SuccessRecord:
     return SuccessRecord(
         experiment="Demo",
         stage=stage_name,
@@ -57,6 +57,7 @@ def _single(stage_name: str) -> SuccessRecord:
         key_components=_components(),
         produces=[ProducedPath(path=f"{stage_name}.txt", kind="file")],
         committed_at="2026-06-24T10:00:00+00:00",
+        elapsed=elapsed,
     )
 
 
@@ -90,6 +91,29 @@ def test_load_state_uses_engine_outcomes_and_topo_order(
     assert state.stages[0].artifacts[0].exists is True
     assert state.stages[0].committed_at is not None
     assert state.stages[1].upstreams == ["sample"]
+
+
+def test_load_state_reads_stage_elapsed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "demo" / "out" / "main"
+    store = Store(output_root)
+    store.ensure_initialized("Demo", module=Demo.__module__)
+    store.write_success(_single("sample", elapsed=1.25))
+
+    monkeypatch.setattr(
+        "varve.dashboard.state.evaluate_state",
+        lambda *args, **kwargs: [
+            StageOutcome("sample", "hit", "hit", None),
+            StageOutcome("summary", "no-cache", "no cache", None),
+        ],
+    )
+
+    state = load_state(_entry(output_root))
+
+    assert state.stages[0].elapsed == 1.25
+    assert state.stages[1].elapsed is None
 
 
 def test_load_state_matches_engine_status_for_real_run(tmp_path: Path) -> None:
