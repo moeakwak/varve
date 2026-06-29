@@ -12,6 +12,8 @@ Keep the public surface small and stable:
 
 Documentation, comments, examples, and user-facing messages in this submodule should be in English.
 
+`varve` is still early and currently has only the workspace studies as real users. Prefer clean, compact APIs over compatibility shims when an old surface is awkward. Do not keep deprecated aliases or dual names just to avoid updating current call sites; update the call sites and the docs in the same change.
+
 ## Dependency Direction
 
 Keep imports moving in one direction:
@@ -100,6 +102,8 @@ from varve import Ctx, Experiment, JSON, KeySpec, StageSpec, batch_stage, stage
 `Store` is not part of the public API. It may be imported by internal modules and tests through `varve.store.store`, but it should not be re-exported from `varve`.
 
 When changing signatures used by experiment authors, update README and architecture docs in the same change.
+
+Stage source dependencies are automatic by default. `@stage` and `@batch_stage` should keep `auto_uses=True` unless an experiment deliberately wants to opt out. Use `additional_uses=(...)` only for dynamic callables that the automatic project-callable scan cannot see; do not reintroduce a full manual `uses` list API.
 
 ## Commit Messages
 

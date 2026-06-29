@@ -20,7 +20,8 @@ _UNION_ORIGINS = (Union, types.UnionType)
 
 class StageSpecLike(Protocol):
     func: Callable[..., Any]
-    uses: tuple[Callable[..., Any], ...]
+    auto_uses: bool
+    additional_uses: tuple[Callable[..., Any], ...]
     keyspec: KeySpec
     needs: tuple[str, ...]
 
@@ -94,6 +95,75 @@ def _callable_label(func: Callable[..., Any]) -> str:
     return f"{module}.{qualname}" if module else qualname
 
 
+def _module_name(func: Callable[..., Any]) -> str:
+    module = getattr(func, "__module__", "")
+    if module == "__main__":
+        main_module = sys.modules.get("__main__")
+        spec = getattr(main_module, "__spec__", None)
+        module = getattr(spec, "name", None) or module
+    return module
+
+
+def _project_prefix(func: Callable[..., Any]) -> str:
+    module = _module_name(func)
+    return module.split(".", 1)[0] if module else ""
+
+
+def _is_project_callable(value: Any, *, project_prefix: str) -> bool:
+    if not callable(value):
+        return False
+    module = getattr(value, "__module__", "")
+    return bool(project_prefix) and (
+        module == project_prefix or module.startswith(f"{project_prefix}.")
+    )
+
+
+def _direct_project_callables(
+    func: Callable[..., Any], *, project_prefix: str
+) -> tuple[Callable[..., Any], ...]:
+    code = getattr(func, "__code__", None)
+    globals_dict = getattr(func, "__globals__", None)
+    if code is None or globals_dict is None:
+        return ()
+    return tuple(
+        value
+        for name in code.co_names
+        if (value := globals_dict.get(name)) is not None
+        and _is_project_callable(value, project_prefix=project_prefix)
+        and value is not func
+    )
+
+
+def _auto_uses(func: Callable[..., Any]) -> tuple[Callable[..., Any], ...]:
+    project_prefix = _project_prefix(func)
+    seen: dict[Callable[..., Any], None] = {}
+    stack = list(_direct_project_callables(func, project_prefix=project_prefix))
+    while stack:
+        helper = stack.pop(0)
+        if helper in seen:
+            continue
+        seen[helper] = None
+        stack.extend(_direct_project_callables(helper, project_prefix=project_prefix))
+    return tuple(seen)
+
+
+def _effective_uses(stage_spec: StageSpecLike) -> tuple[Callable[..., Any], ...]:
+    uses = (
+        *(_auto_uses(stage_spec.func) if stage_spec.auto_uses else ()),
+        *stage_spec.additional_uses,
+    )
+    project_prefix = _project_prefix(stage_spec.func)
+    seen: dict[Callable[..., Any], None] = {}
+    stack = list(uses)
+    while stack:
+        helper = stack.pop(0)
+        if helper in seen:
+            continue
+        seen[helper] = None
+        stack.extend(_direct_project_callables(helper, project_prefix=project_prefix))
+    return tuple(seen)
+
+
 def _direct_same_module_callables(func: Callable[..., Any]) -> dict[str, Callable[..., Any]]:
     code = getattr(func, "__code__", None)
     globals_dict = getattr(func, "__globals__", None)
@@ -108,9 +178,11 @@ def _direct_same_module_callables(func: Callable[..., Any]) -> dict[str, Callabl
     return result
 
 
-def _validate_uses_cover_direct_same_module_calls(stage_spec: StageSpecLike) -> None:
-    registered = set(stage_spec.uses)
-    for owner in (stage_spec.func, *stage_spec.uses):
+def _validate_uses_cover_direct_same_module_calls(
+    stage_spec: StageSpecLike, uses: tuple[Callable[..., Any], ...]
+) -> None:
+    registered = set(uses)
+    for owner in (stage_spec.func, *uses):
         missing = [
             name
             for name, value in sorted(_direct_same_module_callables(owner).items())
@@ -121,7 +193,8 @@ def _validate_uses_cover_direct_same_module_calls(stage_spec: StageSpecLike) -> 
             listed = ", ".join(missing)
             raise ValueError(
                 f"Varve callable {owner_label} directly calls same-module helper(s) not "
-                f"listed in uses: {listed}. Add them to uses. This guard only covers "
+                f"covered by source uses: {listed}. Enable auto_uses or add them to "
+                "additional_uses. This guard only covers "
                 "direct same-module global function calls; aliases, methods, indirect calls, "
                 "closures, and decorator wrappers are not detected."
             )
@@ -134,9 +207,10 @@ def compute_key_components(
     cached_files: Mapping[str, list[FileFingerprint]] | None = None,
 ) -> KeyComponents:
     _validate_config_has_no_paths(ctx.config)
-    _validate_uses_cover_direct_same_module_calls(stage_spec)
+    uses = _effective_uses(stage_spec)
+    _validate_uses_cover_direct_same_module_calls(stage_spec, uses)
     source = {"stage": source_hash(stage_spec.func)}
-    for helper in stage_spec.uses:
+    for helper in uses:
         helper_name = _callable_label(helper)
         source_key = f"uses.{helper_name}"
         if source_key in source:

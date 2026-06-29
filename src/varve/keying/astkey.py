@@ -62,7 +62,7 @@ def source_hash(func: Callable[..., Any]) -> str:
 
     The hash intentionally ignores comments, formatting, source locations, and
     docstrings. It does not chase deeper callees; those must be listed in
-    `uses` or encoded through `KeySpec.files` / `KeySpec.values`.
+    source dependencies or encoded through `KeySpec.files` / `KeySpec.values`.
     """
 
     try:

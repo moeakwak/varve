@@ -34,7 +34,7 @@ def helper(value: str) -> str:
     return value.upper()
 
 
-@stage(uses=[helper])
+@stage()
 def transform(self, ctx):  # pragma: no cover - inspected only
     return helper(ctx.config.profile)
 
@@ -43,8 +43,8 @@ def missing_helper(value: str) -> str:
     return value.lower()
 
 
-@stage()
-def transform_missing_uses(self, ctx):  # pragma: no cover - inspected only
+@stage(auto_uses=False)
+def transform_without_auto_uses(self, ctx):  # pragma: no cover - inspected only
     return missing_helper(ctx.config.profile)
 
 
@@ -88,7 +88,8 @@ def test_content_key_changes_when_value_changes(tmp_path: Path) -> None:
         needs=base.needs,
         produces=base.produces,
         keyspec=KeySpec(values={"logic": value_one}),
-        uses=base.uses,
+        auto_uses=base.auto_uses,
+        additional_uses=base.additional_uses,
     )
     two = StageSpec(
         name=base.name,
@@ -97,7 +98,8 @@ def test_content_key_changes_when_value_changes(tmp_path: Path) -> None:
         needs=base.needs,
         produces=base.produces,
         keyspec=KeySpec(values={"logic": value_two}),
-        uses=base.uses,
+        auto_uses=base.auto_uses,
+        additional_uses=base.additional_uses,
     )
     ctx = Ctx(Config(profile="a"))
     assert content_key(compute_key_components(one, ctx, {})) != content_key(
@@ -116,7 +118,8 @@ def test_content_key_files_use_sha_not_mtime(tmp_path: Path) -> None:
         needs=(),
         produces=None,
         keyspec=KeySpec(files={"data": lambda _ctx: data}),
-        uses=(helper,),
+        auto_uses=False,
+        additional_uses=(helper,),
     )
     ctx = Ctx(Config(profile="a"))
     first = compute_key_components(spec, ctx, {})
@@ -172,7 +175,9 @@ async def partitioned(self, ctx):
     )
 
 
-def test_uses_helpers_with_same_qualname_do_not_overwrite_each_other(tmp_path: Path) -> None:
+def test_additional_uses_helpers_with_same_qualname_do_not_overwrite_each_other(
+    tmp_path: Path,
+) -> None:
     first_module_path = tmp_path / "uses_first.py"
     first_module_path.write_text(
         """
@@ -200,7 +205,8 @@ def helper(value):
         needs=base.needs,
         produces=base.produces,
         keyspec=base.keyspec,
-        uses=(helper, first_module.helper, second_module.helper),
+        auto_uses=False,
+        additional_uses=(helper, first_module.helper, second_module.helper),
     )
     components = compute_key_components(spec, Ctx(Config(profile="a")), {})
 
@@ -228,7 +234,8 @@ def test_main_module_uses_stable_spec_name_for_helper_labels(
             needs=base.needs,
             produces=base.produces,
             keyspec=base.keyspec,
-            uses=(helper,),
+            auto_uses=False,
+            additional_uses=(helper,),
         )
 
         components = compute_key_components(spec, Ctx(Config(profile="a")), {})
@@ -248,7 +255,8 @@ def test_content_key_changes_when_upstream_changes(tmp_path: Path) -> None:
         needs=("sample",),
         produces=base.produces,
         keyspec=base.keyspec,
-        uses=base.uses,
+        auto_uses=base.auto_uses,
+        additional_uses=base.additional_uses,
     )
     ctx = Ctx(Config(profile="a"))
     one = compute_key_components(spec, ctx, {"sample": "sha256:one"})
@@ -299,10 +307,56 @@ def test_config_path_values_inside_mapping_keys_are_rejected(tmp_path: Path) -> 
         )
 
 
-def test_unregistered_same_module_helper_is_rejected() -> None:
+def test_auto_uses_registers_same_module_helper() -> None:
+    components = compute_key_components(_stage_spec(), Ctx(Config(profile="a")), {})
+
+    assert "uses.test_keys.helper" in components.source
+
+
+def test_auto_uses_registers_imported_project_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "demo_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "helpers.py").write_text(
+        """
+def nested(value):
+    return value + "!"
+
+def exported(value):
+    return nested(value).upper()
+""",
+        encoding="utf-8",
+    )
+    (package / "stages.py").write_text(
+        """
+from varve.decorators import stage
+from demo_pkg.helpers import exported
+
+@stage()
+def sample(self, ctx):
+    return exported(ctx.config.profile)
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    module = importlib.import_module("demo_pkg.stages")
+
+    components = compute_key_components(
+        module.sample.__varve_stage__,
+        Ctx(Config(profile="a")),
+        {},
+    )
+
+    assert "uses.demo_pkg.helpers.exported" in components.source
+    assert "uses.demo_pkg.helpers.nested" in components.source
+
+
+def test_missing_same_module_helper_is_rejected_when_auto_uses_is_disabled() -> None:
     with pytest.raises(ValueError, match="missing_helper"):
         compute_key_components(
-            transform_missing_uses.__varve_stage__,
+            transform_without_auto_uses.__varve_stage__,
             Ctx(Config(profile="a")),
             {},
         )

@@ -141,7 +141,7 @@ The output root is not part of the experiment `Config`. `run`, `status`, and `cl
 
 `content_key` hashes a canonical JSON view of:
 
-- normalized source hashes for the stage function and any declared `uses` helpers;
+- normalized source hashes for the stage function, automatically discovered project callables reached from the stage body, and any `additional_uses` helpers;
 - the full experiment Config;
 - sha256 digests for declared files from `KeySpec.files`;
 - declared JSON values from `KeySpec.values`;
@@ -151,7 +151,7 @@ File fingerprint metadata stores path, size, mtime, and sha256. The content key 
 
 Config models must not contain `Path` fields or Path values. Input locations belong in `Args`, and input content belongs in the content key through `KeySpec.files`.
 
-Same-module helper functions directly called by a stage or by a declared helper must also be listed in `uses`. This guard covers direct same-module global function calls; aliases, methods, indirect calls, closures, and decorator wrappers are not detected.
+`auto_uses` is enabled by default on `stage` and `batch_stage`. It recursively follows direct global function/class references within the stage's top-level project package. `additional_uses` exists for dynamic dispatch, registry lookups, object-held callables, or other source dependencies that the bytecode-name scan cannot see. The scan intentionally ignores decorator arguments, `produces`, `KeySpec.files`, and `KeySpec.values`.
 
 `run_key` hashes the `content_key` together with batch `partition_values`. It is used to locate partial batch scratch for resume.
 

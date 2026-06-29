@@ -96,5 +96,5 @@ The CLI is strict: unknown options fail instead of being ignored. Args flags are
 
 ## Known limitations
 
-- varve hashes the whole Config, declared file/value inputs, and source ASTs. Same-module helper functions directly called by a stage or helper must be listed in `uses`; aliases, methods, indirect calls, closures, and decorator wrappers are not detected by that guard. If an output is changed outside varve, use `clean` to reset the affected stages.
+- varve hashes the whole Config, declared file/value inputs, and source ASTs. Stage source hashing automatically follows project callables reached from the stage body. Use `additional_uses=(...)` only for dynamic dispatch or object-held callables that auto discovery cannot see. Auto discovery does not inspect decorator arguments, `produces`, `KeySpec.files`, or `KeySpec.values`; those affect the key through their declared outputs, files, or values. If an output is changed outside varve, use `clean` to reset the affected stages.
 - Source AST fingerprints are derived from `ast.dump`, whose output format can change between CPython minor versions. Upgrading the Python interpreter may therefore invalidate every stage's source hash at once, forcing a full rebuild. Run `clean` to reset after such an upgrade.
