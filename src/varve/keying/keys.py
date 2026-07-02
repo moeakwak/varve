@@ -86,11 +86,7 @@ def _validate_config_has_no_paths(config: Any) -> None:
 
 
 def _callable_label(func: Callable[..., Any]) -> str:
-    module = getattr(func, "__module__", "")
-    if module == "__main__":
-        main_module = sys.modules.get("__main__")
-        spec = getattr(main_module, "__spec__", None)
-        module = getattr(spec, "name", None) or module
+    module = _module_name(func)
     qualname = getattr(func, "__qualname__", getattr(func, "__name__", repr(func)))
     return f"{module}.{qualname}" if module else qualname
 

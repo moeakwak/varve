@@ -53,23 +53,6 @@ def load_branches(yaml_path: Path | None) -> dict[str, tuple[dict[str, Any], boo
     return result
 
 
-def load_branch(yaml_path: Path | None, branch: str) -> tuple[dict[str, Any], bool]:
-    """Load one branch config from a varve.yaml file.
-
-    Missing `main` falls back to schema defaults, represented as an empty dict.
-    Non-main branches must be present.
-    """
-    validate_branch_name(branch)
-    branches = load_branches(yaml_path)
-    if branch in branches:
-        return branches[branch]
-    if branch == "main":
-        return {}, False
-    if yaml_path is None or not Path(yaml_path).exists():
-        raise ValueError(f"Unknown varve branch {branch!r}: no varve.yaml was found")
-    raise ValueError(f"Unknown varve branch {branch!r} in {yaml_path}")
-
-
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
     merged = copy.deepcopy(dict(base))
     for key, value in override.items():
@@ -107,21 +90,3 @@ def assert_same_config(left: Mapping[str, Any], right: Mapping[str, Any], *, bra
             f"Temporary varve branch {branch!r} was created with a different config; "
             "use a different --branch name or clean the existing temporary branch first."
         )
-
-
-def derive_override_branch(
-    base_config: Mapping[str, Any],
-    override_json: str,
-    *,
-    base_name: str,
-    name: str | None = None,
-) -> tuple[dict[str, Any], str, bool]:
-    """Apply an override JSON object and derive a temporary branch name."""
-    validate_branch_name(base_name)
-    merged = merge_override(base_config, override_json)
-    branch = (
-        name
-        or f"{base_name}_override_{hashlib.sha256(canonical_config_json(merged).encode('utf-8')).hexdigest()[:12]}"
-    )
-    validate_branch_name(branch)
-    return merged, branch, True

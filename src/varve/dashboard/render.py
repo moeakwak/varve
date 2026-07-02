@@ -19,7 +19,6 @@ _STATUS_STYLES: dict[Status | ExperimentStatus, str] = {
     "stale": "yellow",
     "dirty": "red",
     "unrecoverable": "red",
-    "corrupt-store": "red",
     "error": "red",
 }
 
@@ -65,7 +64,6 @@ def render_detail(state: ExperimentState) -> None:
         console.print(f"Error: {state.error.phase}: {state.error.message}")
     console.print()
 
-    stage_by_name = {stage.name: stage for stage in state.stages}
     stage_table = Table(title="Stages", box=None)
     stage_table.add_column("STAGE")
     stage_table.add_column("STATUS")
@@ -73,8 +71,7 @@ def render_detail(state: ExperimentState) -> None:
     stage_table.add_column("ARTIFACTS")
     stage_table.add_column("COMMITTED")
     stage_table.add_column("UPSTREAMS")
-    for name in stage_by_name:
-        stage = stage_by_name[name]
+    for stage in state.stages:
         stage_table.add_row(
             stage.name,
             _status_text(stage.status),
@@ -90,10 +87,9 @@ def render_detail(state: ExperimentState) -> None:
     if not state.stages:
         console.print("  No recorded stages.")
         return
-    nodes = set(stage_by_name)
+    nodes = {stage.name for stage in state.stages}
     printed_any = False
-    for name in stage_by_name:
-        stage = stage_by_name[name]
+    for stage in state.stages:
         upstreams = [upstream for upstream in stage.upstreams if upstream in nodes]
         if not upstreams:
             console.print(f"  root: {stage.name}")
@@ -134,5 +130,7 @@ def _total_elapsed(stages: list[StageState]) -> float | None:
 
 
 def _last_run(stages: list[StageState]) -> datetime | None:
-    values = [stage.committed_at for stage in stages if stage.committed_at is not None]
-    return max(values) if values else None
+    return max(
+        (stage.committed_at for stage in stages if stage.committed_at is not None),
+        default=None,
+    )

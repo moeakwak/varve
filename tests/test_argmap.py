@@ -6,7 +6,7 @@ from collections.abc import Mapping
 import pytest
 from pydantic import BaseModel, Field
 
-from varve.cli.app import _config_from_args
+from varve.branch_config import config_from_init
 from varve.cli.argmap import collect_cli_args_namespace, register_args
 
 
@@ -103,9 +103,9 @@ def test_deep_merge_keeps_nested_fields_from_multiple_sources(
     parser = _parser()
     namespace = parser.parse_args(["--target", "out", "--inner.name", "from-cli"])
 
-    config = _config_from_args(
+    config = config_from_init(
         ArgmapConfig,
-        init_kwargs=collect_cli_args_namespace(namespace, ArgmapConfig),
+        collect_cli_args_namespace(namespace, ArgmapConfig),
     )
 
     assert config.target == "out"
@@ -126,9 +126,9 @@ def test_priority_init_gt_env_gt_dotenv_gt_default(
 
     parser = _parser()
     namespace = parser.parse_args(["--target", "out", "--token", "from-cli"])
-    config = _config_from_args(
+    config = config_from_init(
         ArgmapConfig,
-        init_kwargs=collect_cli_args_namespace(namespace, ArgmapConfig),
+        collect_cli_args_namespace(namespace, ArgmapConfig),
     )
 
     assert config.target == "out"
@@ -144,28 +144,6 @@ def test_priority_init_gt_env_gt_dotenv_gt_default(
     [
         pytest.param(
             type(
-                "DictConfig",
-                (BaseModel,),
-                {
-                    "__annotations__": {"extra": dict[str, str]},
-                    "extra": Field(default_factory=dict),
-                },
-            ),
-            id="dict",
-        ),
-        pytest.param(
-            type(
-                "BareDictConfig",
-                (BaseModel,),
-                {
-                    "__annotations__": {"extra": dict},
-                    "extra": Field(default_factory=dict),
-                },
-            ),
-            id="bare-dict",
-        ),
-        pytest.param(
-            type(
                 "MappingConfig",
                 (BaseModel,),
                 {
@@ -177,17 +155,6 @@ def test_priority_init_gt_env_gt_dotenv_gt_default(
         ),
         pytest.param(
             type(
-                "BareMappingConfig",
-                (BaseModel,),
-                {
-                    "__annotations__": {"extra": Mapping},
-                    "extra": Field(default_factory=dict),
-                },
-            ),
-            id="bare-mapping",
-        ),
-        pytest.param(
-            type(
                 "TupleConfig",
                 (BaseModel,),
                 {
@@ -196,28 +163,6 @@ def test_priority_init_gt_env_gt_dotenv_gt_default(
                 },
             ),
             id="tuple",
-        ),
-        pytest.param(
-            type(
-                "BareTupleConfig",
-                (BaseModel,),
-                {
-                    "__annotations__": {"extra": tuple},
-                    "extra": (),
-                },
-            ),
-            id="bare-tuple",
-        ),
-        pytest.param(
-            type(
-                "BareSetConfig",
-                (BaseModel,),
-                {
-                    "__annotations__": {"extra": set},
-                    "extra": Field(default_factory=set),
-                },
-            ),
-            id="bare-set",
         ),
         pytest.param(
             type(

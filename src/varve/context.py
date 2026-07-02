@@ -56,18 +56,13 @@ class Ctx:
         config: Any,
         args: Any = None,
         out: Path,
-        store: Store | None = None,
-        ledger: Store | None = None,
+        store: Store,
         resume_skip: frozenset[int] | None = None,
         stage_name: str | None = None,
     ) -> None:
         self.config = config
         self.args = args
         self.out = out
-        if store is None:
-            store = ledger  # Legacy keyword compatibility.
-        if store is None:
-            raise ValueError("Ctx requires a varve store")
         self._store = store
         self._resume_skip = resume_skip or frozenset()
         self._stage_name = stage_name

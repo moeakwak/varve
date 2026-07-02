@@ -79,27 +79,10 @@ def _main_config(
         raise
 
 
-def _main_output_base(
-    experiment: type[Experiment],
-    main_config: Any,
-    cli_out: Path | None,
-) -> Path:
-    return Path(cli_out) if cli_out is not None else experiment.default_output_root(main_config)
-
-
-def _temporary_manifest(main_base: Path, branch: str):
-    return Store(main_base / ".tmp" / branch).read_manifest()
-
-
 def _temporary_config_from_manifest(main_base: Path, branch: str) -> dict[str, Any]:
-    manifest = _temporary_manifest(main_base, branch)
-    if manifest is None:
+    manifest = Store(main_base / ".tmp" / branch).read_manifest()
+    if manifest is None or manifest.temporary_config is None:
         raise ValueError(f"Unknown varve branch {branch!r}")
-    if manifest.temporary_config is None:
-        raise ValueError(
-            f"Temporary varve branch {branch!r} uses an old manifest without config; "
-            "recreate it or delete the old temporary output."
-        )
     return manifest.temporary_config
 
 
@@ -129,13 +112,10 @@ def resolve_branch(
         resolved_branch = override_branch_name(temporary_config) if branch == "main" else branch
         validate_branch_name(resolved_branch)
 
-        manifest = _temporary_manifest(main_base, resolved_branch)
+        manifest = Store(main_base / ".tmp" / resolved_branch).read_manifest()
         if manifest is not None:
             if manifest.temporary_config is None:
-                raise ValueError(
-                    f"Temporary varve branch {resolved_branch!r} uses an old manifest without config; "
-                    "recreate it or delete the old temporary output."
-                )
+                raise ValueError(f"Unknown varve branch {resolved_branch!r}")
             assert_same_config(manifest.temporary_config, temporary_config, branch=resolved_branch)
 
         return ResolvedBranch(
@@ -177,7 +157,7 @@ def resolve_branch(
             cli_out=None,
             allow_bare_output_root=False,
         )
-        main_base = _main_output_base(experiment, main_config, None)
+        main_base = experiment.default_output_root(main_config)
     temporary_config = _temporary_config_from_manifest(main_base, branch)
     return ResolvedBranch(
         config=experiment.Config.model_validate(temporary_config),

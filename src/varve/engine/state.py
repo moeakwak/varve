@@ -16,7 +16,6 @@ Status = Literal[
     "no-cache",
     "resume",
     "unrecoverable",
-    "corrupt-store",
 ]
 
 
@@ -25,14 +24,6 @@ class Decision:
     status: Status
     reason: str
     resume_skip: frozenset[int] = field(default_factory=frozenset)
-
-
-def _outputs_exist(success: SuccessRecord, output_exists: Callable[[str], bool]) -> bool:
-    if success.kind == "single":
-        assert success.produces is not None
-        return all(output_exists(item.path) for item in success.produces)
-    assert success.outputs is not None
-    return all(output_exists(item.path) for item in success.outputs)
 
 
 def decide_single(

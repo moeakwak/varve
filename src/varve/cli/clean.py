@@ -7,18 +7,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from varve.engine.runner import selected_stages
 from varve.experiment import Experiment
 from varve.models import Manifest
 from varve.store.lock import OutputLock
 from varve.store.store import Store
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-    except ValueError:
-        return False
-    return True
 
 
 def _validate_destructive(root: Path, allowed_roots: list[Path] | None = None) -> None:
@@ -29,7 +22,7 @@ def _validate_destructive(root: Path, allowed_roots: list[Path] | None = None) -
     if resolved in dangerous:
         raise ValueError(f"Refusing to clean dangerous path: {resolved}")
     if allowed_roots is not None and not any(
-        _is_relative_to(resolved, allowed) for allowed in allowed_roots
+        resolved.is_relative_to(allowed.expanduser().resolve()) for allowed in allowed_roots
     ):
         raise ValueError(f"Refusing to clean path outside allowed roots: {resolved}")
 
@@ -44,31 +37,14 @@ def _confirm(message: str, yes: bool, confirm: Callable[[str], bool] | None) -> 
 
 def _read_manifest_anchor(store: Store, experiment: type[Experiment]) -> Manifest:
     manifest_path = store.root / "manifest.json"
-    if not manifest_path.exists():
+    manifest = store.read_manifest()
+    if manifest is None:
         raise ValueError(f"Missing varve manifest anchor: {manifest_path}")
-    manifest = Manifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
     if manifest.experiment != experiment.__name__:
         raise ValueError(
             f"Varve manifest belongs to {manifest.experiment}, not {experiment.__name__}"
         )
     return manifest
-
-
-def _downstream_closure(experiment: type[Experiment], target: str) -> set[str]:
-    stages = experiment.stages()
-    descendants = {name: set() for name in stages}
-    for name, spec in stages.items():
-        for upstream in spec.needs:
-            descendants[upstream].add(name)
-    seen: set[str] = set()
-    stack = [target]
-    while stack:
-        name = stack.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        stack.extend(descendants[name])
-    return seen
 
 
 def _record_paths(record) -> list[str]:
@@ -79,21 +55,13 @@ def _record_paths(record) -> list[str]:
     return [item.path for item in record.outputs]
 
 
-def _collect_target_records(store: Store, stages: set[str]) -> dict[str, Any]:
-    records = {}
-    for stage_name in stages:
-        record = store.read_success(stage_name)
-        if record is not None:
-            records[stage_name] = record
-    return records
-
-
 def _validate_record_paths(root: Path, records: dict[str, Any]) -> None:
     outside = []
+    resolved_root = root.resolve()
     for record in records.values():
         for relative in _record_paths(record):
             path = root / relative
-            if not _is_relative_to(path, root):
+            if not path.resolve().is_relative_to(resolved_root):
                 outside.append(path)
     if outside:
         listed = ", ".join(str(path) for path in outside)
@@ -128,10 +96,12 @@ def clean(
             shutil.rmtree(root)
             return
 
-        if target not in experiment.stages():
-            raise ValueError(f"Unknown varve stage: {target}")
-        stage_names = _downstream_closure(experiment, target)
-        records = _collect_target_records(store, stage_names)
+        stage_names = selected_stages(experiment, downstream=target)
+        records = {}
+        for stage_name in stage_names:
+            record = store.read_success(stage_name)
+            if record is not None:
+                records[stage_name] = record
         _validate_record_paths(root, records)
         _confirm(f"Clean varve stage subtree {target}?", yes, confirm)
 

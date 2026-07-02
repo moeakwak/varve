@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import get_args
 
 import pytest
 
-from varve.engine.state import Status
 from varve.models import (
     AttemptMarker,
     BatchRecord,
@@ -86,7 +84,3 @@ def test_corrupt_store_raises(tmp_path: Path) -> None:
     (path / "sample.json").write_text("{bad", encoding="utf-8")
     with pytest.raises(CorruptStore):
         Store(tmp_path).read_success("sample")
-
-
-def test_corrupt_store_status_literal_is_public() -> None:
-    assert "corrupt-store" in get_args(Status)

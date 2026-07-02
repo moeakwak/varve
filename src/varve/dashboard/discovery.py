@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 from pydantic import ValidationError
 
@@ -84,7 +83,7 @@ def _is_temporary_output_root(output_root: Path) -> bool:
 
 def _read_manifest(manifest_path: Path) -> tuple[Manifest | None, str | None]:
     try:
-        data: Any = json.loads(manifest_path.read_text(encoding="utf-8"))
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
         return Manifest.model_validate(data), None
     except (json.JSONDecodeError, OSError, ValidationError) as error:
         return None, str(error)

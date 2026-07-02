@@ -10,14 +10,13 @@ from types import SimpleNamespace
 
 from pydantic import BaseModel
 
-from varve.branch_config import config_from_init, resolve_branch
+from varve.branch_config import resolve_branch
 from varve.cli import argmap
 from varve.cli.clean import clean
 from varve.engine.runner import evaluate_state, run, selected_stages
 from varve.experiment import Experiment
 from varve.log import configure_cli_logging
 
-_COMMANDS = {"run", "status", "clean", "plan", "list"}
 _CONFIG_COMMANDS = {"run", "status", "clean"}
 _NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
 _COMMAND_OPTION_ARITIES = {
@@ -40,14 +39,6 @@ _COMMAND_OPTION_ARITIES = {
     },
     "plan": {"--upto": 1, "--downstream": 1},
 }
-
-
-def _config_from_args(
-    config_type: type[BaseModel],
-    *,
-    init_kwargs: dict[str, object],
-) -> BaseModel:
-    return config_from_init(config_type, init_kwargs)
 
 
 def _args_from_namespace(
@@ -125,13 +116,6 @@ def _selected_command_index(argv: list[str]) -> int | None:
     return None
 
 
-def _selected_command(argv: list[str]) -> str | None:
-    index = _selected_command_index(argv)
-    if index is None:
-        return None
-    return argv[index]
-
-
 def _option_name(token: str) -> str:
     if token.startswith("--"):
         return token.split("=", 1)[0]
@@ -177,7 +161,9 @@ def _has_unknown_option_before_config_registration(
 def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     selected_command_index = _selected_command_index(raw_argv)
-    selected_command = _selected_command(raw_argv)
+    selected_command = (
+        raw_argv[selected_command_index] if selected_command_index is not None else None
+    )
     parser = argparse.ArgumentParser(prog=experiment.__name__)
     parser.add_argument("-v", "--verbose", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -265,10 +251,7 @@ def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
         cli_out=namespace.out,
         allow_bare_output_root=namespace.command == "clean",
     )
-    if namespace.command == "clean":
-        config = resolved.config
-    else:
-        config = resolved.config
+    config = resolved.config
     args = _args_from_namespace(experiment, namespace)
     if namespace.command == "status":
         _print_status(

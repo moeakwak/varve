@@ -15,7 +15,8 @@ src/varve/
 ├── __init__.py          # Public re-export surface.
 ├── context.py           # Runtime Ctx passed to stage methods.
 ├── decorators.py        # @stage, @batch_stage, and StageSpec metadata.
-├── branch.py            # Branch name validation, branch config loading, and override merging.
+├── branch.py            # Branch name validation, varve.yaml loading, and override merging.
+├── branch_config.py     # Config construction, branch resolution, and output-base selection.
 ├── experiment.py        # Experiment base class, branch-aware output roots, stage collection, CLI hook.
 ├── keyspec.py           # JSON type and KeySpec declarations.
 ├── log.py               # Logger and CLI logging helpers.
@@ -41,7 +42,7 @@ src/varve/
     └── clean.py         # Destructive clean operations and safety checks.
 ```
 
-Empty package `__init__.py` files under internal subpackages intentionally do not re-export symbols. Internal imports use full module paths such as `varve.store.store.Store` and `varve.keying.keys.content_key`.
+Internal imports use full module paths such as `varve.store.store.Store` and `varve.keying.keys.content_key`.
 
 ## Dependency Direction
 
@@ -53,20 +54,26 @@ flowchart TD
   store["src/varve/store"]
   state["src/varve/engine/state"]
   runner["src/varve/engine/runner"]
+  branch_config["src/varve/branch_config.py"]
   dashboard["src/varve/dashboard"]
   cli["src/varve/cli"]
 
   keying --> leaves
   store --> leaves
   state --> leaves
+  branch_config --> store
+  branch_config --> public
   runner --> keying
   runner --> store
   runner --> state
   runner --> public
   dashboard --> store
   dashboard --> leaves
+  dashboard --> runner
+  dashboard --> branch_config
   cli --> runner
   cli --> store
+  cli --> branch_config
   cli --> public
   public --> store
   public --> cli_exception["Experiment.cli() lazy import only"]
@@ -76,16 +83,17 @@ Rules:
 
 - `keying`, `store`, and `engine.state` stay low level: they do not import each other, `engine.runner`, public-surface modules, or `cli`.
 - `keying` only depends on leaf top-level modules such as `models`, `log`, and `keyspec`.
+- `branch_config` constructs Config objects and resolves branches above the store layer.
 - `engine.runner` composes the lower layers and owns orchestration.
-- `dashboard` is a read-only top-level package. It may read `store` and persisted `models`, but no lower layer imports `dashboard`, and `dashboard` must not depend on `engine.runner`.
+- `dashboard` is a top-level read/refresh package. It may read `store`, resolve branches, evaluate engine state, and run refreshes, but no lower layer imports `dashboard`.
 - `cli` is the top layer and may call runner, clean, store, and public-facing modules.
 - `Experiment.cli()` has the only controlled reverse edge. It lazily imports `varve.cli.app.main` inside the method body.
 
 There is no automated import-direction checker. Dependency direction is enforced by this document and code review.
 
-## Public API vs Internal Surface
+## Public Import Surface vs Internal Surface
 
-The public API is exactly the seven names exported from `varve.__all__`:
+The public import surface is exactly the seven names exported from `varve.__all__`:
 
 ```python
 Ctx
@@ -105,7 +113,10 @@ from varve import Ctx, Experiment, JSON, KeySpec, StageSpec, batch_stage, stage
 
 Internal surfaces include `Store`, `CorruptStore`, `run_key`, `content_key`, `Manifest`, `SuccessRecord`, `PartialMeta`, `BatchRecord`, `AttemptMarker`, `StageOutcome`, and CLI helper functions. They may be imported by internal modules and tests through their full paths, but they are not exported from `varve`.
 
-`Ctx(..., ledger=...)` is only a legacy keyword alias for `Ctx(..., store=...)`. Internal runner code passes `store=`.
+The experiment author contract also includes `Experiment` methods used to declare
+runtime policy and entry points: `cli()`, `default_output_root()`,
+`clean_roots()`, `varve_config_path()`, `output_root()`, `stages()`, and
+`topo_order()`.
 
 ## Cache Semantics Overview
 
@@ -133,7 +144,7 @@ There is no append-only history.
 
 Recorded artifact paths are output-root-relative. Static `@stage(produces=...)` declarations are resolved against `ctx.out`. Batch stages may yield absolute paths under `ctx.out` or paths already relative to `ctx.out`; relative batch paths are not current-working-directory-relative.
 
-The output root is not part of the experiment `Config`. `run`, `status`, and `clean` resolve an output base from explicit `--out`/`cli_out` when present, otherwise from `Experiment.default_output_root(config)`. varve then appends the selected branch: `base/<branch>` for persistent branches and `base/.tmp/<branch>` for temporary override branches. The resolved value is used for `Store(out)` and every stage `Ctx(out=out, args=args)`.
+The output root is not part of the experiment `Config`. `run`, `status`, and `clean` resolve an output base from explicit `--out`/`cli_out` when present, otherwise from `Experiment.default_output_root(config)`. varve then appends the selected branch: `base/<branch>` for persistent branches and `base/.tmp/<branch>` for temporary override branches. The resolved value is used for `Store(out)` and every stage `Ctx(out=out, args=args, store=store)`.
 
 `Ctx.resume(iterable, progress=True, desc=..., unit=..., total=..., postfix=...)` keeps resume semantics unchanged while showing one `tqdm` progress bar for the whole resumed iterable. The bar is enabled by default and labeled with the stage name; skipped indexes seed its initial value, so resumed runs do not restart the displayed count from zero. Pass `progress=False` to disable it.
 
@@ -167,10 +178,9 @@ stale
 no-cache
 resume
 unrecoverable
-corrupt-store
 ```
 
-Current code declares `corrupt-store` as a status literal, but no runner path produces that status today. Malformed store files raise `CorruptStore` from `varve.store.store`.
+Malformed store files raise `CorruptStore` from `varve.store.store`.
 
 ### Decision Inputs
 
@@ -233,17 +243,13 @@ The top-level `varve` console script provides a dashboard over existing stores:
 - `varve show <experiment_id> [--root DIR] [--branch NAME]` prints one store's stage details and dependency edges.
 - `varve refresh [--root DIR] [--prefix MODULE_PREFIX]` runs executable discovered experiment branches. With `--prefix`, it only considers manifest modules starting with that prefix.
 
-Discovery is intentionally zero-import. Read-only dashboard commands import experiment modules only when engine state evaluation needs the manifest module; `refresh` imports matching experiments with `artifact-missing`, `dirty`, `no-cache`, `resume`, or `stale` status before calling the runner. Stores outside the branch output layout are skipped.
+Discovery is intentionally zero-import. Read-only dashboard commands stay non-mutating after discovery: they import the manifest module, resolve the selected branch, and use the same engine state evaluator as `status`. Dashboard experiment status is the aggregate engine `Status`, or `error` when manifest parsing, import, branch/config resolution, or evaluation fails.
 
-- `ok`: a success record exists and every recorded artifact path still exists.
-- `artifact-missing`: a success record exists but at least one recorded artifact is missing.
-- `interrupted`: an attempt marker exists, with or without an older success record.
-- `corrupt`: a stage store file is malformed, or the manifest could not provide an experiment name.
-- `empty`: the manifest exists but no stage success or attempt records exist.
+`refresh` uses the same evaluated state and runs only branches with executable statuses: `artifact-missing`, `dirty`, `no-cache`, `resume`, or `stale`. Stores outside the branch output layout are skipped.
 
-Stage discovery uses the union of `.varve/stages/*.json` and `.varve/attempts/*.json`, so a stage that interrupted before its first success record is still visible. Single-stage artifacts are read from `SuccessRecord.produces`; batch artifacts are read from `SuccessRecord.outputs`.
+Stage rows follow `Experiment.topo_order()` and use each stage's engine `STATUS` and `REASON`. Single-stage artifacts are read from `SuccessRecord.produces`; batch artifacts are read from `SuccessRecord.outputs`.
 
-The detail view rebuilds dependency edges from `SuccessRecord.key_components.upstreams`. The topological order only includes stages present in the store, and edges are printed only when both endpoints are recorded. The dashboard cannot see stages that were declared but never run, and it does not recompute source fingerprints or content keys to detect stale source or key-input changes.
+The detail view prints dependency edges from declared stage `needs`, only when both endpoints are present in the evaluated stage list. Declared stages can appear before they have a success record; artifacts and timing stay blank until a success exists.
 
 ## Args and Config Sources
 
@@ -300,7 +306,6 @@ Per-stage clean (`target is not None`) then:
 ## Known Limitations
 
 - Source AST fingerprints use `ast.dump`. The normalized dump can change across CPython versions, so a Python upgrade may invalidate source hashes and force rebuilds.
-- `corrupt-store` is declared in the `Status` literal set, but current code does not produce that status. Corrupt store files raise `CorruptStore` directly.
 
 ## Non-Goals
 

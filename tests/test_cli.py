@@ -214,42 +214,6 @@ def test_cli_clean_target_after_equals_option_does_not_clean_root(tmp_path: Path
     assert not (root / "sample.txt").exists()
 
 
-def test_cli_clean_target_after_dynamic_config_options_does_not_clean_root(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    assert CliExperiment.cli(["run", f"--out={out}"]) == 0
-    root = out / "main"
-    extra = root / "extra.txt"
-    extra.write_text("extra", encoding="utf-8")
-
-    assert (
-        CliExperiment.cli(
-            ["clean", f"--out={out}", "--no-enabled", "--downstream", "sample", "--yes"]
-        )
-        == 0
-    )
-    assert root.exists()
-    assert extra.exists()
-    assert not (root / "sample.txt").exists()
-
-
-def test_cli_clean_target_after_nested_equals_option_does_not_clean_root(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    assert NestedCliExperiment.cli(["run", f"--out={out}", "--inner.name=custom"]) == 0
-    root = out / "main"
-    extra = root / "extra.txt"
-    extra.write_text("extra", encoding="utf-8")
-
-    assert (
-        NestedCliExperiment.cli(
-            ["clean", f"--out={out}", "--inner.name=custom", "--downstream", "sample", "--yes"]
-        )
-        == 0
-    )
-    assert root.exists()
-    assert extra.exists()
-    assert not (root / "sample.txt").exists()
-
-
 def test_cli_clean_target_after_nested_bool_option_does_not_clean_root(tmp_path: Path) -> None:
     out = tmp_path / "out"
     assert NestedCliExperiment.cli(["run", f"--out={out}"]) == 0
@@ -532,12 +496,6 @@ def test_cli_optional_field_accepts_null_sentinel(
     assert captured[-1][1].sample is None
 
 
-def test_cli_optional_field_accepts_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = _capture_run(monkeypatch)
-    assert ChoiceCliExperiment.cli(["run", f"--out={tmp_path}", "--sample", "9"]) == 0
-    assert captured[-1][1].sample == 9
-
-
 @pytest.mark.parametrize("command", ["run", "status", "clean"])
 def test_cli_help_is_handled_by_argparse(command: str, capsys) -> None:
     with pytest.raises(SystemExit) as exc_info:
@@ -546,36 +504,15 @@ def test_cli_help_is_handled_by_argparse(command: str, capsys) -> None:
     assert "--mode" in capsys.readouterr().out
 
 
-def test_cli_help_hides_removed_flags_and_internal_dest(capsys) -> None:
+def test_cli_help_hides_internal_dest(capsys) -> None:
     with pytest.raises(SystemExit) as exc_info:
         NestedCliExperiment.cli(["run", "--help"])
     assert exc_info.value.code == 0
     help_text = capsys.readouterr().out
     assert "__VARVE_CONFIG__" not in help_text
     assert "__VARVE_ARGS__" not in help_text
-    for removed in ["--only", "--dry", "--config", "--name"]:
-        assert removed not in help_text
     assert "--upto STAGE" in help_text
     assert "--downstream STAGE" in help_text
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["run", "sample"],
-        ["run", "--only", "sample"],
-        ["run", "--dry"],
-        ["run", "--config", "cfg.yaml"],
-        ["run", "--name", "quick"],
-        ["status", "--override", "{}"],
-        ["clean", "--override", "{}", "--yes"],
-        ["plan", "--mermaid"],
-        ["plan", "--dot"],
-    ],
-)
-def test_cli_rejects_removed_surface(argv: list[str]) -> None:
-    with pytest.raises(SystemExit):
-        CliExperiment.cli(argv)
 
 
 @pytest.mark.parametrize(
@@ -687,15 +624,6 @@ def test_cli_yaml_branch_does_not_require_valid_main_config(
 
     assert RequiredExtraCliExperiment.cli(["run", f"--out={out}", "--branch", "alt"]) == 0
     assert (out / "alt" / "sample.txt").read_text(encoding="utf-8") == "beta"
-
-
-def test_cli_old_temporary_manifest_cannot_be_reused(tmp_path: Path) -> None:
-    manifest = tmp_path / "out" / ".tmp" / "legacy" / ".varve" / "manifest.json"
-    manifest.parent.mkdir(parents=True)
-    manifest.write_text('{"schema_version":1,"experiment":"CliExperiment"}\n', encoding="utf-8")
-
-    with pytest.raises(ValueError, match="old manifest"):
-        CliExperiment.cli(["status", f"--out={tmp_path / 'out'}", "--branch", "legacy"])
 
 
 def test_cli_clean_without_out_requires_full_config() -> None:

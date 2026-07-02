@@ -8,14 +8,6 @@ from pydantic import BaseModel
 from varve import Experiment, KeySpec, batch_stage, stage
 
 
-def test_keyspec_coerce() -> None:
-    original = KeySpec()
-    assert KeySpec.coerce(original) is original
-    assert KeySpec.coerce(None) == KeySpec()
-    with pytest.raises(TypeError, match="Unsupported key spec"):
-        KeySpec.coerce(["a", "b"])  # type: ignore[arg-type]
-
-
 def test_decorators_capture_stage_metadata() -> None:
     @batch_stage(needs="sample", partition_key=["batch_size"])
     async def transform(ctx):  # pragma: no cover - metadata only

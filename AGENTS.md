@@ -43,11 +43,9 @@ The core storage class is `Store` in `varve.store.store`.
 - attempt markers in `.varve/attempts/*.json`;
 - partial batch scratch in `.varve/partial/<stage>/<run_key>/`.
 
-It is not an append-only history. New code should use `Store`, `store`, and `corrupt-store` language consistently.
+It is not an append-only history. New code should use `Store`, `store`, and corrupt store language consistently.
 
 `CorruptStore` is the associated exception for malformed store files. It belongs to the internal store surface and is not exported from `varve.__all__`.
-
-`Ctx(..., ledger=...)` is only a legacy keyword alias for `Ctx(..., store=...)`. Runner code and new call sites must pass `store=`.
 
 The experiment output root is a varve-owned runtime value. Experiment Config models must not declare `out` or `output_root` fields for it. Experiments provide a canonical root by overriding `Experiment.default_output_root(config)`. varve appends the selected branch to that base: `base/<branch>` for persistent branches and `base/.tmp/<branch>` for temporary branches. Stage bodies and helper functions must write through `ctx.out`.
 
@@ -129,7 +127,7 @@ Keep the subject short, imperative, and lower-case after the type/scope prefix. 
 ```bash
 git commit -m 'feat(cli): support `Literal`/`Enum` choices'
 git commit -m 'fix(store): guard batch `produces` against missing output root'
-git commit -m 'refactor(engine)!: rename `ledger` to `store`'
+git commit -m 'refactor(context)!: require `store` in `Ctx`'
 ```
 
 ### Body

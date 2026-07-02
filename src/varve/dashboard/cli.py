@@ -24,39 +24,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "refresh":
         return _refresh(args.root, args.include_temp, args.prefix)
     root = args.root if args.command == "ls" else Path.cwd()
-    include_temp = args.include_temp
-    return _ls(root, include_temp)
+    return _ls(root, getattr(args, "include_temp", False))
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="varve")
-    parser.add_argument(
-        "--include-temp",
-        action="store_true",
-        default=False,
-        help="include temporary override branches under out/.tmp",
-    )
     subparsers = parser.add_subparsers(dest="command")
 
     ls_parser = subparsers.add_parser("ls", help="list discovered experiment stores")
     ls_parser.add_argument("--root", type=Path, default=Path.cwd())
-    ls_parser.add_argument(
-        "--include-temp",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="include temporary override branches under out/.tmp",
-    )
+    _add_include_temp(ls_parser)
 
     show_parser = subparsers.add_parser("show", help="show one experiment store")
     show_parser.add_argument("experiment")
     show_parser.add_argument("--root", type=Path, default=Path.cwd())
     show_parser.add_argument("--branch", default="main")
-    show_parser.add_argument(
-        "--include-temp",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="include temporary override branches under out/.tmp",
-    )
+    _add_include_temp(show_parser)
 
     refresh_parser = subparsers.add_parser("refresh", help="run executable discovered experiments")
     refresh_parser.add_argument("--root", type=Path, default=Path.cwd())
@@ -64,13 +47,16 @@ def _parser() -> argparse.ArgumentParser:
         "--prefix",
         help="only refresh experiments whose module starts with this prefix",
     )
-    refresh_parser.add_argument(
+    _add_include_temp(refresh_parser)
+    return parser
+
+
+def _add_include_temp(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
         "--include-temp",
         action="store_true",
-        default=argparse.SUPPRESS,
         help="include temporary override branches under out/.tmp",
     )
-    return parser
 
 
 def _ls(root: Path, include_temp: bool) -> int:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,7 +15,6 @@ from varve.context import Ctx
 from varve.engine.state import Decision, Status, decide_batch, decide_single
 from varve.experiment import Experiment
 from varve.keying.keys import compute_key_components, content_key, run_key
-from varve.log import get_logger
 from varve.models import (
     AttemptMarker,
     BatchRecord,
@@ -71,7 +71,6 @@ def _cwd_relative_path_hint(path: Path, out: Path) -> str | None:
 def _refresh_fingerprint_cache(
     *,
     store: Store,
-    stage_name: str,
     previous: SuccessRecord | None,
     components: KeyComponents,
 ) -> None:
@@ -169,24 +168,14 @@ def selected_stages(
     return set(stages)
 
 
-def _upstream_keys(stage_spec, store: Store) -> dict[str, str]:
-    keys: dict[str, str] = {}
-    for name in stage_spec.needs:
-        record = store.read_success(name)
-        if record is None:
-            raise ValueError(f"Upstream stage has no success record: {name}")
-        keys[name] = record.content_key
-    return keys
-
-
-def _upstream_keys_from_known(
+def _upstream_keys(
     stage_spec,
     store: Store,
-    known_content_keys: dict[str, str],
+    known_content_keys: dict[str, str] | None = None,
 ) -> dict[str, str]:
     keys: dict[str, str] = {}
     for name in stage_spec.needs:
-        if name in known_content_keys:
+        if known_content_keys is not None and name in known_content_keys:
             keys[name] = known_content_keys[name]
             continue
         record = store.read_success(name)
@@ -282,7 +271,7 @@ async def _drive(
     instance = experiment_type()
     outcomes: list[StageOutcome] = []
     known_content_keys: dict[str, str] = {}
-    logger = get_logger()
+    logger = logging.getLogger("varve")
     logger.info(
         "plan: %s", " -> ".join(name for name in experiment_type.topo_order() if name in selected)
     )
@@ -296,10 +285,10 @@ async def _drive(
             if missing_upstream:
                 outcomes.append(StageOutcome(stage_name, "no-cache", "no cache", None))
                 continue
-        upstream_keys = (
-            _upstream_keys_from_known(stage_spec, store, known_content_keys)
-            if not execute
-            else _upstream_keys(stage_spec, store)
+        upstream_keys = _upstream_keys(
+            stage_spec,
+            store,
+            known_content_keys if not execute else None,
         )
         previous = store.read_success(stage_name)
         cached_files = previous.key_components.files if previous is not None else None
@@ -351,7 +340,6 @@ async def _drive(
         if execute and decision.status == "hit":
             _refresh_fingerprint_cache(
                 store=store,
-                stage_name=stage_name,
                 previous=previous,
                 components=components,
             )

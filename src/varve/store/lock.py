@@ -8,10 +8,6 @@ import os
 from pathlib import Path
 
 
-def _lock_payload() -> bytes:
-    return b"locked\n"
-
-
 def _try_file_lock(fd: int) -> bool:
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -56,7 +52,7 @@ class OutputLock:
             raise RuntimeError(f"Varve output root is already locked: {self.path}")
         try:
             os.ftruncate(self._fd, 0)
-            os.write(self._fd, _lock_payload())
+            os.write(self._fd, b"locked\n")
         except Exception:
             _unlock_file(self._fd)
             os.close(self._fd)

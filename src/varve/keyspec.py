@@ -21,11 +21,3 @@ class KeySpec:
 
     files: Mapping[str, Callable[[Any], Path | list[Path]]] = field(default_factory=dict)
     values: Mapping[str, Callable[[Any], JSON]] = field(default_factory=dict)
-
-    @classmethod
-    def coerce(cls, key: KeySpec | None) -> KeySpec:
-        if key is None:
-            return cls()
-        if isinstance(key, cls):
-            return key
-        raise TypeError(f"Unsupported key spec: {type(key).__name__}")

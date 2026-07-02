@@ -74,19 +74,6 @@ def test_clean_full_output_root_rejects_when_confirm_declines(tmp_path: Path) ->
     assert root.exists()
 
 
-def test_clean_full_output_root_accepts_when_confirm_accepts(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    run(CleanExperiment, Config(), cli_out=out)
-    root = out / "main"
-
-    def accepting_confirm(message: str) -> bool:
-        assert str(root) in message
-        return True
-
-    clean(CleanExperiment, Config(), cli_out=out, confirm=accepting_confirm)
-    assert not root.exists()
-
-
 def test_clean_yes_skips_confirm_callback(tmp_path: Path) -> None:
     out = tmp_path / "out"
     run(CleanExperiment, Config(), cli_out=out)

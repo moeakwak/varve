@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 from pydantic import ValidationError
 
 from varve.models import (
+    AttemptMarker,
     BatchRecord,
     Manifest,
     PartialMeta,
@@ -81,23 +82,15 @@ class Store:
             raise ValueError(
                 f"Varve store belongs to {manifest.experiment}, not {experiment}: {manifest_path}"
             )
-        if (
-            temporary_config is not None
-            and manifest.temporary_config is not None
-            and manifest.temporary_config != temporary_config
-        ):
+        if temporary_config is not None and manifest.temporary_config != temporary_config:
             raise ValueError(f"Varve store has a different temporary config: {manifest_path}")
-        if (module is not None and manifest.module != module) or (
-            temporary_config is not None and manifest.temporary_config is None
-        ):
+        if module is not None and manifest.module != module:
             _atomic_write_json(
                 manifest_path,
                 Manifest(
                     experiment=manifest.experiment,
                     module=module if module is not None else manifest.module,
-                    temporary_config=temporary_config
-                    if temporary_config is not None
-                    else manifest.temporary_config,
+                    temporary_config=manifest.temporary_config,
                 ),
             )
 
@@ -107,12 +100,10 @@ class Store:
     def write_success(self, record: SuccessRecord) -> None:
         _atomic_write_json(self.root / "stages" / f"{record.stage}.json", record)
 
-    def read_attempt(self, stage: str):
-        from varve.models import AttemptMarker
-
+    def read_attempt(self, stage: str) -> AttemptMarker | None:
         return _read_model(self.root / "attempts" / f"{stage}.json", AttemptMarker)
 
-    def write_attempt(self, stage: str, marker) -> None:
+    def write_attempt(self, stage: str, marker: AttemptMarker) -> None:
         _atomic_write_json(self.root / "attempts" / f"{stage}.json", marker)
 
     def clear_attempt(self, stage: str) -> None:
@@ -129,12 +120,11 @@ class Store:
             return None
         batches_root = partial_root / "batches"
         batches: dict[int, BatchRecord] = {}
-        if batches_root.exists():
-            for path in sorted(batches_root.glob("*.json")):
-                batch = _read_model(path, BatchRecord)
-                if batch is None:
-                    continue
-                batches[batch.index] = batch
+        for path in sorted(batches_root.glob("*.json")):
+            batch = _read_model(path, BatchRecord)
+            if batch is None:
+                continue
+            batches[batch.index] = batch
         return meta, batches
 
     def write_partial_meta(self, stage: str, run_key: str, meta: PartialMeta) -> None:
@@ -147,7 +137,7 @@ class Store:
         )
 
     def clear_partial(self, stage: str, run_key: str | None = None) -> None:
-        if run_key is None:
-            shutil.rmtree(self.root / "partial" / stage, ignore_errors=True)
-        else:
-            shutil.rmtree(self.root / "partial" / stage / run_key, ignore_errors=True)
+        path = self.root / "partial" / stage
+        if run_key is not None:
+            path /= run_key
+        shutil.rmtree(path, ignore_errors=True)

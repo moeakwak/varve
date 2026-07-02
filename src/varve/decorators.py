@@ -55,7 +55,7 @@ def stage(
             func=func,
             needs=_normalize_needs(needs),
             produces=produces,
-            keyspec=KeySpec.coerce(key),
+            keyspec=key if key is not None else KeySpec(),
             auto_uses=auto_uses,
             additional_uses=tuple(additional_uses),
         )
@@ -88,7 +88,7 @@ def batch_stage(
             func=func,
             needs=_normalize_needs(needs),
             produces=produces,
-            keyspec=KeySpec.coerce(key),
+            keyspec=key if key is not None else KeySpec(),
             auto_uses=auto_uses,
             additional_uses=tuple(additional_uses),
             partition_key=tuple(partition_key),

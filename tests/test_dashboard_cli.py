@@ -102,15 +102,6 @@ def test_ls_and_show_can_include_temporary_branches(
     assert "main" in include_temp_output
     assert "quick" in include_temp_output
 
-    monkeypatch = pytest.MonkeyPatch()
-    try:
-        monkeypatch.chdir(tmp_path)
-        assert main(["--include-temp"]) == 0
-    finally:
-        monkeypatch.undo()
-    default_command_output = capsys.readouterr().out
-    assert "quick" in default_command_output
-
     assert main(["show", "demo", "--branch", "quick", "--root", str(tmp_path)]) == 1
     assert "Unknown experiment: demo (branch quick)" in capsys.readouterr().err
 

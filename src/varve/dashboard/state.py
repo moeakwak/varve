@@ -28,7 +28,6 @@ STATUS_PRIORITY: tuple[Status, ...] = (
     "no-cache",
     "stale",
     "dirty",
-    "corrupt-store",
     "unrecoverable",
 )
 _STATUS_PRIORITY = {status: index for index, status in enumerate(STATUS_PRIORITY)}
