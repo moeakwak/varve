@@ -1,9 +1,25 @@
 [project]
 name = "varve"
-version = "0.1.0"
-description = "A small Python materialized-cache orchestration library."
+# release-please owns this value. The first release PR bumps it to 0.1.0.
+version = "0.0.0"
+description = "A small Python library for experiment pipelines with code-aware materialized caching."
 readme = "README.md"
 requires-python = ">=3.10"
+authors = [{ name = "Bob Wang" }]
+license = "MIT"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
 dependencies = [
     "pydantic>=2.0.0",
     "pydantic-settings[yaml]>=2.0.0",
@@ -11,11 +27,17 @@ dependencies = [
     "tqdm>=4.66.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/moeakwak/varve"
+Issues = "https://github.com/moeakwak/varve/issues"
+Changelog = "https://github.com/moeakwak/varve/blob/main/CHANGELOG.md"
+
 [project.scripts]
 varve = "varve.dashboard.cli:main"
 
 [project.optional-dependencies]
 dev = [
+    "pyright>=1.1.0",
     "pytest>=8.0.0",
     "ruff>=0.1.0",
 ]
@@ -34,3 +56,8 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+pythonVersion = "3.10"
+include = ["src/varve", "tests"]
