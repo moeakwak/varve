@@ -7,7 +7,7 @@ from typing import Literal
 import pytest
 from pydantic import BaseModel, Field, ValidationError
 
-from varve import Experiment, stage
+from varve import Pipeline, stage
 from varve.store.store import Store
 
 
@@ -31,7 +31,7 @@ class NestedArgs(Args):
     inner: InnerArgs = Field(default_factory=InnerArgs)
 
 
-class CliExperiment(Experiment):
+class CliExperiment(Pipeline):
     Args = Args
     Config = Config
 
@@ -62,7 +62,7 @@ class StringForceArgs(BaseModel):
     force: str = "config-default"
 
 
-class ConflictingCliExperiment(Experiment):
+class ConflictingCliExperiment(Pipeline):
     Args = ConflictingCliArgs
     Config = ConflictingCliConfig
 
@@ -81,7 +81,7 @@ class ConflictingCliExperiment(Experiment):
         )
 
 
-class StringForceCliExperiment(Experiment):
+class StringForceCliExperiment(Pipeline):
     Args = StringForceArgs
     Config = Config
 
@@ -94,7 +94,7 @@ class UnsupportedConfig(BaseModel):
     extra: dict = Field(default_factory=dict)
 
 
-class UnsupportedConfigExperiment(Experiment):
+class UnsupportedConfigExperiment(Pipeline):
     Args = UnsupportedConfig
     Config = UnsupportedConfig
 
@@ -416,7 +416,7 @@ class ChoiceArgs(BaseModel):
     sample: int | None = 5
 
 
-class ChoiceCliExperiment(Experiment):
+class ChoiceCliExperiment(Pipeline):
     Args = ChoiceArgs
     Config = Config
 
@@ -433,7 +433,7 @@ class RequiredExtraConfig(BaseModel):
     dataset: str
 
 
-class RequiredExtraCliExperiment(Experiment):
+class RequiredExtraCliExperiment(Pipeline):
     Config = RequiredExtraConfig
 
     @classmethod

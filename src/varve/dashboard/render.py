@@ -54,7 +54,7 @@ def render_overview(states: list[ExperimentState]) -> None:
 def render_detail(state: ExperimentState) -> None:
     console = Console(highlight=False)
     experiment_name = state.entry.experiment_name or state.entry.experiment_id
-    console.print(f"Experiment: {state.entry.experiment_id}")
+    console.print(f"Pipeline: {state.entry.experiment_id}")
     # soft_wrap keeps long output-root paths on one line; rich would otherwise
     # hard-wrap them at the console width and split the path mid-string.
     console.print(f"Output root: {state.entry.output_root}", soft_wrap=True)

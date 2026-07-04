@@ -9,14 +9,14 @@ boundaries, see [AGENTS.md](AGENTS.md).
 
 ```python
 from pydantic import BaseModel
-from varve import Experiment, stage
+from varve import Pipeline, stage
 
 
 class Config(BaseModel):
     seed: int = 1
 
 
-class Demo(Experiment):
+class Demo(Pipeline):
     Config = Config
 
     @stage(produces="sample.txt")
@@ -28,7 +28,7 @@ if __name__ == "__main__":
     raise SystemExit(Demo.cli())
 ```
 
-Experiment commands:
+Pipeline commands:
 
 - `run [--branch NAME] [--override JSON] [--upto STAGE | --downstream STAGE] [--force] [--out PATH]`
 - `status [--branch NAME] [--upto STAGE | --downstream STAGE] [--out PATH]`
@@ -42,13 +42,13 @@ Dashboard commands:
 - `varve show <experiment_id> [--root DIR] [--branch NAME]`
 - `varve refresh [--root DIR] [--prefix MODULE_PREFIX]`
 
-Experiments may define `Args` for execution flags and `Config` for semantic
+Pipelines may define `Args` for execution flags and `Config` for semantic
 configuration. `varve.yaml` lives next to the experiment module, `main` is the
 default branch, and `run --override '{"field": "value"}'` creates a temporary
 branch under `.tmp/`.
 
 Stage code writes through `ctx.out`. varve resolves the output root from
-`--out` or `Experiment.default_output_root(config)`, then appends the selected
+`--out` or `Pipeline.default_output_root(config)`, then appends the selected
 branch: `base/<branch>` for persistent branches and `base/.tmp/<branch>` for
 temporary branches.
 

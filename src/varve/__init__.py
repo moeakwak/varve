@@ -2,12 +2,12 @@
 
 from varve.context import Ctx
 from varve.decorators import StageSpec, batch_stage, stage
-from varve.experiment import Experiment
 from varve.keyspec import JSON, KeySpec
+from varve.pipeline import Pipeline
 
 __all__ = [
     "Ctx",
-    "Experiment",
+    "Pipeline",
     "JSON",
     "KeySpec",
     "StageSpec",

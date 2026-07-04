@@ -1,4 +1,4 @@
-"""Experiment base class and stage graph collection."""
+"""Pipeline base class and stage graph collection."""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ class _EmptyArgs(BaseModel):
     pass
 
 
-class Experiment:
-    """Base class for varve experiments.
+class Pipeline:
+    """Base class for varve pipelines.
 
     Subclasses declare stage methods with `@stage` and `@batch_stage`. The base
     class keeps orchestration outside experiment code by collecting and sorting

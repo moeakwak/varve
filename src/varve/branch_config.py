@@ -17,7 +17,7 @@ from varve.branch import (
     override_branch_name,
     validate_branch_name,
 )
-from varve.experiment import Experiment
+from varve.pipeline import Pipeline
 from varve.store.store import Store
 
 
@@ -65,7 +65,7 @@ def _snapshot(config: Any) -> dict[str, Any]:
 
 
 def _main_config(
-    experiment: type[Experiment],
+    experiment: type[Pipeline],
     raw_main: dict[str, Any],
     *,
     cli_out: Path | None,
@@ -87,7 +87,7 @@ def _temporary_config_from_manifest(main_base: Path, branch: str) -> dict[str, A
 
 
 def resolve_branch(
-    experiment: type[Experiment],
+    experiment: type[Pipeline],
     *,
     branch: str,
     override_json: str | None,

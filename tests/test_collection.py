@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from varve import Experiment, KeySpec, batch_stage, stage
+from varve import KeySpec, Pipeline, batch_stage, stage
 
 
 def test_decorators_capture_stage_metadata() -> None:
@@ -26,7 +26,7 @@ class DemoConfig(BaseModel):
 
 
 def test_experiment_collects_and_sorts_stages() -> None:
-    class Demo(Experiment):
+    class Demo(Pipeline):
         Config = DemoConfig
 
         @stage(produces="sample.txt")
@@ -43,7 +43,7 @@ def test_experiment_collects_and_sorts_stages() -> None:
 
 
 def test_experiment_rejects_unknown_dependencies() -> None:
-    class Broken(Experiment):
+    class Broken(Pipeline):
         Config = DemoConfig
 
         @stage(needs="missing")
@@ -55,7 +55,7 @@ def test_experiment_rejects_unknown_dependencies() -> None:
 
 
 def test_output_root_default_resolution(tmp_path: Path) -> None:
-    class Demo(Experiment):
+    class Demo(Pipeline):
         Config = DemoConfig
 
         @classmethod

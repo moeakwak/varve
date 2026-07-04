@@ -24,14 +24,14 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from varve import Experiment, stage
+from varve import Pipeline, stage
 
 
 class Config(BaseModel):
     token: str = "default"
 
 
-class DemoExperiment(Experiment):
+class DemoExperiment(Pipeline):
     Config = Config
 
     @classmethod

@@ -1,4 +1,4 @@
-"""Command-line interface for Experiment subclasses."""
+"""Command-line interface for Pipeline subclasses."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from varve.branch_config import resolve_branch
 from varve.cli import argmap
 from varve.cli.clean import clean
 from varve.engine.runner import evaluate_state, run, selected_stages
-from varve.experiment import Experiment
 from varve.log import configure_cli_logging
+from varve.pipeline import Pipeline
 
 _CONFIG_COMMANDS = {"run", "status", "clean"}
 _NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
@@ -42,14 +42,14 @@ _COMMAND_OPTION_ARITIES = {
 
 
 def _args_from_namespace(
-    experiment: type[Experiment],
+    experiment: type[Pipeline],
     namespace: argparse.Namespace,
 ) -> BaseModel:
     init_kwargs = argmap.collect_cli_args_namespace(namespace, experiment.Args)
     return experiment.Args.model_validate(init_kwargs)
 
 
-def _print_list(experiment: type[Experiment]) -> None:
+def _print_list(experiment: type[Pipeline]) -> None:
     for name in experiment.topo_order():
         spec = experiment.stages()[name]
         needs = ",".join(spec.needs) if spec.needs else "-"
@@ -58,7 +58,7 @@ def _print_list(experiment: type[Experiment]) -> None:
 
 
 def _print_plan(
-    experiment: type[Experiment],
+    experiment: type[Pipeline],
     *,
     upto: str | None,
     downstream: str | None,
@@ -68,7 +68,7 @@ def _print_plan(
 
 
 def _print_status(
-    experiment: type[Experiment],
+    experiment: type[Pipeline],
     config,
     args,
     *,
@@ -158,7 +158,7 @@ def _has_unknown_option_before_config_registration(
     return False
 
 
-def main(experiment: type[Experiment], argv: list[str] | None = None) -> int:
+def main(experiment: type[Pipeline], argv: list[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     selected_command_index = _selected_command_index(raw_argv)
     selected_command = (

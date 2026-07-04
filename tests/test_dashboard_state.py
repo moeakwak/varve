@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from varve import Experiment, stage
+from varve import Pipeline, stage
 from varve.dashboard.models import ExperimentEntry
 from varve.dashboard.state import load_state
 from varve.engine.runner import StageOutcome, run
@@ -21,7 +21,7 @@ class Args(BaseModel):
     pass
 
 
-class Demo(Experiment):
+class Demo(Pipeline):
     Config = Config
     Args = Args
 

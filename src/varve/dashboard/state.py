@@ -17,8 +17,8 @@ from varve.dashboard.models import (
 )
 from varve.engine.runner import evaluate_state
 from varve.engine.state import Status
-from varve.experiment import Experiment
 from varve.models import SuccessRecord
+from varve.pipeline import Pipeline
 from varve.store.store import Store
 
 STATUS_PRIORITY: tuple[Status, ...] = (
@@ -90,7 +90,7 @@ def load_state(entry: ExperimentEntry) -> ExperimentState:
     )
 
 
-def import_entry_experiment(entry: ExperimentEntry) -> type[Experiment]:
+def import_entry_experiment(entry: ExperimentEntry) -> type[Pipeline]:
     if entry.manifest_error:
         raise ValueError(entry.manifest_error)
     if entry.experiment_name is None:
@@ -102,7 +102,7 @@ def import_entry_experiment(entry: ExperimentEntry) -> type[Experiment]:
 
 def resolve_entry_branch(
     entry: ExperimentEntry,
-    experiment: type[Experiment],
+    experiment: type[Pipeline],
 ) -> ResolvedBranch:
     return resolve_branch(
         experiment,
@@ -112,11 +112,11 @@ def resolve_entry_branch(
     )
 
 
-def _import_experiment(module_name: str, class_name: str) -> type[Experiment]:
+def _import_experiment(module_name: str, class_name: str) -> type[Pipeline]:
     module = importlib.import_module(module_name)
     value = getattr(module, class_name)
-    if not isinstance(value, type) or not issubclass(value, Experiment):
-        raise TypeError(f"{module_name}.{class_name} is not a varve Experiment")
+    if not isinstance(value, type) or not issubclass(value, Pipeline):
+        raise TypeError(f"{module_name}.{class_name} is not a varve Pipeline")
     return value
 
 

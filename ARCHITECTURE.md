@@ -4,7 +4,7 @@
 
 `varve` is a materialized, content-addressed cache for serial experiment orchestration.
 
-Experiments own output formats and default output-base policy. `varve` owns branch-aware output root resolution, `ctx.out`, and the store under the output root. The store records which stage successfully produced which durable artifacts for a content key. The runner uses stage declarations, source fingerprints, the full Config, file fingerprints, values, and upstream content keys to decide whether a stage is a cache hit, stale, resumable, dirty, or missing cached state.
+Pipelines own output formats and default output-base policy. `varve` owns branch-aware output root resolution, `ctx.out`, and the store under the output root. The store records which stage successfully produced which durable artifacts for a content key. The runner uses stage declarations, source fingerprints, the full Config, file fingerprints, values, and upstream content keys to decide whether a stage is a cache hit, stale, resumable, dirty, or missing cached state.
 
 The package is intentionally small. The public API is for experiment authors; the `keying`, `store`, `engine`, and `cli` packages are internal implementation surfaces.
 
@@ -17,7 +17,7 @@ src/varve/
 ├── decorators.py        # @stage, @batch_stage, and StageSpec metadata.
 ├── branch.py            # Branch name validation, varve.yaml loading, and override merging.
 ├── branch_config.py     # Config construction, branch resolution, and output-base selection.
-├── experiment.py        # Experiment base class, branch-aware output roots, stage collection, CLI hook.
+├── pipeline.py          # Pipeline base class, branch-aware output roots, stage collection, CLI hook.
 ├── keyspec.py           # JSON type and KeySpec declarations.
 ├── log.py               # Logger and CLI logging helpers.
 ├── models.py            # Pydantic models persisted in the store.
@@ -48,7 +48,7 @@ Internal imports use full module paths such as `varve.store.store.Store` and `va
 
 ```mermaid
 flowchart TD
-  public["public surface: __init__, experiment, decorators, context"]
+  public["public surface: __init__, pipeline, decorators, context"]
   leaves["leaf top-level modules: models, log, keyspec"]
   keying["src/varve/keying"]
   store["src/varve/store"]
@@ -76,7 +76,7 @@ flowchart TD
   cli --> branch_config
   cli --> public
   public --> store
-  public --> cli_exception["Experiment.cli() lazy import only"]
+  public --> cli_exception["Pipeline.cli() lazy import only"]
 ```
 
 Rules:
@@ -87,7 +87,7 @@ Rules:
 - `engine.runner` composes the lower layers and owns orchestration.
 - `dashboard` is a top-level read/refresh package. It may read `store`, resolve branches, evaluate engine state, and run refreshes, but no lower layer imports `dashboard`.
 - `cli` is the top layer and may call runner, clean, store, and public-facing modules.
-- `Experiment.cli()` has the only controlled reverse edge. It lazily imports `varve.cli.app.main` inside the method body.
+- `Pipeline.cli()` has the only controlled reverse edge. It lazily imports `varve.cli.app.main` inside the method body.
 
 There is no automated import-direction checker. Dependency direction is enforced by this document and code review.
 
@@ -97,7 +97,7 @@ The public import surface is exactly the seven names exported from `varve.__all_
 
 ```python
 Ctx
-Experiment
+Pipeline
 JSON
 KeySpec
 StageSpec
@@ -105,15 +105,15 @@ batch_stage
 stage
 ```
 
-Experiment authors should be able to write:
+Pipeline authors should be able to write:
 
 ```python
-from varve import Ctx, Experiment, JSON, KeySpec, StageSpec, batch_stage, stage
+from varve import Ctx, Pipeline, JSON, KeySpec, StageSpec, batch_stage, stage
 ```
 
 Internal surfaces include `Store`, `CorruptStore`, `run_key`, `content_key`, `Manifest`, `SuccessRecord`, `PartialMeta`, `BatchRecord`, `AttemptMarker`, `StageOutcome`, and CLI helper functions. They may be imported by internal modules and tests through their full paths, but they are not exported from `varve`.
 
-The experiment author contract also includes `Experiment` methods used to declare
+The experiment author contract also includes `Pipeline` methods used to declare
 runtime policy and entry points: `cli()`, `default_output_root()`,
 `clean_roots()`, `varve_config_path()`, `output_root()`, `stages()`, and
 `topo_order()`.
@@ -144,7 +144,7 @@ There is no append-only history.
 
 Recorded artifact paths are output-root-relative. Static `@stage(produces=...)` declarations are resolved against `ctx.out`. Batch stages may yield absolute paths under `ctx.out` or paths already relative to `ctx.out`; relative batch paths are not current-working-directory-relative.
 
-The output root is not part of the experiment `Config`. `run`, `status`, and `clean` resolve an output base from explicit `--out`/`cli_out` when present, otherwise from `Experiment.default_output_root(config)`. varve then appends the selected branch: `base/<branch>` for persistent branches and `base/.tmp/<branch>` for temporary override branches. The resolved value is used for `Store(out)` and every stage `Ctx(out=out, args=args, store=store)`.
+The output root is not part of the experiment `Config`. `run`, `status`, and `clean` resolve an output base from explicit `--out`/`cli_out` when present, otherwise from `Pipeline.default_output_root(config)`. varve then appends the selected branch: `base/<branch>` for persistent branches and `base/.tmp/<branch>` for temporary override branches. The resolved value is used for `Store(out)` and every stage `Ctx(out=out, args=args, store=store)`.
 
 `Ctx.resume(iterable, progress=True, desc=..., unit=..., total=..., postfix=...)` keeps resume semantics unchanged while showing one `tqdm` progress bar for the whole resumed iterable. The bar is enabled by default and labeled with the stage name; skipped indexes seed its initial value, so resumed runs do not restart the displayed count from zero. Pass `progress=False` to disable it.
 
@@ -209,7 +209,7 @@ Runner adds orchestration-specific inputs around those decisions: selected stage
 
 ## CLI Architecture
 
-`Experiment.cli(argv)` delegates to `varve.cli.app.main`.
+`Pipeline.cli(argv)` delegates to `varve.cli.app.main`.
 
 The CLI uses `argparse` for command parsing:
 
@@ -247,7 +247,7 @@ Discovery is intentionally zero-import. Read-only dashboard commands stay non-mu
 
 `refresh` uses the same evaluated state and runs only branches with executable statuses: `artifact-missing`, `dirty`, `no-cache`, `resume`, or `stale`. Stores outside the branch output layout are skipped.
 
-Stage rows follow `Experiment.topo_order()` and use each stage's engine `STATUS` and `REASON`. Single-stage artifacts are read from `SuccessRecord.produces`; batch artifacts are read from `SuccessRecord.outputs`.
+Stage rows follow `Pipeline.topo_order()` and use each stage's engine `STATUS` and `REASON`. Single-stage artifacts are read from `SuccessRecord.produces`; batch artifacts are read from `SuccessRecord.outputs`.
 
 The detail view prints dependency edges from declared stage `needs`, only when both endpoints are present in the evaluated stage list. Declared stages can appear before they have a success record; artifacts and timing stay blank until a success exists.
 
@@ -290,7 +290,7 @@ Full clean (`target is None`) then:
 - requires `_confirm` unless `yes=True`;
 - removes the whole output root.
 
-Experiments declare business-allowed full-clean roots by overriding `Experiment.clean_roots(config)`. The CLI passes that value into `clean(..., allowed_roots=...)`. The default is `None`, which leaves only the dangerous-root blacklist and manifest anchor guard.
+Pipelines declare business-allowed full-clean roots by overriding `Pipeline.clean_roots(config)`. The CLI passes that value into `clean(..., allowed_roots=...)`. The default is `None`, which leaves only the dangerous-root blacklist and manifest anchor guard.
 
 Per-stage clean (`target is not None`) then:
 

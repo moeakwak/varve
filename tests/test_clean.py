@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from varve import Experiment, stage
+from varve import Pipeline, stage
 from varve.cli.clean import _validate_destructive, clean
 from varve.engine.runner import run
 from varve.models import ProducedPath
@@ -17,7 +17,7 @@ class Config(BaseModel):
     pass
 
 
-class CleanExperiment(Experiment):
+class CleanExperiment(Pipeline):
     Config = Config
 
     @classmethod

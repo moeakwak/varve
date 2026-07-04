@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from varve.engine.runner import selected_stages
-from varve.experiment import Experiment
 from varve.models import Manifest
+from varve.pipeline import Pipeline
 from varve.store.lock import OutputLock
 from varve.store.store import Store
 
@@ -35,7 +35,7 @@ def _confirm(message: str, yes: bool, confirm: Callable[[str], bool] | None) -> 
     raise ValueError("Clean requires confirmation or yes=True")
 
 
-def _read_manifest_anchor(store: Store, experiment: type[Experiment]) -> Manifest:
+def _read_manifest_anchor(store: Store, experiment: type[Pipeline]) -> Manifest:
     manifest_path = store.root / "manifest.json"
     manifest = store.read_manifest()
     if manifest is None:
@@ -69,7 +69,7 @@ def _validate_record_paths(root: Path, records: dict[str, Any]) -> None:
 
 
 def clean(
-    experiment: type[Experiment],
+    experiment: type[Pipeline],
     config: Any,
     *,
     cli_out: Path | None = None,

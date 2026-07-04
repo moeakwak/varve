@@ -4,7 +4,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from varve import Experiment, KeySpec, stage
+from varve import KeySpec, Pipeline, stage
 from varve.engine.runner import run
 
 
@@ -16,7 +16,7 @@ class Args(BaseModel):
     src: Path
 
 
-class BranchExperiment(Experiment):
+class BranchExperiment(Pipeline):
     Config = Config
     Args = Args
 

@@ -6,7 +6,7 @@
 
 Keep the public surface small and stable:
 
-- Public API: `Ctx`, `Experiment`, `JSON`, `KeySpec`, `StageSpec`, `batch_stage`, `stage`.
+- Public API: `Ctx`, `Pipeline`, `JSON`, `KeySpec`, `StageSpec`, `batch_stage`, `stage`.
 - Internal implementation: `src/varve/{keying,store,engine,cli}` and persisted store schemas.
 - Internal workspace notes, migration plans, and exploratory design records do not belong in this submodule.
 
@@ -21,9 +21,9 @@ Keep imports moving in one direction:
 - `keying`, `store`, and `engine.state` are low-level packages. They must not depend on each other, `engine.runner`, public-surface modules, or `cli`. Prefer dependencies on leaf top-level modules such as `models`, `log`, and `keyspec`.
 - `engine.runner` may depend on `keying`, `store`, `engine.state`, and the public-facing top-level modules. It must not depend on `cli`.
 - `cli` is the top layer. It may depend on `engine`, `store`, and public-facing top-level modules.
-- Public-facing top-level modules such as `experiment`, `decorators`, and `context` may depend on internal packages when that is needed to keep the user API small.
+- Public-facing top-level modules such as `pipeline`, `decorators`, and `context` may depend on internal packages when that is needed to keep the user API small.
 
-The only controlled reverse edge is inside `Experiment.cli()`:
+The only controlled reverse edge is inside `Pipeline.cli()`:
 
 ```python
 from varve.cli.app import main
@@ -47,7 +47,7 @@ It is not an append-only history. New code should use `Store`, `store`, and corr
 
 `CorruptStore` is the associated exception for malformed store files. It belongs to the internal store surface and is not exported from `varve.__all__`.
 
-The experiment output root is a varve-owned runtime value. Experiment Config models must not declare `out` or `output_root` fields for it. Experiments provide a canonical root by overriding `Experiment.default_output_root(config)`. varve appends the selected branch to that base: `base/<branch>` for persistent branches and `base/.tmp/<branch>` for temporary branches. Stage bodies and helper functions must write through `ctx.out`.
+The experiment output root is a varve-owned runtime value. Pipeline Config models must not declare `out` or `output_root` fields for it. Pipelines provide a canonical root by overriding `Pipeline.default_output_root(config)`. varve appends the selected branch to that base: `base/<branch>` for persistent branches and `base/.tmp/<branch>` for temporary branches. Stage bodies and helper functions must write through `ctx.out`.
 
 ## CLI Responsibilities
 
@@ -76,7 +76,7 @@ Nested environment variables use `__` as the delimiter. The `.env` file is read 
 
 Nested fields deep-merge at field level across sources. The current `model_config` does not set `nested_model_default_partial_update`; the merge behavior comes from pydantic-settings source deep merge, not from partial mutation of a default nested model instance.
 
-Config sources are for semantic configuration only. Output-root selection is resolved separately from `--out` or `Experiment.default_output_root(config)`, then varve appends `branch` / `is_temporary`.
+Config sources are for semantic configuration only. Output-root selection is resolved separately from `--out` or `Pipeline.default_output_root(config)`, then varve appends `branch` / `is_temporary`.
 
 ## Clean Safety
 
@@ -85,7 +85,7 @@ Config sources are for semantic configuration only. Output-root selection is res
 - Full clean (`target is None`) removes the output root after manifest validation, `_validate_destructive`, and confirmation. `allowed_roots` only applies here.
 - Per-stage clean validates the manifest anchor, expands the target's downstream closure, reads success records, and deletes only recorded output paths inside the output root.
 
-The dangerous-root blacklist is part of the destructive-clean boundary. Keep rejecting empty paths, `/`, the home directory, and the current working directory for full clean. Experiments declare business-allowed full-clean roots by overriding `Experiment.clean_roots(config)`.
+The dangerous-root blacklist is part of the destructive-clean boundary. Keep rejecting empty paths, `/`, the home directory, and the current working directory for full clean. Pipelines declare business-allowed full-clean roots by overriding `Pipeline.clean_roots(config)`.
 
 Per-stage clean must stay independent of `allowed_roots`; its boundary is the manifest anchor plus success-record path closure.
 
@@ -94,7 +94,7 @@ Per-stage clean must stay independent of `allowed_roots`; its boundary is the ma
 Keep this import stable:
 
 ```python
-from varve import Ctx, Experiment, JSON, KeySpec, StageSpec, batch_stage, stage
+from varve import Ctx, Pipeline, JSON, KeySpec, StageSpec, batch_stage, stage
 ```
 
 `Store` is not part of the public API. It may be imported by internal modules and tests through `varve.store.store`, but it should not be re-exported from `varve`.

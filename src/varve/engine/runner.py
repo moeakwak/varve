@@ -13,7 +13,6 @@ from typing import Any
 
 from varve.context import Ctx
 from varve.engine.state import Decision, Status, decide_batch, decide_single
-from varve.experiment import Experiment
 from varve.keying.keys import compute_key_components, content_key, run_key
 from varve.models import (
     AttemptMarker,
@@ -24,6 +23,7 @@ from varve.models import (
     ProducedPath,
     SuccessRecord,
 )
+from varve.pipeline import Pipeline
 from varve.store.lock import OutputLock
 from varve.store.store import Store
 
@@ -124,7 +124,7 @@ def _partition_values(stage_spec, config) -> dict[str, Any]:
 
 
 def _stage_sets(
-    experiment_type: type[Experiment],
+    experiment_type: type[Pipeline],
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     stages = experiment_type.stages()
     ancestors = {name: set(spec.needs) for name, spec in stages.items()}
@@ -148,7 +148,7 @@ def _closure(seed: str, graph: dict[str, set[str]]) -> set[str]:
 
 
 def selected_stages(
-    experiment_type: type[Experiment],
+    experiment_type: type[Pipeline],
     *,
     upto: str | None = None,
     downstream: str | None = None,
@@ -186,7 +186,7 @@ def _upstream_keys(
 
 
 def _validate_external_upstreams(
-    experiment_type: type[Experiment],
+    experiment_type: type[Pipeline],
     selected: set[str],
     store: Store,
     out: Path,
@@ -249,7 +249,7 @@ async def _execute_batch(instance, stage_spec, ctx: Ctx):
 
 
 async def _drive(
-    experiment_type: type[Experiment],
+    experiment_type: type[Pipeline],
     config,
     *,
     args,
@@ -453,7 +453,7 @@ async def _drive(
 
 
 def run(
-    experiment: type[Experiment],
+    experiment: type[Pipeline],
     config,
     *,
     args=None,
@@ -496,7 +496,7 @@ def run(
 
 
 def evaluate_state(
-    experiment: type[Experiment],
+    experiment: type[Pipeline],
     config,
     *,
     args=None,

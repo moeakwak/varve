@@ -6,14 +6,14 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from varve import Experiment, stage
+from varve import Pipeline, stage
 
 
 class Config(BaseModel):
     pass
 
 
-class DefaultOutputExperiment(Experiment):
+class DefaultOutputExperiment(Pipeline):
     Config = Config
 
     @stage()

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from varve import Experiment, KeySpec, batch_stage, stage
+from varve import KeySpec, Pipeline, batch_stage, stage
 from varve.engine.runner import evaluate_state, run, selected_stages
 from varve.models import BatchRecord, PartialMeta
 from varve.store.store import Store
@@ -22,7 +22,7 @@ class Args(BaseModel):
     fail_after: int | None = None
 
 
-class ToyExperiment(Experiment):
+class ToyExperiment(Pipeline):
     Config = Config
     Args = Args
 
@@ -55,7 +55,7 @@ class ToyExperiment(Experiment):
         (ctx.out / "summary.txt").write_text(text, encoding="utf-8")
 
 
-class MultiOutputBatchExperiment(Experiment):
+class MultiOutputBatchExperiment(Pipeline):
     Config = Config
     Args = Args
 
@@ -73,7 +73,7 @@ class MultiOutputBatchExperiment(Experiment):
             yield [left, right]
 
 
-class CwdRelativeBatchExperiment(Experiment):
+class CwdRelativeBatchExperiment(Pipeline):
     Config = Config
     Args = Args
 
@@ -354,7 +354,7 @@ class FileKeyArgs(BaseModel):
     src: Path
 
 
-class FileKeyExperiment(Experiment):
+class FileKeyExperiment(Pipeline):
     Config = FileKeyConfig
     Args = FileKeyArgs
 

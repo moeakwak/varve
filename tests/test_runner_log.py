@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from varve import Experiment, stage
+from varve import Pipeline, stage
 from varve.engine.runner import run
 
 
@@ -13,7 +13,7 @@ class Config(BaseModel):
     pass
 
 
-class LogExperiment(Experiment):
+class LogExperiment(Pipeline):
     Config = Config
 
     @classmethod

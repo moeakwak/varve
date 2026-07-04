@@ -7,7 +7,7 @@ import pytest
 from pydantic import BaseModel
 from rich.console import Console
 
-from varve import Experiment, stage
+from varve import Pipeline, stage
 from varve.dashboard import render
 from varve.dashboard.cli import main
 from varve.dashboard.models import ExperimentEntry, ExperimentState, StageState, StateError
@@ -24,7 +24,7 @@ class Args(BaseModel):
     pass
 
 
-class CliDemo(Experiment):
+class CliDemo(Pipeline):
     Config = Config
     Args = Args
 
