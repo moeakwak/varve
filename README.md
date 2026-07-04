@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/varve.svg)](https://pypi.org/project/varve/) [![License](https://img.shields.io/pypi/l/varve.svg)](LICENSE)
 
-Varve is a small Python library for running experiment pipelines as code. Each stage is a Python method, the run/plan/status CLI is generated for you, and every output is cached under a key derived automatically from your code, config, and pinned inputs, so re-runs only re-execute what actually changed. Single machine, no daemon, no pipeline YAML.
+Varve is a small Python library for running experiment pipelines as code. Each stage is a Python method, the run/status/plan/list/clean CLI is generated for you, and every output is cached under a key derived automatically from your code, config, and pinned inputs, so re-runs only re-execute what actually changed. Single machine, no daemon, no pipeline YAML.
 
 For the package layout, cache model, and edge-case behavior, see [ARCHITECTURE.md](ARCHITECTURE.md). For contribution guidance, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -51,7 +51,7 @@ Varve is for research and data-analysis pipelines where Python code is already t
 
 The core design choices are:
 
-- **Pipelines are Python code.** Stages are class methods, dependencies are declared with `needs=`, and semantic configuration is a pydantic model.
+- **Pipelines are Python code.** Stages are instance methods, dependencies are declared with `needs=`, and semantic configuration is a pydantic model.
 - **Cache keys are code-aware by default.** Varve fingerprints stage source, automatically discovered project callables, full Config values, declared input files, declared JSON values, and upstream content keys.
 - **Outputs are materialized.** Successful stage records point at durable files under the output root, so missing artifacts are detected instead of silently treated as cache hits.
 - **Single machine, no service.** Varve uses an in-process runner and a file-system store. There is no daemon, database, or remote backend.
@@ -65,6 +65,7 @@ The core design choices are:
   - `plan [--upto STAGE | --downstream STAGE]`
   - `list`
   - `clean [--branch NAME] [--downstream STAGE] [--out PATH] [--yes]`
+- `run`, `status`, and `clean` also accept generated flags from the pipeline's `Args` model.
 - Cache states for hits, stale records, missing artifacts, dirty attempts, resumable batches, and unrecoverable partition changes.
 - `ctx.resume(...)` for resumable batch stages.
 - `KeySpec.files` for pinning input file contents into the content key.
@@ -84,19 +85,19 @@ Use `run --override '{"field": "value"}'` to deep-merge JSON over `main` and cre
 
 ## Dashboard
 
-The top-level `varve` command scans existing stores without requiring custom pipeline code:
+The top-level `varve` command discovers existing stores without requiring a custom dashboard entrypoint:
 
 ```bash
-varve ls [--root DIR]
-varve show <pipeline_id> [--root DIR] [--branch NAME]
-varve refresh [--root DIR] [--prefix MODULE_PREFIX]
+varve ls [--root DIR] [--include-temp]
+varve show <pipeline_id> [--root DIR] [--branch NAME] [--include-temp]
+varve refresh [--root DIR] [--prefix MODULE_PREFIX] [--include-temp]
 ```
 
 Dashboard commands are secondary tooling. The primary interface remains each pipeline's generated CLI.
 
 ## Platform support
 
-Varve 0.1.0 is Unix-only. The output-root lock uses `fcntl`, so Windows support requires a future lock implementation.
+Varve is currently Unix-only. The output-root lock uses `fcntl`, so Windows support requires a future lock implementation.
 
 Source fingerprints use `ast.dump`. A CPython minor-version upgrade may invalidate stage source hashes and rebuild caches.
 

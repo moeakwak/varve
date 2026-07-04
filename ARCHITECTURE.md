@@ -95,15 +95,9 @@ Per-stage clean only deletes recorded artifacts and store records for the select
 
 ## Dashboard
 
-The top-level `varve` console script reads existing stores:
+The top-level `varve` console script reads existing stores.
 
-```bash
-varve ls [--root DIR]
-varve show <pipeline_id> [--root DIR] [--branch NAME]
-varve refresh [--root DIR] [--prefix MODULE_PREFIX]
-```
-
-Discovery is zero-import. Read-only views import only the selected manifest module after discovery. `refresh` runs branches whose evaluated status is executable: `artifact-missing`, `dirty`, `no-cache`, `resume`, or `stale`.
+Temporary branches under `out/.tmp` are filtered by default and included only with `--include-temp`. Discovery is zero-import; state rendering imports stored manifest modules only after discovery. `refresh` runs branches whose evaluated status is executable: `artifact-missing`, `dirty`, `no-cache`, `resume`, or `stale`.
 
 ## Known Limitations
 
