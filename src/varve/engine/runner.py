@@ -396,15 +396,19 @@ async def _drive(
         else:
             if force or decision.status != "resume":
                 store.clear_partial(stage_name, current_key)
+            previous_for_outputs = previous if decision.status == "artifact-missing" else None
             partial_for_outputs = partial if decision.status == "resume" else None
             outputs_by_index = _batch_outputs_from_records(
-                previous=previous,
+                previous=previous_for_outputs,
                 partial=partial_for_outputs,
                 out=out,
                 force=force,
             )
             warned_without_resume = False
+            partial_enabled = True
+            saw_yield = False
             async for yielded_index, index_paths in _execute_batch(instance, stage_spec, ctx):
+                saw_yield = True
                 if not ctx._used_resume and not warned_without_resume:
                     warnings.warn(
                         f"batch stage {stage_name!r} yielded without iterating ctx.resume; "
@@ -413,6 +417,10 @@ async def _drive(
                         stacklevel=2,
                     )
                     warned_without_resume = True
+                if not ctx._used_resume and partial_enabled:
+                    store.clear_partial(stage_name, current_key)
+                    outputs_by_index.clear()
+                    partial_enabled = False
                 index = yielded_index if yielded_index is not None else len(outputs_by_index)
                 yielded = []
                 for path in index_paths:
@@ -423,12 +431,17 @@ async def _drive(
                             raise ValueError(hint)
                         raise FileNotFoundError(f"Yielded varve output does not exist: {absolute}")
                     yielded.append(_relative_to_out(absolute, out))
-                store.write_batch(
-                    stage_name,
-                    current_key,
-                    BatchRecord(index=index, yielded=yielded, committed_at=_now()),
-                )
+                if partial_enabled:
+                    store.write_batch(
+                        stage_name,
+                        current_key,
+                        BatchRecord(index=index, yielded=yielded, committed_at=_now()),
+                    )
                 outputs_by_index[index] = yielded
+            if not ctx._used_resume:
+                store.clear_partial(stage_name, current_key)
+                if not saw_yield:
+                    outputs_by_index.clear()
             outputs = [
                 OutputHandle(index=index, path=path)
                 for index, paths in sorted(outputs_by_index.items())

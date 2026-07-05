@@ -64,6 +64,8 @@ Known cache states are `dirty`, `hit`, `artifact-missing`, `stale`, `no-cache`, 
 
 Batch resume records completed indexes from `ctx.resume(...)`. This requires deterministic iterable order; callers should sort unstable inputs before passing them to `ctx.resume(...)`. Varve intentionally does not provide order-independent batch resume under the current content-key model.
 
+Batch stages that yield without first iterating `ctx.resume(...)` are allowed but non-resumable. The runner warns, ignores old partial state for that run, and does not write new partial state from those yielded outputs.
+
 Batch stages are scheduled serially by the runner. Stage bodies may still perform parallel work inside each batch item with `asyncio.gather(...)`, process pools, or long-lived worker sessions. A batch item may yield zero paths; the completed index is recorded, but item-level output completeness is the stage's responsibility.
 
 ## Output Roots And Branches

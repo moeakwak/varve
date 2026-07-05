@@ -134,6 +134,8 @@ class NakedYieldBatchPipeline(Pipeline):
         path = ctx.out / "part.txt"
         path.write_text("payload", encoding="utf-8")
         yield path
+        if ctx.args.fail_after is not None:
+            raise RuntimeError("planned failure")
 
 
 def _out(base: Path) -> Path:
@@ -272,6 +274,28 @@ def test_batch_stage_warns_on_failure_after_naked_yield(tmp_path: Path) -> None:
             run(FailingNakedYieldBatchPipeline, Config(), cli_out=tmp_path)
 
     assert any("yielded without iterating ctx.resume" in str(item.message) for item in caught)
+
+
+def test_failed_naked_batch_yield_does_not_resume_partial(tmp_path: Path) -> None:
+    for _ in range(2):
+        with pytest.warns(UserWarning, match="yielded without iterating ctx.resume"):
+            with pytest.raises(RuntimeError, match="planned failure"):
+                run(
+                    NakedYieldBatchPipeline,
+                    Config(),
+                    args=Args(fail_after=0),
+                    cli_out=tmp_path,
+                )
+
+    with pytest.warns(UserWarning, match="yielded without iterating ctx.resume"):
+        result = run(NakedYieldBatchPipeline, Config(), cli_out=tmp_path)
+
+    assert result[-1].status == "dirty"
+    record = Store(_out(tmp_path)).read_success("transform")
+    assert record is not None
+    assert record.outputs is not None
+    assert [(output.index, output.path) for output in record.outputs] == [(0, "part.txt")]
+    assert Store(_out(tmp_path)).read_partial("transform", record.content_key) is None
 
 
 def test_force_reruns_all_batch_items_after_partial(tmp_path: Path) -> None:

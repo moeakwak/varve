@@ -93,7 +93,7 @@ Batch resume is index-based: varve records completed positions from `ctx.resume(
 
 Batch stages run serially at the varve level so partial writes stay simple and deterministic. If each item can use parallelism internally, use normal Python tools such as `asyncio.gather(...)`, a process pool, or a long-lived worker/session inside the batch stage body.
 
-Varve warns when a batch stage yields outputs without first iterating `ctx.resume(...)`, because those outputs cannot be resumed safely. A batch item may yield zero paths; varve records the completed index but does not validate item-level completeness.
+Varve warns when a batch stage yields outputs without first iterating `ctx.resume(...)`, because those outputs cannot be resumed safely. Such stages may still complete successfully, but varve treats them as non-resumable: failed runs do not leave resumable partial state, and later runs start from the stage body instead of recorded batch positions. For resumable batches, a batch item may yield zero paths; varve records the completed index but does not validate item-level completeness.
 
 ## Why varve
 
