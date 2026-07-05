@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.2.0](https://github.com/moeakwak/varve/compare/varve-v0.1.0...varve-v0.2.0) (2026-07-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* batch_stage no longer accepts partition_key. Stage dependencies may still be declared with strings, and now also accept method references.
+* **dashboard:** Dashboard store discovery, models, CLI text, and `varve show` now use pipeline terminology. Stores with v1 experiment manifest fields are no longer accepted.
+* Store schema is now v2. Manifest and SuccessRecord use pipeline instead of experiment. Batch partial state is scoped directly by content_key; run_key, partition_values, PartialMeta, and the unrecoverable cache state are removed. Existing .varve stores must be deleted and rerun.
+
+### Features
+
+* **dashboard:** align dashboard terminology with pipelines ([16b7d05](https://github.com/moeakwak/varve/commit/16b7d051089fd652a47467d65200ceddb5b5249e))
+* simplify stage decorators ([c0ff39c](https://github.com/moeakwak/varve/commit/c0ff39ce55704178d881be9db8b5e0eec8abbaeb))
+* simplify varve cache schema ([377db79](https://github.com/moeakwak/varve/commit/377db79ae8970a2a062caf4cefdde0aca717ffbd))
+* warn on batch yield without resume ([e26d803](https://github.com/moeakwak/varve/commit/e26d8038c1d3dc03fe04c7c564a652826278bade))
+
+
+### Bug Fixes
+
+* detect main-module auto uses ([958f98b](https://github.com/moeakwak/varve/commit/958f98b82b79a38a37841626408a9157b7973ba7))
+* keep naked batch yields non-resumable ([edac515](https://github.com/moeakwak/varve/commit/edac5157adb64e5b49351c1492e19d4e4cea6ee9))
+
+
+### Documentation
+
+* describe varve 0.2 behavior ([ff0800a](https://github.com/moeakwak/varve/commit/ff0800ae5f964a66a2f07722710ac17f8aedeecd))
+
 ## 0.1.0 (2026-07-05)
 
 
