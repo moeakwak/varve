@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from varve.context import Ctx
+from varve.decorators import ProducesItem, ProducesSpec
 from varve.engine.state import Decision, Status, decide_batch, decide_single
 from varve.keying.keys import compute_key_components, content_key, run_key
 from varve.models import (
@@ -40,14 +41,19 @@ def _now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
-def _relative_to_out(path: Path, out: Path) -> str:
+def _relative_to_out(
+    path: Path,
+    out: Path,
+    *,
+    description: str = "Yielded varve output",
+) -> str:
     resolved = path.resolve()
     out_resolved = out.resolve()
     try:
         return str(resolved.relative_to(out_resolved))
     except ValueError as error:
         raise ValueError(
-            f"Yielded varve output must live inside the output root: {resolved} "
+            f"{description} must live inside the output root: {resolved} "
             f"is not under {out_resolved}"
         ) from error
 
@@ -96,17 +102,23 @@ def _refresh_fingerprint_cache(
     store.write_success(refreshed)
 
 
-def _produced_paths(produces, ctx: Ctx) -> list[ProducedPath]:
+def _produced_paths(produces: ProducesSpec, ctx: Ctx[Any, Any]) -> list[ProducedPath]:
     if produces is None:
         return []
     raw = produces(ctx) if callable(produces) else produces
-    paths = [raw] if isinstance(raw, str) else list(raw)
+    paths: list[ProducesItem] = [raw] if isinstance(raw, str | Path) else list(raw)
     result = []
     for item in paths:
-        path = ctx.out / item
+        declared = Path(item)
+        path = declared if declared.is_absolute() else ctx.out / declared
         if not path.exists():
             raise FileNotFoundError(f"Declared varve output does not exist: {path}")
-        result.append(ProducedPath(path=str(item), kind="dir" if path.is_dir() else "file"))
+        relative = _relative_to_out(
+            path,
+            ctx.out,
+            description="Declared varve output",
+        )
+        result.append(ProducedPath(path=relative, kind="dir" if path.is_dir() else "file"))
     return result
 
 
@@ -292,7 +304,15 @@ async def _drive(
         )
         previous = store.read_success(stage_name)
         cached_files = previous.key_components.files if previous is not None else None
-        ctx_for_key = Ctx(config=config, args=args, out=out, store=store)
+        declared_needs = frozenset(stage_spec.needs)
+        ctx_for_key = Ctx(
+            config=config,
+            args=args,
+            out=out,
+            store=store,
+            stage_name=stage_name,
+            declared_needs=declared_needs,
+        )
         components = compute_key_components(stage_spec, ctx_for_key, upstream_keys, cached_files)
         current_key = content_key(components)
         known_content_keys[stage_name] = current_key
@@ -374,6 +394,7 @@ async def _drive(
             store=store,
             resume_skip=decision.resume_skip,
             stage_name=stage_name,
+            declared_needs=declared_needs,
         )
         if stage_spec.kind == "single":
             await _execute_stage(instance, stage_spec, ctx)

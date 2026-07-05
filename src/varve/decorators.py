@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 from varve.keyspec import KeySpec
 
 StageKind = Literal["single", "batch"]
-ProducesSpec = str | list[str] | Callable[[Any], list[str]] | None
+ProducesItem = str | Path
+ProducesSpec = (
+    ProducesItem | list[ProducesItem] | Callable[[Any], ProducesItem | list[ProducesItem]] | None
+)
 
 
 @dataclass(frozen=True)

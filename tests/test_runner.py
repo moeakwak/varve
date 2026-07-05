@@ -49,8 +49,7 @@ class ToyExperiment(Pipeline):
 
     @stage(needs="transform", produces="summary.txt")
     def summarize(self, ctx):
-        parts = ctx.input("transform")
-        assert isinstance(parts, list)
+        parts = ctx.inputs("transform")
         text = ",".join(path.read_text(encoding="utf-8") for path in parts)
         (ctx.out / "summary.txt").write_text(text, encoding="utf-8")
 
@@ -88,6 +87,38 @@ class CwdRelativeBatchExperiment(Pipeline):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("payload", encoding="utf-8")
             yield path
+
+
+class OutsideProducesExperiment(Pipeline):
+    Config = Config
+    Args = Args
+
+    @classmethod
+    def default_output_root(cls, config: Config) -> Path:
+        return Path("varve-test-output")
+
+    @stage(produces="../outside.txt")
+    def sample(self, ctx):
+        outside = ctx.out.parent / "outside.txt"
+        outside.write_text("payload", encoding="utf-8")
+
+
+class MissingNeedsInputExperiment(Pipeline):
+    Config = Config
+    Args = Args
+
+    @classmethod
+    def default_output_root(cls, config: Config) -> Path:
+        return Path("varve-test-output")
+
+    @stage(produces="sample.txt")
+    def sample(self, ctx):
+        (ctx.out / "sample.txt").write_text("sample", encoding="utf-8")
+
+    @stage(produces="summary.txt")
+    def summarize(self, ctx):
+        source = ctx.input("sample")
+        (ctx.out / "summary.txt").write_text(source.read_text(encoding="utf-8"))
 
 
 def _out(base: Path) -> Path:
@@ -344,6 +375,16 @@ def test_batch_rejects_cwd_relative_output_with_actionable_error(
 
     with pytest.raises(ValueError, match="relative to the output root"):
         run(CwdRelativeBatchExperiment, Config(), cli_out=Path("out"))
+
+
+def test_single_produces_rejects_output_outside_root(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="inside the output root"):
+        run(OutsideProducesExperiment, Config(), cli_out=tmp_path)
+
+
+def test_ctx_input_requires_declared_need_during_run(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="declare it in needs"):
+        run(MissingNeedsInputExperiment, Config(), cli_out=tmp_path)
 
 
 class FileKeyConfig(BaseModel):

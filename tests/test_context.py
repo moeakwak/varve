@@ -7,6 +7,12 @@ import pytest
 
 import varve.context
 from varve.context import Ctx
+from varve.models import (
+    KeyComponents,
+    OutputHandle,
+    ProducedPath,
+    SuccessRecord,
+)
 from varve.store.store import Store
 
 
@@ -45,6 +51,77 @@ def captured_bars(monkeypatch) -> list[FakeBar]:
 
 def _ctx(tmp_path: Path, **kwargs) -> Ctx:
     return Ctx(config={}, out=tmp_path, store=Store(tmp_path), **kwargs)
+
+
+def _key_components() -> KeyComponents:
+    return KeyComponents(source={}, config={}, files={}, values={}, upstreams={})
+
+
+def _single_record(stage: str, paths: list[str]) -> SuccessRecord:
+    return SuccessRecord(
+        experiment="Demo",
+        stage=stage,
+        kind="single",
+        content_key=f"{stage}-key",
+        key_components=_key_components(),
+        produces=[ProducedPath(path=path, kind="file") for path in paths],
+        committed_at="now",
+    )
+
+
+def _batch_record(stage: str, paths: list[str]) -> SuccessRecord:
+    return SuccessRecord(
+        experiment="Demo",
+        stage=stage,
+        kind="batch",
+        content_key=f"{stage}-key",
+        key_components=_key_components(),
+        outputs=[OutputHandle(index=index, path=path) for index, path in enumerate(paths)],
+        committed_at="now",
+    )
+
+
+def test_input_returns_exactly_one_upstream_output(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.write_success(_single_record("sample", ["sample.txt"]))
+    ctx = Ctx(config={}, out=tmp_path, store=store, declared_needs=frozenset({"sample"}))
+
+    assert ctx.input("sample") == tmp_path / "sample.txt"
+
+
+def test_input_rejects_multiple_outputs_with_inputs_hint(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.write_success(_batch_record("parts", ["a.txt", "b.txt"]))
+    ctx = Ctx(config={}, out=tmp_path, store=store, declared_needs=frozenset({"parts"}))
+
+    with pytest.raises(ValueError, match="Use ctx.inputs"):
+        ctx.input("parts")
+
+
+def test_inputs_always_returns_a_list(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.write_success(_single_record("sample", ["sample.txt"]))
+    store.write_success(_batch_record("parts", ["a.txt", "b.txt"]))
+    ctx = Ctx(
+        config={},
+        out=tmp_path,
+        store=store,
+        declared_needs=frozenset({"sample", "parts"}),
+    )
+
+    assert ctx.inputs("sample") == [tmp_path / "sample.txt"]
+    assert ctx.inputs("parts") == [tmp_path / "a.txt", tmp_path / "b.txt"]
+
+
+def test_input_requires_declared_need(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.write_success(_single_record("sample", ["sample.txt"]))
+    ctx = Ctx(
+        config={}, out=tmp_path, store=store, stage_name="summary", declared_needs=frozenset()
+    )
+
+    with pytest.raises(ValueError, match="declare it in needs"):
+        ctx.input("sample")
 
 
 def test_ctx_carries_args_when_provided(tmp_path: Path) -> None:

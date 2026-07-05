@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, TypeVar, cast
 
 from varve.store.store import Store
+
+ConfigT = TypeVar("ConfigT")
+ArgsT = TypeVar("ArgsT")
 
 
 def _len_or_none(iterable: Iterable[Any]) -> int | None:
@@ -49,37 +52,75 @@ class _ResumeProgress:
         self._bar.close()
 
 
-class Ctx:
+class Ctx(Generic[ConfigT, ArgsT]):
+    """Runtime context passed to stage methods.
+
+    `config`, `args`, and `out` expose the pipeline inputs and output root. Use
+    `input()` when an upstream stage must have exactly one output, `inputs()` when
+    it may have many, and `resume()` to iterate batch work with automatic resume.
+    """
+
     def __init__(
         self,
         *,
-        config: Any,
-        args: Any = None,
+        config: ConfigT,
+        args: ArgsT | None = None,
         out: Path,
         store: Store,
         resume_skip: frozenset[int] | None = None,
         stage_name: str | None = None,
+        declared_needs: frozenset[str] | None = None,
     ) -> None:
-        self.config = config
-        self.args = args
+        self.config: ConfigT = config
+        self.args: ArgsT = cast(ArgsT, args)
         self.out = out
         self._store = store
         self._resume_skip = resume_skip or frozenset()
         self._stage_name = stage_name
+        self._declared_needs = declared_needs
         self._current_batch_index: int | None = None
 
-    def input(self, stage: str) -> Path | list[Path]:
+    def _check_declared_need(self, stage: str) -> None:
+        if self._declared_needs is None or stage in self._declared_needs:
+            return
+        current = f" for stage {self._stage_name!r}" if self._stage_name else ""
+        raise ValueError(
+            f"Cannot read upstream stage {stage!r}{current}: declare it in needs= so "
+            "the upstream content key is part of this stage's key."
+        )
+
+    def _input_paths(self, stage: str) -> list[Path]:
+        self._check_declared_need(stage)
         record = self._store.read_success(stage)
         if record is None:
             raise ValueError(f"Upstream stage has no success record: {stage}")
         if record.kind == "single":
             assert record.produces is not None
-            paths = [self.out / item.path for item in record.produces]
-            return paths[0] if len(paths) == 1 else paths
+            return [self.out / item.path for item in record.produces]
         assert record.outputs is not None
         return [
             self.out / item.path for item in sorted(record.outputs, key=lambda item: item.index)
         ]
+
+    def input(self, stage: str) -> Path:
+        """Return the single output path produced by an upstream stage.
+
+        Raises when the upstream stage produced zero or multiple paths. Use
+        `inputs(stage)` for upstream stages that can produce more than one path.
+        """
+
+        paths = self._input_paths(stage)
+        if len(paths) != 1:
+            raise ValueError(
+                f"Expected exactly one output from upstream stage {stage!r}, "
+                f"found {len(paths)}. Use ctx.inputs({stage!r}) for multiple outputs."
+            )
+        return paths[0]
+
+    def inputs(self, stage: str) -> list[Path]:
+        """Return all output paths produced by an upstream stage."""
+
+        return self._input_paths(stage)
 
     async def resume(
         self,
@@ -91,6 +132,8 @@ class Ctx:
         unit: str = "batch",
         postfix: Callable[[Any], str] | None = None,
     ) -> AsyncIterator[tuple[int, Any]]:
+        """Iterate batch items, skipping items already recorded in a resumable run."""
+
         progress_handle: _ResumeProgress | None = None
         if progress:
             label = desc or self._stage_name or "batch"

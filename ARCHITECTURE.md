@@ -58,6 +58,8 @@ The store lives under `<output_root>/.varve/` and is latest-wins, not append-onl
 
 Recorded artifact paths are output-root-relative. Stage bodies should write through `ctx.out`.
 
+Stage bodies read upstream outputs through `ctx.input(stage)` for exactly one path or `ctx.inputs(stage)` for a list of paths. Both helpers require `stage` to be declared in the current stage's `needs=` list, because only declared upstreams are folded into the content key.
+
 Known cache states are `dirty`, `hit`, `artifact-missing`, `stale`, `no-cache`, `resume`, and `unrecoverable`.
 
 ## Output Roots And Branches
