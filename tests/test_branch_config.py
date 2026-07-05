@@ -31,7 +31,7 @@ class Config(BaseModel):
     token: str = "default"
 
 
-class DemoExperiment(Pipeline):
+class DemoPipeline(Pipeline):
     Config = Config
 
     @classmethod
@@ -50,6 +50,6 @@ class DemoExperiment(Pipeline):
     )
     module = _load_module(module_path, "demo_exp")
 
-    assert module.DemoExperiment.cli(["run", "--branch", "alt"]) == 0
+    assert module.DemoPipeline.cli(["run", "--branch", "alt"]) == 0
 
     assert (tmp_path / "out" / "alt" / "sample.txt").read_text(encoding="utf-8") == "branch"

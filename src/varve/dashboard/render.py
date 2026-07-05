@@ -8,57 +8,56 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from varve.dashboard.models import ExperimentState, ExperimentStatus, StageState
+from varve.dashboard.models import PipelineState, PipelineStatus, StageState
 from varve.engine.state import Status
 
-_STATUS_STYLES: dict[Status | ExperimentStatus, str] = {
+_STATUS_STYLES: dict[Status | PipelineStatus, str] = {
     "hit": "green",
     "artifact-missing": "yellow",
     "resume": "yellow",
     "no-cache": "yellow",
     "stale": "yellow",
     "dirty": "red",
-    "unrecoverable": "red",
     "error": "red",
 }
 
 
-def render_overview(states: list[ExperimentState]) -> None:
+def render_overview(states: list[PipelineState]) -> None:
     console = Console(highlight=False)
     table = Table(box=None)
-    table.add_column("EXPERIMENT")
+    table.add_column("PIPELINE")
     table.add_column("BRANCH")
     table.add_column("STATUS")
     table.add_column("STAGES")
     table.add_column("DURATION")
     table.add_column("LAST RUN")
 
-    previous_experiment_id: str | None = None
-    for state in sorted(states, key=lambda item: (item.entry.experiment_id, item.entry.branch)):
+    previous_pipeline_id: str | None = None
+    for state in sorted(states, key=lambda item: (item.entry.pipeline_id, item.entry.branch)):
         hit_count = sum(1 for stage in state.stages if stage.status == "hit")
-        experiment_id = (
-            state.entry.experiment_id if state.entry.experiment_id != previous_experiment_id else ""
+        pipeline_id = (
+            state.entry.pipeline_id if state.entry.pipeline_id != previous_pipeline_id else ""
         )
         table.add_row(
-            experiment_id,
+            pipeline_id,
             state.entry.branch,
             _status_text(state.status),
             f"{hit_count}/{len(state.stages)}",
             _format_elapsed(_total_elapsed(state.stages)),
             _format_datetime(_last_run(state.stages)),
         )
-        previous_experiment_id = state.entry.experiment_id
+        previous_pipeline_id = state.entry.pipeline_id
     console.print(table)
 
 
-def render_detail(state: ExperimentState) -> None:
+def render_detail(state: PipelineState) -> None:
     console = Console(highlight=False)
-    experiment_name = state.entry.experiment_name or state.entry.experiment_id
-    console.print(f"Pipeline: {state.entry.experiment_id}")
+    pipeline_name = state.entry.pipeline_name or state.entry.pipeline_id
+    console.print(f"Pipeline: {state.entry.pipeline_id}")
     # soft_wrap keeps long output-root paths on one line; rich would otherwise
     # hard-wrap them at the console width and split the path mid-string.
     console.print(f"Output root: {state.entry.output_root}", soft_wrap=True)
-    console.print(f"Name: {experiment_name}")
+    console.print(f"Name: {pipeline_name}")
     console.print("Status: ", _status_text(state.status), sep="")
     if state.error is not None:
         console.print(f"Error: {state.error.phase}: {state.error.message}")
@@ -102,7 +101,7 @@ def render_detail(state: ExperimentState) -> None:
         console.print("  No recorded dependencies.")
 
 
-def _status_text(status: ExperimentStatus) -> Text:
+def _status_text(status: PipelineStatus) -> Text:
     return Text(status, style=_STATUS_STYLES[status])
 
 

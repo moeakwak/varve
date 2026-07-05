@@ -12,9 +12,9 @@ from varve import Pipeline, stage
 from varve.dashboard import render
 from varve.dashboard.cli import main
 from varve.dashboard.models import (
-    ExperimentEntry,
-    ExperimentState,
-    ExperimentStatus,
+    PipelineEntry,
+    PipelineState,
+    PipelineStatus,
     StageState,
     StateError,
 )
@@ -76,7 +76,7 @@ def test_show_renders_error_diagnostics(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     output_root = tmp_path / "broken" / "out" / "main"
-    Store(output_root).ensure_initialized("MissingExperiment", module="varve.no_such_module")
+    Store(output_root).ensure_initialized("MissingPipeline", module="varve.no_such_module")
 
     assert main(["show", "broken", "--root", str(tmp_path)]) == 0
 
@@ -110,7 +110,7 @@ def test_ls_and_show_can_include_temporary_branches(
     assert "quick" in include_temp_output
 
     assert main(["show", "demo", "--branch", "quick", "--root", str(tmp_path)]) == 1
-    assert "Unknown experiment: demo (branch quick)" in capsys.readouterr().err
+    assert "Unknown pipeline: demo (branch quick)" in capsys.readouterr().err
 
     assert (
         main(["show", "demo", "--branch", "quick", "--root", str(tmp_path), "--include-temp"]) == 0
@@ -127,11 +127,11 @@ def test_ls_returns_nonzero_for_empty_scan_root(
     assert main(["ls", "--root", str(tmp_path / "missing")]) == 1
 
     captured = capsys.readouterr()
-    assert "No experiments found" in captured.err
+    assert "No pipelines found" in captured.err
     assert captured.out == ""
 
 
-def test_show_returns_nonzero_and_lists_known_ids_for_unknown_experiment(
+def test_show_returns_nonzero_and_lists_known_ids_for_unknown_pipeline(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -147,7 +147,7 @@ def test_show_returns_nonzero_and_lists_known_ids_for_unknown_experiment(
     assert main(["show", "missing", "--root", str(tmp_path)]) == 1
 
     captured = capsys.readouterr()
-    assert "Unknown experiment: missing" in captured.err
+    assert "Unknown pipeline: missing" in captured.err
     assert "alpha --branch main" in captured.err
     assert "beta --branch main" in captured.err
 
@@ -172,45 +172,45 @@ def test_refresh_runs_executable_entries_in_discovery_order(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     entries = [
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path / "stale" / "out" / "main",
-            experiment_id="stale",
-            experiment_name="Stale",
+            pipeline_id="stale",
+            pipeline_name="Stale",
             branch="main",
             module="tests.demo",
         ),
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path / "dirty" / "out" / "main",
-            experiment_id="dirty",
-            experiment_name="Dirty",
+            pipeline_id="dirty",
+            pipeline_name="Dirty",
             branch="main",
             module="tests.demo",
         ),
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path / "no-cache" / "out" / "main",
-            experiment_id="no-cache",
-            experiment_name="NoCache",
+            pipeline_id="no-cache",
+            pipeline_name="NoCache",
             branch="main",
             module="tests.demo",
         ),
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path / "resume" / "out" / "main",
-            experiment_id="resume",
-            experiment_name="Resume",
+            pipeline_id="resume",
+            pipeline_name="Resume",
             branch="main",
             module="tests.demo",
         ),
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path / "artifact-missing" / "out" / "main",
-            experiment_id="artifact-missing",
-            experiment_name="ArtifactMissing",
+            pipeline_id="artifact-missing",
+            pipeline_name="ArtifactMissing",
             branch="main",
             module="tests.demo",
         ),
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path / "hit" / "out" / "main",
-            experiment_id="hit",
-            experiment_name="Hit",
+            pipeline_id="hit",
+            pipeline_name="Hit",
             branch="main",
             module="tests.demo",
         ),
@@ -221,18 +221,16 @@ def test_refresh_runs_executable_entries_in_discovery_order(
         assert include_temporary is True
         return entries
 
-    def fake_state(entry: ExperimentEntry):
-        status = cast(
-            ExperimentStatus, entry.experiment_id if entry.experiment_id != "hit" else "hit"
-        )
-        return ExperimentState(entry=entry, stages=[], status=status, error=None)
+    def fake_state(entry: PipelineEntry):
+        status = cast(PipelineStatus, entry.pipeline_id if entry.pipeline_id != "hit" else "hit")
+        return PipelineState(entry=entry, stages=[], status=status, error=None)
 
     refreshed: list[tuple[str, str]] = []
-    monkeypatch.setattr("varve.dashboard.cli.discover_experiments", fake_discover)
+    monkeypatch.setattr("varve.dashboard.cli.discover_pipelines", fake_discover)
     monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
     monkeypatch.setattr(
         "varve.dashboard.cli._run_entry",
-        lambda entry: refreshed.append((entry.experiment_id, entry.branch)),
+        lambda entry: refreshed.append((entry.pipeline_id, entry.branch)),
     )
 
     assert main(["refresh", "--root", str(tmp_path), "--include-temp"]) == 0
@@ -254,44 +252,44 @@ def test_refresh_prefix_filters_entries_by_module(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entries = [
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path / "match" / "out" / "main",
-            experiment_id="match",
-            experiment_name="Match",
+            pipeline_id="match",
+            pipeline_name="Match",
             branch="main",
             module="studies.exp.analysis.match",
         ),
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path / "other" / "out" / "main",
-            experiment_id="other",
-            experiment_name="Other",
+            pipeline_id="other",
+            pipeline_name="Other",
             branch="main",
             module="studies.exp.audit.other",
         ),
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path / "legacy" / "out" / "main",
-            experiment_id="legacy",
-            experiment_name="Legacy",
+            pipeline_id="legacy",
+            pipeline_name="Legacy",
             branch="main",
             module=None,
         ),
     ]
 
     monkeypatch.setattr(
-        "varve.dashboard.cli.discover_experiments",
+        "varve.dashboard.cli.discover_pipelines",
         lambda root, *, include_temporary=False: entries,
     )
     checked: list[str] = []
 
-    def fake_state(entry: ExperimentEntry):
-        checked.append(entry.experiment_id)
-        return ExperimentState(entry=entry, stages=[], status="stale", error=None)
+    def fake_state(entry: PipelineEntry):
+        checked.append(entry.pipeline_id)
+        return PipelineState(entry=entry, stages=[], status="stale", error=None)
 
     refreshed: list[str] = []
     monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
     monkeypatch.setattr(
         "varve.dashboard.cli._run_entry",
-        lambda entry: refreshed.append(entry.experiment_id),
+        lambda entry: refreshed.append(entry.pipeline_id),
     )
 
     assert main(["refresh", "--root", str(tmp_path), "--prefix", "studies.exp.analysis"]) == 0
@@ -304,20 +302,20 @@ def test_refresh_initializes_cli_logging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    entry = ExperimentEntry(
+    entry = PipelineEntry(
         output_root=tmp_path / "stale" / "out" / "main",
-        experiment_id="stale",
-        experiment_name="Stale",
+        pipeline_id="stale",
+        pipeline_name="Stale",
         branch="main",
         module="tests.demo",
     )
     monkeypatch.setattr(
-        "varve.dashboard.cli.discover_experiments",
+        "varve.dashboard.cli.discover_pipelines",
         lambda root, *, include_temporary=False: [entry],
     )
     monkeypatch.setattr(
         "varve.dashboard.cli.load_state",
-        lambda item: ExperimentState(entry=item, stages=[], status="stale", error=None),
+        lambda item: PipelineState(entry=item, stages=[], status="stale", error=None),
     )
     calls: list[bool] = []
     monkeypatch.setattr(
@@ -337,21 +335,21 @@ def test_refresh_noops_when_no_entries_are_executable(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    entry = ExperimentEntry(
+    entry = PipelineEntry(
         output_root=tmp_path / "hit" / "out" / "main",
-        experiment_id="hit",
-        experiment_name="Hit",
+        pipeline_id="hit",
+        pipeline_name="Hit",
         branch="main",
         module="tests.demo",
     )
 
     monkeypatch.setattr(
-        "varve.dashboard.cli.discover_experiments",
+        "varve.dashboard.cli.discover_pipelines",
         lambda root, *, include_temporary=False: [entry],
     )
     monkeypatch.setattr(
         "varve.dashboard.cli.load_state",
-        lambda item: ExperimentState(entry=item, stages=[], status="hit", error=None),
+        lambda item: PipelineState(entry=item, stages=[], status="hit", error=None),
     )
     monkeypatch.setattr(
         "varve.dashboard.cli._run_entry",
@@ -361,7 +359,7 @@ def test_refresh_noops_when_no_entries_are_executable(
     assert main(["refresh", "--root", str(tmp_path)]) == 0
 
     captured = capsys.readouterr()
-    assert captured.out == "No executable experiments found\n"
+    assert captured.out == "No executable pipelines found\n"
 
 
 def test_render_detail_styles_status(
@@ -381,11 +379,11 @@ def test_render_detail_styles_status(
         )
 
     monkeypatch.setattr(render, "Console", console_factory)
-    state = ExperimentState(
-        entry=ExperimentEntry(
+    state = PipelineState(
+        entry=PipelineEntry(
             output_root=tmp_path,
-            experiment_id="demo",
-            experiment_name="Demo",
+            pipeline_id="demo",
+            pipeline_name="Demo",
             branch="main",
         ),
         stages=[],
@@ -399,7 +397,7 @@ def test_render_detail_styles_status(
     assert "Error: import: missing" in buffer.getvalue()
 
 
-def test_render_overview_groups_repeated_experiment_names(
+def test_render_overview_groups_repeated_pipeline_names(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -415,22 +413,22 @@ def test_render_overview_groups_repeated_experiment_names(
 
     monkeypatch.setattr(render, "Console", console_factory)
     states = [
-        ExperimentState(
-            entry=ExperimentEntry(
+        PipelineState(
+            entry=PipelineEntry(
                 output_root=tmp_path / "demo" / "out" / "main",
-                experiment_id="demo",
-                experiment_name="Demo",
+                pipeline_id="demo",
+                pipeline_name="Demo",
                 branch="main",
             ),
             stages=[],
             status="hit",
             error=None,
         ),
-        ExperimentState(
-            entry=ExperimentEntry(
+        PipelineState(
+            entry=PipelineEntry(
                 output_root=tmp_path / "demo" / "out" / ".tmp" / "quick",
-                experiment_id="demo",
-                experiment_name="Demo",
+                pipeline_id="demo",
+                pipeline_name="Demo",
                 branch="quick",
             ),
             stages=[],
@@ -462,11 +460,11 @@ def test_render_overview_shows_total_stage_elapsed(
         )
 
     monkeypatch.setattr(render, "Console", console_factory)
-    state = ExperimentState(
-        entry=ExperimentEntry(
+    state = PipelineState(
+        entry=PipelineEntry(
             output_root=tmp_path / "demo" / "out" / "main",
-            experiment_id="demo",
-            experiment_name="Demo",
+            pipeline_id="demo",
+            pipeline_name="Demo",
             branch="main",
         ),
         stages=[

@@ -23,7 +23,7 @@ class Pipeline:
     """Base class for varve pipelines.
 
     Subclasses declare stage methods with `@stage` and `@batch_stage`. The base
-    class keeps orchestration outside experiment code by collecting and sorting
+    class keeps orchestration outside pipeline code by collecting and sorting
     those declarations.
     """
 
@@ -116,7 +116,7 @@ class Pipeline:
 
         Returning None (default) keeps current behavior: only the dangerous blacklist
         (/, home, cwd) and manifest anchor guard a full clean. Override to declare
-        experiment-specific allowed roots (for example, experiment outputs and /tmp).
+        pipeline-specific allowed roots (for example, pipeline outputs and /tmp).
         """
         return None
 

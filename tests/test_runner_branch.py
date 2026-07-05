@@ -16,7 +16,7 @@ class Args(BaseModel):
     src: Path
 
 
-class BranchExperiment(Pipeline):
+class BranchPipeline(Pipeline):
     Config = Config
     Args = Args
 
@@ -43,7 +43,7 @@ def test_runner_uses_branch_output_root_and_passes_args_to_stage_and_keying(
     out_base = tmp_path / "out"
 
     run(
-        BranchExperiment,
+        BranchPipeline,
         Config(token="branch"),
         args=Args(src=src),
         cli_out=out_base,
@@ -59,7 +59,7 @@ def test_runner_uses_temporary_branch_output_root(tmp_path: Path) -> None:
     out_base = tmp_path / "out"
 
     run(
-        BranchExperiment,
+        BranchPipeline,
         Config(),
         args=Args(src=src),
         cli_out=out_base,

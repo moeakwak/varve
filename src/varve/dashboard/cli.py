@@ -6,10 +6,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from varve.dashboard.discovery import discover_experiments
-from varve.dashboard.models import ExperimentEntry
+from varve.dashboard.discovery import discover_pipelines
+from varve.dashboard.models import PipelineEntry
 from varve.dashboard.render import render_detail, render_overview
-from varve.dashboard.state import import_entry_experiment, load_state, resolve_entry_branch
+from varve.dashboard.state import import_entry_pipeline, load_state, resolve_entry_branch
 from varve.engine.runner import run
 from varve.log import configure_cli_logging
 
@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.command == "show":
-        return _show(args.root, args.experiment, args.branch, args.include_temp)
+        return _show(args.root, args.pipeline, args.branch, args.include_temp)
     if args.command == "refresh":
         return _refresh(args.root, args.include_temp, args.prefix)
     root = args.root if args.command == "ls" else Path.cwd()
@@ -31,21 +31,21 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="varve")
     subparsers = parser.add_subparsers(dest="command")
 
-    ls_parser = subparsers.add_parser("ls", help="list discovered experiment stores")
+    ls_parser = subparsers.add_parser("ls", help="list discovered pipeline stores")
     ls_parser.add_argument("--root", type=Path, default=Path.cwd())
     _add_include_temp(ls_parser)
 
-    show_parser = subparsers.add_parser("show", help="show one experiment store")
-    show_parser.add_argument("experiment")
+    show_parser = subparsers.add_parser("show", help="show one pipeline store")
+    show_parser.add_argument("pipeline")
     show_parser.add_argument("--root", type=Path, default=Path.cwd())
     show_parser.add_argument("--branch", default="main")
     _add_include_temp(show_parser)
 
-    refresh_parser = subparsers.add_parser("refresh", help="run executable discovered experiments")
+    refresh_parser = subparsers.add_parser("refresh", help="run executable discovered pipelines")
     refresh_parser.add_argument("--root", type=Path, default=Path.cwd())
     refresh_parser.add_argument(
         "--prefix",
-        help="only refresh experiments whose module starts with this prefix",
+        help="only refresh pipelines whose module starts with this prefix",
     )
     _add_include_temp(refresh_parser)
     return parser
@@ -60,34 +60,34 @@ def _add_include_temp(parser: argparse.ArgumentParser) -> None:
 
 
 def _ls(root: Path, include_temp: bool) -> int:
-    entries = discover_experiments(root, include_temporary=include_temp)
+    entries = discover_pipelines(root, include_temporary=include_temp)
     if not entries:
-        print(f"No experiments found under {root}", file=sys.stderr)
+        print(f"No pipelines found under {root}", file=sys.stderr)
         return 1
     states = [load_state(entry) for entry in entries]
     render_overview(states)
     return 0
 
 
-def _show(root: Path, experiment_id: str, branch: str, include_temp: bool) -> int:
-    entries = discover_experiments(root, include_temporary=include_temp)
-    by_key = {(entry.experiment_id, entry.branch): entry for entry in entries}
-    entry = by_key.get((experiment_id, branch))
+def _show(root: Path, pipeline_id: str, branch: str, include_temp: bool) -> int:
+    entries = discover_pipelines(root, include_temporary=include_temp)
+    by_key = {(entry.pipeline_id, entry.branch): entry for entry in entries}
+    entry = by_key.get((pipeline_id, branch))
     if entry is None:
-        print(f"Unknown experiment: {experiment_id} (branch {branch})", file=sys.stderr)
+        print(f"Unknown pipeline: {pipeline_id} (branch {branch})", file=sys.stderr)
         if by_key:
-            print("Available experiments:", file=sys.stderr)
+            print("Available pipelines:", file=sys.stderr)
             for known_id, known_branch in sorted(by_key):
                 print(f"  {known_id} --branch {known_branch}", file=sys.stderr)
         else:
-            print(f"No experiments found under {root}", file=sys.stderr)
+            print(f"No pipelines found under {root}", file=sys.stderr)
         return 1
     render_detail(load_state(entry))
     return 0
 
 
 def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
-    entries = discover_experiments(root, include_temporary=include_temp)
+    entries = discover_pipelines(root, include_temporary=include_temp)
     if prefix is not None:
         entries = [
             entry
@@ -95,7 +95,7 @@ def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
             if entry.module is not None and entry.module.startswith(prefix)
         ]
     if not entries:
-        print(f"No experiments found under {root}", file=sys.stderr)
+        print(f"No pipelines found under {root}", file=sys.stderr)
         return 1
 
     refreshed = 0
@@ -105,7 +105,7 @@ def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
         state = load_state(entry)
         if state.status not in _EXECUTABLE_STATUSES:
             continue
-        print(f"Refreshing {entry.experiment_id} --branch {entry.branch}")
+        print(f"Refreshing {entry.pipeline_id} --branch {entry.branch}")
         if not logging_configured:
             configure_cli_logging()
             logging_configured = True
@@ -114,24 +114,24 @@ def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
         except Exception as error:  # noqa: BLE001 - refresh should continue with later stores.
             failed += 1
             print(
-                f"Failed to refresh {entry.experiment_id} --branch {entry.branch}: {error}",
+                f"Failed to refresh {entry.pipeline_id} --branch {entry.branch}: {error}",
                 file=sys.stderr,
             )
         else:
             refreshed += 1
 
     if refreshed == 0 and failed == 0:
-        print("No executable experiments found")
+        print("No executable pipelines found")
     return 1 if failed else 0
 
 
-def _run_entry(entry: ExperimentEntry) -> None:
-    experiment = import_entry_experiment(entry)
-    resolved = resolve_entry_branch(entry, experiment)
+def _run_entry(entry: PipelineEntry) -> None:
+    pipeline = import_entry_pipeline(entry)
+    resolved = resolve_entry_branch(entry, pipeline)
     run(
-        experiment,
+        pipeline,
         resolved.config,
-        args=experiment.Args(),
+        args=pipeline.Args(),
         cli_out=resolved.output_base,
         branch=resolved.branch,
         is_temporary=resolved.is_temporary,

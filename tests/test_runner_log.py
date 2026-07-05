@@ -13,7 +13,7 @@ class Config(BaseModel):
     pass
 
 
-class LogExperiment(Pipeline):
+class LogPipeline(Pipeline):
     Config = Config
 
     @classmethod
@@ -27,7 +27,7 @@ class LogExperiment(Pipeline):
 
 def test_runner_emits_stage_level_logs(tmp_path: Path, caplog) -> None:
     caplog.set_level(logging.INFO, logger="varve")
-    run(LogExperiment, Config(), cli_out=tmp_path)
+    run(LogPipeline, Config(), cli_out=tmp_path)
     messages = [record.getMessage() for record in caplog.records]
     assert "plan: sample" in messages
     assert any("[sample] run · no cache" in message for message in messages)

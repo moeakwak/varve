@@ -1,4 +1,4 @@
-"""Branch selection helpers for varve experiments."""
+"""Branch selection helpers for varve pipelines."""
 
 from __future__ import annotations
 

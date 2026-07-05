@@ -35,15 +35,13 @@ def _confirm(message: str, yes: bool, confirm: Callable[[str], bool] | None) -> 
     raise ValueError("Clean requires confirmation or yes=True")
 
 
-def _read_manifest_anchor(store: Store, experiment: type[Pipeline]) -> Manifest:
+def _read_manifest_anchor(store: Store, pipeline: type[Pipeline]) -> Manifest:
     manifest_path = store.root / "manifest.json"
     manifest = store.read_manifest()
     if manifest is None:
         raise ValueError(f"Missing varve manifest anchor: {manifest_path}")
-    if manifest.experiment != experiment.__name__:
-        raise ValueError(
-            f"Varve manifest belongs to {manifest.experiment}, not {experiment.__name__}"
-        )
+    if manifest.pipeline != pipeline.__name__:
+        raise ValueError(f"Varve manifest belongs to {manifest.pipeline}, not {pipeline.__name__}")
     return manifest
 
 
@@ -69,7 +67,7 @@ def _validate_record_paths(root: Path, records: dict[str, Any]) -> None:
 
 
 def clean(
-    experiment: type[Pipeline],
+    pipeline: type[Pipeline],
     config: Any,
     *,
     cli_out: Path | None = None,
@@ -80,7 +78,7 @@ def clean(
     allowed_roots: list[Path] | None = None,
     confirm: Callable[[str], bool] | None = None,
 ) -> None:
-    root = experiment.output_root(
+    root = pipeline.output_root(
         config,
         cli_out=cli_out,
         branch=branch,
@@ -88,7 +86,7 @@ def clean(
     )
     store = Store(root)
     with OutputLock(store.root):
-        _read_manifest_anchor(store, experiment)
+        _read_manifest_anchor(store, pipeline)
 
         if target is None:
             _validate_destructive(root, allowed_roots)
@@ -96,7 +94,7 @@ def clean(
             shutil.rmtree(root)
             return
 
-        stage_names = selected_stages(experiment, downstream=target)
+        stage_names = selected_stages(pipeline, downstream=target)
         records = {}
         for stage_name in stage_names:
             record = store.read_success(stage_name)

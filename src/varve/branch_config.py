@@ -69,14 +69,14 @@ def _snapshot(config: Any) -> dict[str, Any]:
 
 
 def _main_config(
-    experiment: type[Pipeline],
+    pipeline: type[Pipeline],
     raw_main: dict[str, Any],
     *,
     cli_out: Path | None,
     allow_bare_output_root: bool,
 ) -> Any:
     try:
-        return config_from_init(experiment.Config, raw_main)
+        return config_from_init(pipeline.Config, raw_main)
     except ValidationError:
         if allow_bare_output_root and cli_out is not None:
             return SimpleNamespace()
@@ -91,7 +91,7 @@ def _temporary_config_from_manifest(main_base: Path, branch: str) -> dict[str, A
 
 
 def resolve_branch(
-    experiment: type[Pipeline],
+    pipeline: type[Pipeline],
     *,
     branch: str,
     override_json: str | None,
@@ -99,20 +99,20 @@ def resolve_branch(
     allow_bare_output_root: bool = False,
 ) -> ResolvedBranch:
     validate_branch_name(branch)
-    branches = load_branches(experiment.varve_config_path())
+    branches = load_branches(pipeline.varve_config_path())
     raw_main = branches.get("main", ({}, False))[0]
 
     if override_json is not None:
         if branch in branches and branch != "main":
             raise ValueError("--override is only supported on main or temporary branches")
 
-        final_config = config_from_init(experiment.Config, merge_override(raw_main, override_json))
+        final_config = config_from_init(pipeline.Config, merge_override(raw_main, override_json))
         temporary_config = _snapshot(final_config)
         if cli_out is not None:
             main_base = Path(cli_out)
         else:
-            main_config = config_from_init(experiment.Config, raw_main)
-            main_base = experiment.default_output_root(main_config)
+            main_config = config_from_init(pipeline.Config, raw_main)
+            main_base = pipeline.default_output_root(main_config)
         resolved_branch = override_branch_name(temporary_config) if branch == "main" else branch
         validate_branch_name(resolved_branch)
 
@@ -133,14 +133,14 @@ def resolve_branch(
     if branch in branches:
         raw_config, is_temporary = branches[branch]
         return ResolvedBranch(
-            config=config_from_init(experiment.Config, raw_config),
+            config=config_from_init(pipeline.Config, raw_config),
             branch=branch,
             is_temporary=is_temporary,
             output_base=Path(cli_out) if cli_out is not None else None,
         )
     if branch == "main":
         main_config = _main_config(
-            experiment,
+            pipeline,
             raw_main,
             cli_out=cli_out,
             allow_bare_output_root=allow_bare_output_root,
@@ -156,15 +156,15 @@ def resolve_branch(
         main_base = Path(cli_out)
     else:
         main_config = _main_config(
-            experiment,
+            pipeline,
             raw_main,
             cli_out=None,
             allow_bare_output_root=False,
         )
-        main_base = experiment.default_output_root(main_config)
+        main_base = pipeline.default_output_root(main_config)
     temporary_config = _temporary_config_from_manifest(main_base, branch)
     return ResolvedBranch(
-        config=experiment.Config.model_validate(temporary_config),
+        config=pipeline.Config.model_validate(temporary_config),
         branch=branch,
         is_temporary=True,
         output_base=main_base,

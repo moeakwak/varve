@@ -10,8 +10,8 @@ from varve.branch_config import ResolvedBranch, resolve_branch
 from varve.dashboard.models import (
     ArtifactState,
     ErrorPhase,
-    ExperimentEntry,
-    ExperimentState,
+    PipelineEntry,
+    PipelineState,
     StageState,
     StateError,
 )
@@ -28,35 +28,34 @@ STATUS_PRIORITY: tuple[Status, ...] = (
     "no-cache",
     "stale",
     "dirty",
-    "unrecoverable",
 )
 _STATUS_PRIORITY = {status: index for index, status in enumerate(STATUS_PRIORITY)}
 
 
-def load_state(entry: ExperimentEntry) -> ExperimentState:
-    """Load one experiment branch's current cache state."""
+def load_state(entry: PipelineEntry) -> PipelineState:
+    """Load one pipeline branch's current cache state."""
     if entry.manifest_error:
         return _error(entry, "manifest", entry.manifest_error)
-    if entry.experiment_name is None:
-        return _error(entry, "manifest", "Manifest is missing experiment")
+    if entry.pipeline_name is None:
+        return _error(entry, "manifest", "Manifest is missing pipeline")
     if entry.module is None:
         return _error(entry, "manifest", "Manifest is missing module")
 
     try:
-        experiment = import_entry_experiment(entry)
+        pipeline = import_entry_pipeline(entry)
     except Exception as error:  # noqa: BLE001 - dashboard must keep scanning after import failures.
         return _error(entry, "import", str(error))
 
     try:
-        resolved = resolve_entry_branch(entry, experiment)
+        resolved = resolve_entry_branch(entry, pipeline)
     except Exception as error:  # noqa: BLE001 - dashboard reports resolver diagnostics.
         return _error(entry, "resolve", str(error))
 
     try:
         outcomes = evaluate_state(
-            experiment,
+            pipeline,
             resolved.config,
-            args=experiment.Args(),
+            args=pipeline.Args(),
             cli_out=resolved.output_base,
             branch=resolved.branch,
             is_temporary=resolved.is_temporary,
@@ -67,7 +66,7 @@ def load_state(entry: ExperimentEntry) -> ExperimentState:
     outcomes_by_stage = {outcome.stage: outcome for outcome in outcomes}
     store = Store(entry.output_root)
     stages: list[StageState] = []
-    for name in experiment.topo_order():
+    for name in pipeline.topo_order():
         outcome = outcomes_by_stage[name]
         success = store.read_success(name)
         stages.append(
@@ -78,11 +77,11 @@ def load_state(entry: ExperimentEntry) -> ExperimentState:
                 artifacts=_artifacts(entry, success) if success is not None else [],
                 committed_at=_parse_datetime(success.committed_at) if success is not None else None,
                 elapsed=success.elapsed if success is not None else None,
-                upstreams=list(experiment.stages()[name].needs),
+                upstreams=list(pipeline.stages()[name].needs),
             )
         )
 
-    return ExperimentState(
+    return PipelineState(
         entry=entry,
         stages=stages,
         status=_aggregate_status(stages),
@@ -90,29 +89,29 @@ def load_state(entry: ExperimentEntry) -> ExperimentState:
     )
 
 
-def import_entry_experiment(entry: ExperimentEntry) -> type[Pipeline]:
+def import_entry_pipeline(entry: PipelineEntry) -> type[Pipeline]:
     if entry.manifest_error:
         raise ValueError(entry.manifest_error)
-    if entry.experiment_name is None:
-        raise ValueError("Manifest is missing experiment")
+    if entry.pipeline_name is None:
+        raise ValueError("Manifest is missing pipeline")
     if entry.module is None:
         raise ValueError("Manifest is missing module")
-    return _import_experiment(entry.module, entry.experiment_name)
+    return _import_pipeline(entry.module, entry.pipeline_name)
 
 
 def resolve_entry_branch(
-    entry: ExperimentEntry,
-    experiment: type[Pipeline],
+    entry: PipelineEntry,
+    pipeline: type[Pipeline],
 ) -> ResolvedBranch:
     return resolve_branch(
-        experiment,
+        pipeline,
         branch=entry.branch,
         override_json=None,
         cli_out=_output_base(entry),
     )
 
 
-def _import_experiment(module_name: str, class_name: str) -> type[Pipeline]:
+def _import_pipeline(module_name: str, class_name: str) -> type[Pipeline]:
     module = importlib.import_module(module_name)
     value = getattr(module, class_name)
     if not isinstance(value, type) or not issubclass(value, Pipeline):
@@ -120,13 +119,13 @@ def _import_experiment(module_name: str, class_name: str) -> type[Pipeline]:
     return value
 
 
-def _output_base(entry: ExperimentEntry) -> Path:
+def _output_base(entry: PipelineEntry) -> Path:
     if entry.output_root.parent.name == ".tmp":
         return entry.output_root.parent.parent
     return entry.output_root.parent
 
 
-def _artifacts(entry: ExperimentEntry, success: SuccessRecord) -> list[ArtifactState]:
+def _artifacts(entry: PipelineEntry, success: SuccessRecord) -> list[ArtifactState]:
     if success.kind == "single":
         assert success.produces is not None
         paths = [Path(produced.path) for produced in success.produces]
@@ -150,11 +149,11 @@ def _aggregate_status(stages: list[StageState]) -> Status:
 
 
 def _error(
-    entry: ExperimentEntry,
+    entry: PipelineEntry,
     phase: ErrorPhase,
     message: str,
-) -> ExperimentState:
-    return ExperimentState(
+) -> PipelineState:
+    return PipelineState(
         entry=entry,
         stages=[],
         status="error",

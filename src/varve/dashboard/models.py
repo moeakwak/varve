@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from varve.engine.state import Status
 
-ExperimentStatus = Status | Literal["error"]
+PipelineStatus = Status | Literal["error"]
 ErrorPhase = Literal["manifest", "import", "resolve", "evaluate"]
 
 
@@ -19,10 +19,10 @@ class StateError(BaseModel):
     message: str
 
 
-class ExperimentEntry(BaseModel):
+class PipelineEntry(BaseModel):
     output_root: Path
-    experiment_id: str
-    experiment_name: str | None
+    pipeline_id: str
+    pipeline_name: str | None
     branch: str
     module: str | None = None
     manifest_error: str | None = None
@@ -43,8 +43,8 @@ class StageState(BaseModel):
     elapsed: float | None = None
 
 
-class ExperimentState(BaseModel):
-    entry: ExperimentEntry
+class PipelineState(BaseModel):
+    entry: PipelineEntry
     stages: list[StageState]
-    status: ExperimentStatus
+    status: PipelineStatus
     error: StateError | None = None

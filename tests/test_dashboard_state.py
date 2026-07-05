@@ -6,7 +6,7 @@ import pytest
 from pydantic import BaseModel
 
 from varve import Pipeline, stage
-from varve.dashboard.models import ExperimentEntry
+from varve.dashboard.models import PipelineEntry
 from varve.dashboard.state import load_state
 from varve.engine.runner import StageOutcome, run
 from varve.models import KeyComponents, ProducedPath, SuccessRecord
@@ -34,11 +34,11 @@ class Demo(Pipeline):
         (ctx.out / "summary.txt").write_text("summary", encoding="utf-8")
 
 
-def _entry(output_root: Path, *, module: str | None = None) -> ExperimentEntry:
-    return ExperimentEntry(
+def _entry(output_root: Path, *, module: str | None = None) -> PipelineEntry:
+    return PipelineEntry(
         output_root=output_root,
-        experiment_id="demo",
-        experiment_name="Demo",
+        pipeline_id="demo",
+        pipeline_name="Demo",
         branch="main",
         module=module if module is not None else Demo.__module__,
     )
@@ -50,7 +50,7 @@ def _components() -> KeyComponents:
 
 def _single(stage_name: str, *, elapsed: float | None = None) -> SuccessRecord:
     return SuccessRecord(
-        experiment="Demo",
+        pipeline="Demo",
         stage=stage_name,
         kind="single",
         content_key=f"sha256:{stage_name}",
@@ -133,10 +133,10 @@ def test_load_state_matches_engine_status_for_real_run(tmp_path: Path) -> None:
 
 def test_load_state_reports_manifest_phase_for_manifest_errors(tmp_path: Path) -> None:
     state = load_state(
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path,
-            experiment_id="demo",
-            experiment_name="Demo",
+            pipeline_id="demo",
+            pipeline_name="Demo",
             branch="main",
             module=Demo.__module__,
             manifest_error="bad json",
@@ -151,10 +151,10 @@ def test_load_state_reports_manifest_phase_for_manifest_errors(tmp_path: Path) -
 
 def test_load_state_reports_manifest_phase_for_missing_module(tmp_path: Path) -> None:
     state = load_state(
-        ExperimentEntry(
+        PipelineEntry(
             output_root=tmp_path,
-            experiment_id="demo",
-            experiment_name="Demo",
+            pipeline_id="demo",
+            pipeline_name="Demo",
             branch="main",
             module=None,
         )
