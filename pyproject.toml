@@ -61,3 +61,7 @@ ignore = ["E501"]
 typeCheckingMode = "basic"
 pythonVersion = "3.10"
 include = ["src/varve", "tests"]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
