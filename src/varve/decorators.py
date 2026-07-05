@@ -14,6 +14,7 @@ ProducesItem = str | Path
 ProducesSpec = (
     ProducesItem | list[ProducesItem] | Callable[[Any], ProducesItem | list[ProducesItem]] | None
 )
+NeedItem = str | Callable[..., Any]
 
 
 @dataclass(frozen=True)
@@ -26,15 +27,22 @@ class StageSpec:
     keyspec: KeySpec
     auto_uses: bool = True
     additional_uses: tuple[Callable[..., Any], ...] = ()
-    partition_key: tuple[str, ...] = ()
 
 
-def _normalize_needs(needs: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+def _need_name(need: NeedItem) -> str:
+    if isinstance(need, str):
+        return need
+    return need.__name__
+
+
+def _normalize_needs(
+    needs: NeedItem | list[NeedItem] | tuple[NeedItem, ...] | None,
+) -> tuple[str, ...]:
     if needs is None:
         return ()
-    if isinstance(needs, str):
-        return (needs,)
-    return tuple(needs)
+    if isinstance(needs, str) or callable(needs):
+        return (_need_name(needs),)
+    return tuple(_need_name(need) for need in needs)
 
 
 def _attach_stage_spec(func: Callable[..., Any], spec: StageSpec) -> Callable[..., Any]:
@@ -44,13 +52,17 @@ def _attach_stage_spec(func: Callable[..., Any], spec: StageSpec) -> Callable[..
 
 def stage(
     *,
-    needs: str | list[str] | tuple[str, ...] | None = None,
+    needs: NeedItem | list[NeedItem] | tuple[NeedItem, ...] | None = None,
     produces: ProducesSpec = None,
     key: KeySpec | None = None,
     auto_uses: bool = True,
     additional_uses: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Declare a single-run stage."""
+    """Declare a single-run stage.
+
+    `needs` accepts stage names or method references defined earlier in the
+    class body.
+    """
 
     def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
         spec = StageSpec(
@@ -70,14 +82,17 @@ def stage(
 
 def batch_stage(
     *,
-    needs: str | list[str] | tuple[str, ...] | None = None,
+    needs: NeedItem | list[NeedItem] | tuple[NeedItem, ...] | None = None,
     produces: ProducesSpec = None,
     key: KeySpec | None = None,
     auto_uses: bool = True,
     additional_uses: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
-    partition_key: list[str] | tuple[str, ...] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Declare an async-generator batch stage."""
+    """Declare an async-generator batch stage.
+
+    `needs` accepts stage names or method references defined earlier in the
+    class body.
+    """
 
     if produces is not None:
         raise ValueError(
@@ -95,7 +110,6 @@ def batch_stage(
             keyspec=key if key is not None else KeySpec(),
             auto_uses=auto_uses,
             additional_uses=tuple(additional_uses),
-            partition_key=tuple(partition_key),
         )
         return _attach_stage_spec(func, spec)
 

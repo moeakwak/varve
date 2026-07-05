@@ -9,7 +9,7 @@ from varve import KeySpec, Pipeline, batch_stage, stage
 
 
 def test_decorators_capture_stage_metadata() -> None:
-    @batch_stage(needs="sample", partition_key=["batch_size"])
+    @batch_stage(needs="sample")
     async def transform(ctx):  # pragma: no cover - metadata only
         yield ctx
 
@@ -18,14 +18,13 @@ def test_decorators_capture_stage_metadata() -> None:
     assert spec.kind == "batch"
     assert spec.needs == ("sample",)
     assert spec.keyspec == KeySpec()
-    assert spec.partition_key == ("batch_size",)
 
 
 class DemoConfig(BaseModel):
     profile: str = "default"
 
 
-def test_experiment_collects_and_sorts_stages() -> None:
+def test_pipeline_collects_and_sorts_stages() -> None:
     class Demo(Pipeline):
         Config = DemoConfig
 
@@ -42,7 +41,7 @@ def test_experiment_collects_and_sorts_stages() -> None:
     assert Demo.topo_order() == ["sample", "summarize"]
 
 
-def test_experiment_rejects_unknown_dependencies() -> None:
+def test_pipeline_rejects_unknown_dependencies() -> None:
     class Broken(Pipeline):
         Config = DemoConfig
 
@@ -52,6 +51,22 @@ def test_experiment_rejects_unknown_dependencies() -> None:
 
     with pytest.raises(ValueError, match="Unknown varve stage dependencies"):
         Broken.stages()
+
+
+def test_pipeline_accepts_method_reference_dependencies() -> None:
+    class Demo(Pipeline):
+        Config = DemoConfig
+
+        @stage(produces="sample.txt")
+        def sample(self, ctx):  # pragma: no cover - metadata only
+            return None
+
+        @stage(needs=sample, produces="summary.txt")
+        def summarize(self, ctx):  # pragma: no cover - metadata only
+            return None
+
+    assert Demo.stages()["summarize"].needs == ("sample",)
+    assert Demo.topo_order() == ["sample", "summarize"]
 
 
 def test_output_root_default_resolution(tmp_path: Path) -> None:
