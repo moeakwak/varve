@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 import time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,13 +15,12 @@ from typing import Any
 from varve.context import Ctx
 from varve.decorators import ProducesItem, ProducesSpec
 from varve.engine.state import Decision, Status, decide_batch, decide_single
-from varve.keying.keys import compute_key_components, content_key, run_key
+from varve.keying.keys import compute_key_components, content_key
 from varve.models import (
     AttemptMarker,
     BatchRecord,
     KeyComponents,
     OutputHandle,
-    PartialMeta,
     ProducedPath,
     SuccessRecord,
 )
@@ -130,15 +130,10 @@ def _success_outputs_exist(record: SuccessRecord, out: Path) -> bool:
     return all((out / item.path).exists() for item in record.outputs)
 
 
-def _partition_values(stage_spec, config) -> dict[str, Any]:
-    data = config.model_dump(mode="json") if hasattr(config, "model_dump") else vars(config)
-    return {name: data[name] for name in stage_spec.partition_key}
-
-
 def _stage_sets(
-    experiment_type: type[Pipeline],
+    pipeline_type: type[Pipeline],
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    stages = experiment_type.stages()
+    stages = pipeline_type.stages()
     ancestors = {name: set(spec.needs) for name, spec in stages.items()}
     descendants = {name: set() for name in stages}
     for name, spec in stages.items():
@@ -160,7 +155,7 @@ def _closure(seed: str, graph: dict[str, set[str]]) -> set[str]:
 
 
 def selected_stages(
-    experiment_type: type[Pipeline],
+    pipeline_type: type[Pipeline],
     *,
     upto: str | None = None,
     downstream: str | None = None,
@@ -168,11 +163,11 @@ def selected_stages(
     specified = [item is not None for item in (upto, downstream)]
     if sum(specified) > 1:
         raise ValueError("upto and downstream are mutually exclusive")
-    stages = experiment_type.stages()
+    stages = pipeline_type.stages()
     for name in (upto, downstream):
         if name is not None and name not in stages:
             raise ValueError(f"Unknown varve stage: {name}")
-    ancestors, descendants = _stage_sets(experiment_type)
+    ancestors, descendants = _stage_sets(pipeline_type)
     if downstream is not None:
         return _closure(downstream, descendants)
     if upto is not None:
@@ -198,12 +193,12 @@ def _upstream_keys(
 
 
 def _validate_external_upstreams(
-    experiment_type: type[Pipeline],
+    pipeline_type: type[Pipeline],
     selected: set[str],
     store: Store,
     out: Path,
 ) -> None:
-    stages = experiment_type.stages()
+    stages = pipeline_type.stages()
     for stage_name in selected:
         for upstream in stages[stage_name].needs:
             if upstream in selected:
@@ -221,7 +216,7 @@ def _validate_external_upstreams(
 def _batch_outputs_from_records(
     *,
     previous: SuccessRecord | None,
-    partial: tuple[PartialMeta, dict[int, BatchRecord]] | None,
+    partial: dict[int, BatchRecord] | None,
     out: Path,
     force: bool,
 ) -> dict[int, list[str]]:
@@ -236,8 +231,7 @@ def _batch_outputs_from_records(
             if all((out / path).exists() for path in paths):
                 outputs[index] = list(paths)
     if partial is not None:
-        _, batches = partial
-        for index, batch in batches.items():
+        for index, batch in partial.items():
             if all((out / path).exists() for path in batch.yielded):
                 outputs[index] = list(batch.yielded)
     return outputs
@@ -261,7 +255,7 @@ async def _execute_batch(instance, stage_spec, ctx: Ctx):
 
 
 async def _drive(
-    experiment_type: type[Pipeline],
+    pipeline_type: type[Pipeline],
     config,
     *,
     args,
@@ -273,25 +267,25 @@ async def _drive(
 ) -> list[StageOutcome]:
     store = Store(out)
     selected = selected_stages(
-        experiment_type,
+        pipeline_type,
         upto=upto,
         downstream=downstream,
     )
     if execute:
-        _validate_external_upstreams(experiment_type, selected, store, out)
+        _validate_external_upstreams(pipeline_type, selected, store, out)
 
-    instance = experiment_type()
+    instance = pipeline_type()
     outcomes: list[StageOutcome] = []
     known_content_keys: dict[str, str] = {}
     logger = logging.getLogger("varve")
     logger.info(
-        "plan: %s", " -> ".join(name for name in experiment_type.topo_order() if name in selected)
+        "plan: %s", " -> ".join(name for name in pipeline_type.topo_order() if name in selected)
     )
 
-    for stage_name in experiment_type.topo_order():
+    for stage_name in pipeline_type.topo_order():
         if stage_name not in selected:
             continue
-        stage_spec = experiment_type.stages()[stage_name]
+        stage_spec = pipeline_type.stages()[stage_name]
         if not execute:
             missing_upstream = any(store.read_success(name) is None for name in stage_spec.needs)
             if missing_upstream:
@@ -317,8 +311,6 @@ async def _drive(
         current_key = content_key(components)
         known_content_keys[stage_name] = current_key
         attempt = store.read_attempt(stage_name)
-        partition = _partition_values(stage_spec, config) if stage_spec.kind == "batch" else {}
-        current_run_key = run_key(current_key, partition)
 
         if stage_spec.kind == "single":
             produces = []
@@ -334,21 +326,13 @@ async def _drive(
                 produces_exist=produces_exist,
             )
         else:
-            partial = store.read_partial(stage_name, current_run_key)
-            partial_run_key = (
-                run_key(partial[0].content_key, partial[0].partition_values)
-                if partial is not None
-                else None
-            )
+            partial = store.read_partial(stage_name, current_key)
             attempt_for_decision = attempt
             if previous is None and partial is not None:
                 attempt_for_decision = None
             decision = decide_batch(
                 current_key=current_key,
                 current_components=components,
-                current_partition=partition,
-                run_key=current_run_key,
-                partial_run_key=partial_run_key,
                 success=previous,
                 partial=partial,
                 attempt=attempt_for_decision,
@@ -373,9 +357,6 @@ async def _drive(
             logger.debug("[%s] content_key %s", stage_name, current_key)
             outcomes.append(StageOutcome(stage_name, decision.status, decision.reason, None))
             continue
-        if decision.status == "unrecoverable":
-            raise RuntimeError(f"[{stage_name}] {decision.reason}")
-
         started = time.monotonic()
         logger.info("[%s] run · %s", stage_name, decision.reason)
         logger.debug("[%s] content_key %s", stage_name, current_key)
@@ -402,7 +383,7 @@ async def _drive(
             elapsed = time.monotonic() - started
             store.write_success(
                 SuccessRecord(
-                    experiment=experiment_type.__name__,
+                    pipeline=pipeline_type.__name__,
                     stage=stage_name,
                     kind="single",
                     content_key=current_key,
@@ -414,7 +395,7 @@ async def _drive(
             )
         else:
             if force or decision.status != "resume":
-                store.clear_partial(stage_name, current_run_key)
+                store.clear_partial(stage_name, current_key)
             partial_for_outputs = partial if decision.status == "resume" else None
             outputs_by_index = _batch_outputs_from_records(
                 previous=previous,
@@ -422,16 +403,16 @@ async def _drive(
                 out=out,
                 force=force,
             )
-            store.write_partial_meta(
-                stage_name,
-                current_run_key,
-                PartialMeta(
-                    content_key=current_key,
-                    partition_values=partition,
-                    started_at=_now(),
-                ),
-            )
+            warned_without_resume = False
             async for yielded_index, index_paths in _execute_batch(instance, stage_spec, ctx):
+                if not ctx._used_resume and not warned_without_resume:
+                    warnings.warn(
+                        f"batch stage {stage_name!r} yielded without iterating ctx.resume; "
+                        "its outputs are not resumable. Wrap your iterable in ctx.resume(...) "
+                        "to enable per-batch checkpoint resume.",
+                        stacklevel=2,
+                    )
+                    warned_without_resume = True
                 index = yielded_index if yielded_index is not None else len(outputs_by_index)
                 yielded = []
                 for path in index_paths:
@@ -444,7 +425,7 @@ async def _drive(
                     yielded.append(_relative_to_out(absolute, out))
                 store.write_batch(
                     stage_name,
-                    current_run_key,
+                    current_key,
                     BatchRecord(index=index, yielded=yielded, committed_at=_now()),
                 )
                 outputs_by_index[index] = yielded
@@ -456,12 +437,11 @@ async def _drive(
             elapsed = time.monotonic() - started
             store.write_success(
                 SuccessRecord(
-                    experiment=experiment_type.__name__,
+                    pipeline=pipeline_type.__name__,
                     stage=stage_name,
                     kind="batch",
                     content_key=current_key,
                     key_components=components,
-                    partition_values=partition,
                     outputs=outputs,
                     committed_at=_now(),
                     elapsed=elapsed,
@@ -474,7 +454,7 @@ async def _drive(
 
 
 def run(
-    experiment: type[Pipeline],
+    pipeline: type[Pipeline],
     config,
     *,
     args=None,
@@ -487,8 +467,8 @@ def run(
     temporary_config: dict[str, Any] | None = None,
 ) -> list[StageOutcome]:
     if args is None:
-        args = experiment.Args()
-    out = experiment.output_root(
+        args = pipeline.Args()
+    out = pipeline.output_root(
         config,
         cli_out=cli_out,
         branch=branch,
@@ -498,13 +478,13 @@ def run(
     store.root.mkdir(parents=True, exist_ok=True)
     with OutputLock(store.root):
         store.ensure_initialized(
-            experiment.__name__,
-            module=experiment.import_module_name(),
+            pipeline.__name__,
+            module=pipeline.import_module_name(),
             temporary_config=temporary_config,
         )
         return asyncio.run(
             _drive(
-                experiment,
+                pipeline,
                 config,
                 args=args,
                 out=out,
@@ -517,7 +497,7 @@ def run(
 
 
 def evaluate_state(
-    experiment: type[Pipeline],
+    pipeline: type[Pipeline],
     config,
     *,
     args=None,
@@ -528,8 +508,8 @@ def evaluate_state(
     is_temporary: bool = False,
 ) -> list[StageOutcome]:
     if args is None:
-        args = experiment.Args()
-    out = experiment.output_root(
+        args = pipeline.Args()
+    out = pipeline.output_root(
         config,
         cli_out=cli_out,
         branch=branch,
@@ -537,7 +517,7 @@ def evaluate_state(
     )
     return asyncio.run(
         _drive(
-            experiment,
+            pipeline,
             config,
             args=args,
             out=out,

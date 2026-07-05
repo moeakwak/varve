@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
-from varve.models import AttemptMarker, BatchRecord, KeyComponents, PartialMeta, SuccessRecord
+from varve.models import AttemptMarker, BatchRecord, KeyComponents, SuccessRecord
 
 Status = Literal[
     "dirty",
@@ -15,7 +15,6 @@ Status = Literal[
     "stale",
     "no-cache",
     "resume",
-    "unrecoverable",
 ]
 
 
@@ -49,11 +48,8 @@ def decide_batch(
     *,
     current_key: str,
     current_components: KeyComponents,
-    current_partition: dict,
-    run_key: str,
-    partial_run_key: str | None,
     success: SuccessRecord | None,
-    partial: tuple[PartialMeta, dict[int, BatchRecord]] | None,
+    partial: dict[int, BatchRecord] | None,
     attempt: AttemptMarker | None,
     output_exists: Callable[[str], bool],
 ) -> Decision:
@@ -76,19 +72,14 @@ def decide_batch(
         }
         if len(existing) == len(output_paths_by_index):
             return Decision("hit", "hit")
-        if current_partition != success.partition_values:
-            return Decision("unrecoverable", "partition changed after artifact loss")
         return Decision("artifact-missing", "artifact missing", frozenset(existing))
 
     if partial is None:
         return Decision("no-cache", "no cache")
 
-    if partial_run_key != run_key:
-        return Decision("no-cache", "no cache")
-    _meta, batches = partial
     skip = {
         index
-        for index, batch in batches.items()
+        for index, batch in partial.items()
         if all(output_exists(path) for path in batch.yielded)
     }
     return Decision("resume", "resume", frozenset(skip))

@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 from varve.keying.astkey import source_hash
 from varve.keying.fingerprint import files_fingerprints, json_sha256
-from varve.keyspec import JSON, KeySpec
+from varve.keyspec import KeySpec
 from varve.models import FileFingerprint, KeyComponents
 
 _UNION_ORIGINS = (Union, types.UnionType)
@@ -252,7 +252,3 @@ def content_key(components: KeyComponents) -> str:
         "upstreams": components.upstreams,
     }
     return json_sha256(digest_view)
-
-
-def run_key(content_key_value: str, partition_values: dict[str, JSON]) -> str:
-    return json_sha256({"content_key": content_key_value, "partition": partition_values})

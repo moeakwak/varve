@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from varve.engine.state import decide_batch, decide_single, invalidation_reason
-from varve.keying.keys import run_key
 from varve.models import (
     AttemptMarker,
     BatchRecord,
     KeyComponents,
     OutputHandle,
-    PartialMeta,
     ProducedPath,
     SuccessRecord,
 )
@@ -21,7 +19,7 @@ def _components(**overrides) -> KeyComponents:
 
 def _single(key: str = "sha256:a") -> SuccessRecord:
     return SuccessRecord(
-        experiment="Demo",
+        pipeline="Demo",
         stage="sample",
         kind="single",
         content_key=key,
@@ -31,14 +29,13 @@ def _single(key: str = "sha256:a") -> SuccessRecord:
     )
 
 
-def _batch(key: str = "sha256:a", partition=None) -> SuccessRecord:
+def _batch(key: str = "sha256:a") -> SuccessRecord:
     return SuccessRecord(
-        experiment="Demo",
+        pipeline="Demo",
         stage="batch",
         kind="batch",
         content_key=key,
         key_components=_components(),
-        partition_values=partition or {"batch": 1},
         outputs=[
             OutputHandle(index=0, path="part-0.txt"),
             OutputHandle(index=1, path="part-1.txt"),
@@ -130,9 +127,6 @@ def test_decide_batch_rows() -> None:
         decide_batch(
             current_key="sha256:a",
             current_components=_components(),
-            current_partition={"batch": 1},
-            run_key=run_key("sha256:a", {"batch": 1}),
-            partial_run_key=None,
             success=success,
             partial=None,
             attempt=None,
@@ -145,9 +139,6 @@ def test_decide_batch_rows() -> None:
     decision = decide_batch(
         current_key="sha256:a",
         current_components=_components(),
-        current_partition={"batch": 1},
-        run_key=run_key("sha256:a", {"batch": 1}),
-        partial_run_key=None,
         success=success,
         partial=None,
         attempt=None,
@@ -156,31 +147,10 @@ def test_decide_batch_rows() -> None:
     assert decision.status == "artifact-missing"
     assert decision.resume_skip == frozenset({0})
 
-    assert (
-        decide_batch(
-            current_key="sha256:a",
-            current_components=_components(),
-            current_partition={"batch": 2},
-            run_key=run_key("sha256:a", {"batch": 2}),
-            partial_run_key=None,
-            success=success,
-            partial=None,
-            attempt=None,
-            output_exists=missing,
-        ).status
-        == "unrecoverable"
-    )
-
-    partial = (
-        PartialMeta(content_key="sha256:a", partition_values={"batch": 1}, started_at="now"),
-        {0: BatchRecord(index=0, yielded=["part-0.txt"], committed_at="now")},
-    )
+    partial = {0: BatchRecord(index=0, yielded=["part-0.txt"], committed_at="now")}
     resume = decide_batch(
         current_key="sha256:a",
         current_components=_components(),
-        current_partition={"batch": 1},
-        run_key=run_key("sha256:a", {"batch": 1}),
-        partial_run_key=run_key(partial[0].content_key, partial[0].partition_values),
         success=None,
         partial=partial,
         attempt=None,
@@ -194,9 +164,6 @@ def test_decide_batch_rows() -> None:
         decide_batch(
             current_key="sha256:a",
             current_components=_components(),
-            current_partition={"batch": 1},
-            run_key=run_key("sha256:a", {"batch": 1}),
-            partial_run_key=None,
             success=success,
             partial=None,
             attempt=marker,
@@ -209,28 +176,10 @@ def test_decide_batch_rows() -> None:
         decide_batch(
             current_key="sha256:b",
             current_components=_components(source={"x": "y"}),
-            current_partition={"batch": 1},
-            run_key=run_key("sha256:b", {"batch": 1}),
-            partial_run_key=None,
             success=success,
             partial=None,
             attempt=None,
             output_exists=exists,
         ).status
         == "stale"
-    )
-
-    assert (
-        decide_batch(
-            current_key="sha256:a",
-            current_components=_components(),
-            current_partition={"batch": 2},
-            run_key=run_key("sha256:a", {"batch": 2}),
-            partial_run_key=run_key(partial[0].content_key, partial[0].partition_values),
-            success=None,
-            partial=partial,
-            attempt=None,
-            output_exists=missing,
-        ).status
-        == "no-cache"
     )

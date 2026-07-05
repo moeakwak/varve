@@ -59,7 +59,7 @@ def _key_components() -> KeyComponents:
 
 def _single_record(stage: str, paths: list[str]) -> SuccessRecord:
     return SuccessRecord(
-        experiment="Demo",
+        pipeline="Demo",
         stage=stage,
         kind="single",
         content_key=f"{stage}-key",
@@ -71,7 +71,7 @@ def _single_record(stage: str, paths: list[str]) -> SuccessRecord:
 
 def _batch_record(stage: str, paths: list[str]) -> SuccessRecord:
     return SuccessRecord(
-        experiment="Demo",
+        pipeline="Demo",
         stage=stage,
         kind="batch",
         content_key=f"{stage}-key",

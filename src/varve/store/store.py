@@ -14,7 +14,6 @@ from varve.models import (
     AttemptMarker,
     BatchRecord,
     Manifest,
-    PartialMeta,
     SuccessRecord,
     VarveModel,
 )
@@ -58,7 +57,7 @@ class Store:
 
     def ensure_initialized(
         self,
-        experiment: str,
+        pipeline: str,
         *,
         module: str | None = None,
         temporary_config: dict[str, Any] | None = None,
@@ -72,15 +71,15 @@ class Store:
             _atomic_write_json(
                 manifest_path,
                 Manifest(
-                    experiment=experiment,
+                    pipeline=pipeline,
                     module=module,
                     temporary_config=temporary_config,
                 ),
             )
             return
-        if manifest.experiment != experiment:
+        if manifest.pipeline != pipeline:
             raise ValueError(
-                f"Varve store belongs to {manifest.experiment}, not {experiment}: {manifest_path}"
+                f"Varve store belongs to {manifest.pipeline}, not {pipeline}: {manifest_path}"
             )
         if temporary_config is not None and manifest.temporary_config != temporary_config:
             raise ValueError(f"Varve store has a different temporary config: {manifest_path}")
@@ -88,7 +87,7 @@ class Store:
             _atomic_write_json(
                 manifest_path,
                 Manifest(
-                    experiment=manifest.experiment,
+                    pipeline=manifest.pipeline,
                     module=module if module is not None else manifest.module,
                     temporary_config=manifest.temporary_config,
                 ),
@@ -112,11 +111,10 @@ class Store:
     def read_partial(
         self,
         stage: str,
-        run_key: str,
-    ) -> tuple[PartialMeta, dict[int, BatchRecord]] | None:
-        partial_root = self.root / "partial" / stage / run_key
-        meta = _read_model(partial_root / "meta.json", PartialMeta)
-        if meta is None:
+        content_key: str,
+    ) -> dict[int, BatchRecord] | None:
+        partial_root = self.root / "partial" / stage / content_key
+        if not partial_root.exists():
             return None
         batches_root = partial_root / "batches"
         batches: dict[int, BatchRecord] = {}
@@ -125,19 +123,16 @@ class Store:
             if batch is None:
                 continue
             batches[batch.index] = batch
-        return meta, batches
+        return batches
 
-    def write_partial_meta(self, stage: str, run_key: str, meta: PartialMeta) -> None:
-        _atomic_write_json(self.root / "partial" / stage / run_key / "meta.json", meta)
-
-    def write_batch(self, stage: str, run_key: str, record: BatchRecord) -> None:
+    def write_batch(self, stage: str, content_key: str, record: BatchRecord) -> None:
         _atomic_write_json(
-            self.root / "partial" / stage / run_key / "batches" / f"{record.index}.json",
+            self.root / "partial" / stage / content_key / "batches" / f"{record.index}.json",
             record,
         )
 
-    def clear_partial(self, stage: str, run_key: str | None = None) -> None:
+    def clear_partial(self, stage: str, content_key: str | None = None) -> None:
         path = self.root / "partial" / stage
-        if run_key is not None:
-            path /= run_key
+        if content_key is not None:
+            path /= content_key
         shutil.rmtree(path, ignore_errors=True)

@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class VarveModel(BaseModel):
@@ -15,7 +15,7 @@ class VarveModel(BaseModel):
 
 class Manifest(VarveModel):
     schema_version: int = SCHEMA_VERSION
-    experiment: str
+    pipeline: str
     module: str | None = None
     temporary_config: dict[str, Any] | None = None
 
@@ -47,12 +47,11 @@ class ProducedPath(VarveModel):
 
 class SuccessRecord(VarveModel):
     schema_version: int = SCHEMA_VERSION
-    experiment: str
+    pipeline: str
     stage: str
     kind: Literal["single", "batch"]
     content_key: str
     key_components: KeyComponents
-    partition_values: dict[str, Any] = {}
     outputs: list[OutputHandle] | None = None
     produces: list[ProducedPath] | None = None
     committed_at: str
@@ -66,12 +65,6 @@ class SuccessRecord(VarveModel):
         elif self.outputs is not None or self.produces is None:
             raise ValueError("single success records must have produces and no outputs")
         return self
-
-
-class PartialMeta(VarveModel):
-    content_key: str
-    partition_values: dict[str, Any]
-    started_at: str
 
 
 class BatchRecord(VarveModel):

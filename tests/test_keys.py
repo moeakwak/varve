@@ -10,7 +10,7 @@ import pytest
 from pydantic import BaseModel
 
 from varve.decorators import StageSpec, stage
-from varve.keying.keys import compute_key_components, content_key, run_key
+from varve.keying.keys import compute_key_components, content_key
 from varve.keyspec import KeySpec
 from varve.models import (
     KeyComponents,
@@ -129,50 +129,6 @@ def test_content_key_files_use_sha_not_mtime(tmp_path: Path) -> None:
     second = compute_key_components(spec, ctx, {}, cached_files=first.files)
     assert content_key(second) == key
     assert second.files["data"][0].mtime != first.files["data"][0].mtime
-
-
-def test_varve_decorator_arguments_do_not_enter_source_hash(tmp_path: Path) -> None:
-    first_module_path = tmp_path / "first_module.py"
-    first_module_path.write_text(
-        """
-from varve.decorators import batch_stage
-
-@batch_stage(partition_key=["small"])
-async def partitioned(self, ctx):
-    yield ctx
-""",
-        encoding="utf-8",
-    )
-    second_module_path = tmp_path / "second_module.py"
-    second_module_path.write_text(
-        """
-from varve.decorators import batch_stage
-
-@batch_stage(partition_key=["large"])
-async def partitioned(self, ctx):
-    yield ctx
-""",
-        encoding="utf-8",
-    )
-
-    first_module = _load_module(first_module_path, "first_module")
-    second_module = _load_module(second_module_path, "second_module")
-    first = compute_key_components(
-        first_module.partitioned.__varve_stage__,
-        Ctx(Config(profile="a")),
-        {},
-    )
-    second = compute_key_components(
-        second_module.partitioned.__varve_stage__,
-        Ctx(Config(profile="a")),
-        {},
-    )
-
-    assert content_key(first) == content_key(second)
-    assert run_key(content_key(first), {"partition": "small"}) != run_key(
-        content_key(first),
-        {"partition": "large"},
-    )
 
 
 def test_additional_uses_helpers_with_same_qualname_do_not_overwrite_each_other(
@@ -362,16 +318,10 @@ def test_missing_same_module_helper_is_rejected_when_auto_uses_is_disabled() -> 
         )
 
 
-def test_run_key_includes_content_key_and_partition() -> None:
-    assert run_key("sha256:a", {"batch": 1}) == run_key("sha256:a", {"batch": 1})
-    assert run_key("sha256:a", {"batch": 1}) != run_key("sha256:b", {"batch": 1})
-    assert run_key("sha256:a", {"batch": 1}) != run_key("sha256:a", {"batch": 2})
-
-
 def test_success_record_enforces_kind_specific_output_shape() -> None:
     components = KeyComponents(source={}, config={}, files={}, values={}, upstreams={})
     SuccessRecord(
-        experiment="Demo",
+        pipeline="Demo",
         stage="sample",
         kind="single",
         content_key="sha256:x",
@@ -380,7 +330,7 @@ def test_success_record_enforces_kind_specific_output_shape() -> None:
         committed_at="now",
     )
     SuccessRecord(
-        experiment="Demo",
+        pipeline="Demo",
         stage="transform",
         kind="batch",
         content_key="sha256:x",
@@ -391,7 +341,7 @@ def test_success_record_enforces_kind_specific_output_shape() -> None:
 
     with pytest.raises(ValueError, match="single success records"):
         SuccessRecord(
-            experiment="Demo",
+            pipeline="Demo",
             stage="sample",
             kind="single",
             content_key="sha256:x",
@@ -401,7 +351,7 @@ def test_success_record_enforces_kind_specific_output_shape() -> None:
         )
     with pytest.raises(ValueError, match="batch success records"):
         SuccessRecord(
-            experiment="Demo",
+            pipeline="Demo",
             stage="transform",
             kind="batch",
             content_key="sha256:x",
