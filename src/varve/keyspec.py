@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeAlias
 
-JSON: TypeAlias = dict[str, "JSON"] | list["JSON"] | str | int | float | bool | None
+JSON: TypeAlias = Mapping[str, "JSON"] | list["JSON"] | str | int | float | bool | None
 
 
 @dataclass(frozen=True)

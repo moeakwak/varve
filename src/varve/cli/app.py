@@ -42,33 +42,33 @@ _COMMAND_OPTION_ARITIES = {
 
 
 def _args_from_namespace(
-    experiment: type[Pipeline],
+    pipeline: type[Pipeline],
     namespace: argparse.Namespace,
 ) -> BaseModel:
-    init_kwargs = argmap.collect_cli_args_namespace(namespace, experiment.Args)
-    return experiment.Args.model_validate(init_kwargs)
+    init_kwargs = argmap.collect_cli_args_namespace(namespace, pipeline.Args)
+    return pipeline.Args.model_validate(init_kwargs)
 
 
-def _print_list(experiment: type[Pipeline]) -> None:
-    for name in experiment.topo_order():
-        spec = experiment.stages()[name]
+def _print_list(pipeline: type[Pipeline]) -> None:
+    for name in pipeline.topo_order():
+        spec = pipeline.stages()[name]
         needs = ",".join(spec.needs) if spec.needs else "-"
         kind = "batch" if spec.kind == "batch" else "stage"
         print(f"{name}\t{kind}\tneeds={needs}")
 
 
 def _print_plan(
-    experiment: type[Pipeline],
+    pipeline: type[Pipeline],
     *,
     upto: str | None,
     downstream: str | None,
 ) -> None:
-    selected = selected_stages(experiment, upto=upto, downstream=downstream)
-    print(" -> ".join(name for name in experiment.topo_order() if name in selected))
+    selected = selected_stages(pipeline, upto=upto, downstream=downstream)
+    print(" -> ".join(name for name in pipeline.topo_order() if name in selected))
 
 
 def _print_status(
-    experiment: type[Pipeline],
+    pipeline: type[Pipeline],
     config,
     args,
     *,
@@ -79,7 +79,7 @@ def _print_status(
     is_temporary: bool,
 ) -> None:
     outcomes = evaluate_state(
-        experiment,
+        pipeline,
         config,
         args=args,
         upto=upto,
@@ -158,13 +158,13 @@ def _has_unknown_option_before_config_registration(
     return False
 
 
-def main(experiment: type[Pipeline], argv: list[str] | None = None) -> int:
+def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     selected_command_index = _selected_command_index(raw_argv)
     selected_command = (
         raw_argv[selected_command_index] if selected_command_index is not None else None
     )
-    parser = argparse.ArgumentParser(prog=experiment.__name__)
+    parser = argparse.ArgumentParser(prog=pipeline.__name__)
     parser.add_argument("-v", "--verbose", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -223,39 +223,39 @@ def main(experiment: type[Pipeline], argv: list[str] | None = None) -> int:
         if _has_unknown_option_before_config_registration(
             command=selected_command,
             command_args=command_args,
-            args_type=experiment.Args,
+            args_type=pipeline.Args,
         ):
             parser.error("unknown option or missing option value")
 
     if selected_command == "run":
-        argmap.register_args(run_parser, experiment.Args)
+        argmap.register_args(run_parser, pipeline.Args)
     if selected_command == "status":
-        argmap.register_args(status_parser, experiment.Args)
+        argmap.register_args(status_parser, pipeline.Args)
     if selected_command == "clean":
-        argmap.register_args(clean_parser, experiment.Args)
+        argmap.register_args(clean_parser, pipeline.Args)
 
     namespace = parser.parse_args(raw_argv)
     configure_cli_logging(namespace.verbose)
 
     if namespace.command == "list":
-        _print_list(experiment)
+        _print_list(pipeline)
         return 0
     if namespace.command == "plan":
-        _print_plan(experiment, upto=namespace.upto, downstream=namespace.downstream)
+        _print_plan(pipeline, upto=namespace.upto, downstream=namespace.downstream)
         return 0
 
     resolved = resolve_branch(
-        experiment,
+        pipeline,
         branch=namespace.branch,
         override_json=namespace.override if namespace.command == "run" else None,
         cli_out=namespace.out,
         allow_bare_output_root=namespace.command == "clean",
     )
     config = resolved.config
-    args = _args_from_namespace(experiment, namespace)
+    args = _args_from_namespace(pipeline, namespace)
     if namespace.command == "status":
         _print_status(
-            experiment,
+            pipeline,
             config,
             args,
             upto=namespace.upto,
@@ -266,10 +266,10 @@ def main(experiment: type[Pipeline], argv: list[str] | None = None) -> int:
         )
     elif namespace.command == "clean":
         allowed_roots = (
-            None if isinstance(config, SimpleNamespace) else experiment.clean_roots(config)
+            None if isinstance(config, SimpleNamespace) else pipeline.clean_roots(config)
         )
         clean(
-            experiment,
+            pipeline,
             config,
             cli_out=resolved.output_base,
             branch=resolved.branch,
@@ -281,7 +281,7 @@ def main(experiment: type[Pipeline], argv: list[str] | None = None) -> int:
         )
     elif namespace.command == "run":
         outcomes = run(
-            experiment,
+            pipeline,
             config,
             args=args,
             upto=namespace.upto,

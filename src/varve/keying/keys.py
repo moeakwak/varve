@@ -19,11 +19,20 @@ _UNION_ORIGINS = (Union, types.UnionType)
 
 
 class StageSpecLike(Protocol):
-    func: Callable[..., Any]
-    auto_uses: bool
-    additional_uses: tuple[Callable[..., Any], ...]
-    keyspec: KeySpec
-    needs: tuple[str, ...]
+    @property
+    def func(self) -> Callable[..., Any]: ...
+
+    @property
+    def auto_uses(self) -> bool: ...
+
+    @property
+    def additional_uses(self) -> tuple[Callable[..., Any], ...]: ...
+
+    @property
+    def keyspec(self) -> KeySpec: ...
+
+    @property
+    def needs(self) -> tuple[str, ...]: ...
 
 
 def _config_data(config: Any) -> dict[str, Any]:

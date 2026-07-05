@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError, create_model
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +20,8 @@ from varve.branch import (
 from varve.pipeline import Pipeline
 from varve.store.store import Store
 
+ConfigT = TypeVar("ConfigT", bound=BaseModel)
+
 
 @dataclass(frozen=True)
 class ResolvedBranch:
@@ -30,7 +32,7 @@ class ResolvedBranch:
     temporary_config: dict[str, Any] | None = None
 
 
-def _settings_type(config_type: type[BaseModel]):
+def _settings_type(config_type: type[BaseModel]) -> type[BaseSettings]:
     class VarveSettings(BaseSettings):
         model_config = SettingsConfigDict(
             env_nested_delimiter="__",
@@ -48,11 +50,13 @@ def _settings_type(config_type: type[BaseModel]):
         ):
             return (init_settings, env_settings, dotenv_settings, file_secret_settings)
 
-    fields = {name: (field.annotation, field) for name, field in config_type.model_fields.items()}
+    fields: dict[str, Any] = {
+        name: (field.annotation, field) for name, field in config_type.model_fields.items()
+    }
     return create_model(f"{config_type.__name__}VarveSettings", __base__=VarveSettings, **fields)
 
 
-def config_from_init(config_type: type[BaseModel], init_kwargs: dict[str, Any]) -> BaseModel:
+def config_from_init(config_type: type[ConfigT], init_kwargs: dict[str, Any]) -> ConfigT:
     settings_type = _settings_type(config_type)
     settings = settings_type(**init_kwargs)
     return config_type.model_validate(settings.model_dump())

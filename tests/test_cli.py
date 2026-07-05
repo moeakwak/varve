@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError
@@ -451,7 +451,7 @@ class StrictCleanRootsExperiment(RequiredExtraCliExperiment):
         return [Path("/tmp") / config.dataset]
 
 
-def _capture_run(monkeypatch: pytest.MonkeyPatch) -> list[tuple[BaseModel, BaseModel, dict]]:
+def _capture_run(monkeypatch: pytest.MonkeyPatch) -> list[tuple[BaseModel, Any, dict]]:
     captured: list = []
 
     def fake_run(experiment, config, **kwargs):

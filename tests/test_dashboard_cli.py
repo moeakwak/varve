@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic import BaseModel
@@ -10,7 +11,13 @@ from rich.console import Console
 from varve import Pipeline, stage
 from varve.dashboard import render
 from varve.dashboard.cli import main
-from varve.dashboard.models import ExperimentEntry, ExperimentState, StageState, StateError
+from varve.dashboard.models import (
+    ExperimentEntry,
+    ExperimentState,
+    ExperimentStatus,
+    StageState,
+    StateError,
+)
 from varve.dashboard.render import render_detail, render_overview
 from varve.engine.runner import run
 from varve.store.store import Store
@@ -215,7 +222,9 @@ def test_refresh_runs_executable_entries_in_discovery_order(
         return entries
 
     def fake_state(entry: ExperimentEntry):
-        status = entry.experiment_id if entry.experiment_id != "hit" else "hit"
+        status = cast(
+            ExperimentStatus, entry.experiment_id if entry.experiment_id != "hit" else "hit"
+        )
         return ExperimentState(entry=entry, stages=[], status=status, error=None)
 
     refreshed: list[tuple[str, str]] = []
