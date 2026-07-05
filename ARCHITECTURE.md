@@ -1,6 +1,6 @@
 # varve Architecture
 
-`varve` is a small single-machine runner for Python-defined experiment pipelines with a materialized, content-addressed cache. Users define `Pipeline` classes and stages; varve owns branch-aware output roots, cache keys, store records, generated CLI commands, and clean/status behavior.
+`varve` is a small single-machine runner for Python-defined pipelines with a materialized, content-addressed cache. Users define `Pipeline` classes and stages; varve owns branch-aware output roots, cache keys, store records, generated CLI commands, and clean/status behavior.
 
 ## Package Layout
 
@@ -51,16 +51,20 @@ The store lives under `<output_root>/.varve/` and is latest-wins, not append-onl
 ├── lock
 ├── stages/<stage>.json
 ├── attempts/<stage>.json
-└── partial/<stage>/<run_key>/
+└── partial/<stage>/<content_key>/
 ```
 
-`content_key` includes stage source, discovered project callables, full `Config`, declared `KeySpec.files`, declared `KeySpec.values`, and upstream content keys. `run_key` adds batch partition values.
+`content_key` includes stage source, discovered project callables, full `Config`, declared `KeySpec.files`, declared `KeySpec.values`, and upstream content keys. Batch partial state is scoped directly by `content_key`, so changing any Config field, including fields such as `batch_size`, makes the batch stage stale and starts a fresh run.
 
 Recorded artifact paths are output-root-relative. Stage bodies should write through `ctx.out`.
 
 Stage bodies read upstream outputs through `ctx.input(stage)` for exactly one path or `ctx.inputs(stage)` for a list of paths. Both helpers require `stage` to be declared in the current stage's `needs=` list, because only declared upstreams are folded into the content key.
 
-Known cache states are `dirty`, `hit`, `artifact-missing`, `stale`, `no-cache`, `resume`, and `unrecoverable`.
+Known cache states are `dirty`, `hit`, `artifact-missing`, `stale`, `no-cache`, and `resume`.
+
+Batch resume records completed indexes from `ctx.resume(...)`. This requires deterministic iterable order; callers should sort unstable inputs before passing them to `ctx.resume(...)`. Varve intentionally does not provide order-independent batch resume under the current content-key model.
+
+Batch stages are scheduled serially by the runner. Stage bodies may still perform parallel work inside each batch item with `asyncio.gather(...)`, process pools, or long-lived worker sessions. A batch item may yield zero paths; the completed index is recorded, but item-level output completeness is the stage's responsibility.
 
 ## Output Roots And Branches
 
@@ -84,6 +88,8 @@ Config priority:
 ```text
 branch or override value > env > dotenv (.env) > field default
 ```
+
+`run --override JSON` creates a temporary branch by deep-merging JSON over `main`.
 
 Do not add Click or Typer. The strict `argparse` behavior is intentional.
 

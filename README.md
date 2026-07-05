@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/varve.svg)](https://pypi.org/project/varve/) [![License](https://img.shields.io/pypi/l/varve.svg)](LICENSE)
 
-Varve is a small Python library for running experiment pipelines as code. Each stage is a Python method, the run/status/plan/list/clean CLI is generated for you, and every output is cached under a key derived automatically from your code, config, and pinned inputs, so re-runs only re-execute what actually changed. Single machine, no daemon, no pipeline YAML.
+Varve runs Python-defined pipelines with code-aware materialized caching. Each stage is a Python method, the run/status/plan/list/clean CLI is generated for you, and every output is cached under a key derived automatically from your code, config, and pinned inputs, so re-runs only re-execute what actually changed. Single machine, no daemon, no pipeline YAML.
 
 A varve is an annual layer of lake sediment: thin, ordered, and datable. This library uses the same idea for pipeline outputs: materialized layers whose keys record the code, config, inputs, and upstream layers that produced them.
 
@@ -70,7 +70,7 @@ class Demo(Pipeline):
     def prepare(self, ctx: Ctx[Config, Args]) -> None:
         (ctx.out / "items.txt").write_text("alpha\nbeta\ngamma\n")
 
-    @batch_stage(needs="prepare", partition_key=("batch_size",))
+    @batch_stage(needs="prepare")
     async def process(self, ctx: Ctx[Config, Args]):
         items = ctx.input("prepare").read_text().splitlines()
         async for index, item in ctx.resume(items, progress=ctx.args.progress):
@@ -87,9 +87,19 @@ class Demo(Pipeline):
 
 `ctx.input("stage")` returns exactly one upstream output path and fails if the stage produced zero or many paths. `ctx.inputs("stage")` always returns `list[Path]`. Both require the upstream stage to be declared in `needs=`, so the upstream content key is part of the downstream cache key.
 
+`needs=` accepts stage names as strings or method references defined earlier in the class body, such as `@stage(needs=prepare)`. Strings are usually clearer across inheritance boundaries.
+
+Batch resume is index-based: varve records completed positions from `ctx.resume(...)` and skips those positions on the next run. The iterable order must therefore be deterministic for resume correctness. If source order is unstable, sort it before passing it to `ctx.resume(...)`; varve does not provide order-independent batch resume.
+
+Batch stages run serially at the varve level so partial writes stay simple and deterministic. If each item can use parallelism internally, use normal Python tools such as `asyncio.gather(...)`, a process pool, or a long-lived worker/session inside the batch stage body.
+
+Varve warns when a batch stage yields outputs without first iterating `ctx.resume(...)`, because those outputs cannot be resumed safely. A batch item may yield zero paths; varve records the completed index but does not validate item-level completeness.
+
 ## Why varve
 
-Varve is for research and data-analysis pipelines where Python code is already the best source of truth. It is intentionally closer to a small library such as redun, Hamilton, or pydoit than to a workflow platform.
+Varve is for pipelines where Python code is already the best source of truth. It is intentionally closer to a small library such as redun, Hamilton, or pydoit than to a workflow platform.
+
+It is designed for local experiment, research, and data-processing workflows: dataset preparation, evaluation runs, render/compare batches, generated reports, and other repeatable jobs that need materialized outputs without a service.
 
 Unlike DVC, varve is not data version control. Unlike Snakemake, it does not introduce a separate DSL. Unlike Prefect, Dagster, or Airflow, it has no scheduler service, worker fleet, or deployment model.
 
@@ -110,7 +120,7 @@ The core design choices are:
   - `list`
   - `clean [--branch NAME] [--downstream STAGE] [--out PATH] [--yes]`
 - `run`, `status`, and `clean` also accept generated flags from the pipeline's `Args` model.
-- Cache states for hits, stale records, missing artifacts, dirty attempts, resumable batches, and unrecoverable partition changes.
+- Cache states for hits, stale records, missing artifacts, dirty attempts, resumable batches, and stages with no cache record.
 - `ctx.input(...)`, `ctx.inputs(...)`, and `ctx.resume(...)` for stage bodies.
 - `KeySpec.files` for pinning input file contents into the content key.
 

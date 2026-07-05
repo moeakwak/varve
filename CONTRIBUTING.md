@@ -34,4 +34,4 @@ Do not re-export internal store, keying, runner, or dashboard types from `varve.
 
 ## Releases
 
-Do not hand-edit versions or release changelog entries; release-please owns them.
+`CHANGELOG.md`, the version in `pyproject.toml`, and `.release-please-manifest.json` are owned by release-please. Do not hand-edit them on `main` or feature branches; such edits are overwritten on the next release-please run. The only legitimate hand-edit is tuning that release PR before it finalizes the release.
