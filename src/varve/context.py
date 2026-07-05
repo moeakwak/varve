@@ -79,6 +79,7 @@ class Ctx(Generic[ConfigT, ArgsT]):
         self._stage_name = stage_name
         self._declared_needs = declared_needs
         self._current_batch_index: int | None = None
+        self._used_resume = False
 
     def _check_declared_need(self, stage: str) -> None:
         if self._declared_needs is None or stage in self._declared_needs:
@@ -132,8 +133,15 @@ class Ctx(Generic[ConfigT, ArgsT]):
         unit: str = "batch",
         postfix: Callable[[Any], str] | None = None,
     ) -> AsyncIterator[tuple[int, Any]]:
-        """Iterate batch items, skipping items already recorded in a resumable run."""
+        """Iterate batch items, skipping items already recorded in a resumable run.
 
+        Resume is positional: `iterable` must have deterministic order for the
+        same keyed inputs. Sort unstable sources before passing them here. Batch
+        stages do not validate per-item output shape; validate that in a
+        downstream stage when shape matters.
+        """
+
+        self._used_resume = True
         progress_handle: _ResumeProgress | None = None
         if progress:
             label = desc or self._stage_name or "batch"
