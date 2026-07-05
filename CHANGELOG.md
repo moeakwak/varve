@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.1.0 (2026-07-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* ctx.input now requires exactly one output; use ctx.inputs for upstream stages with zero or multiple outputs.
+* rename Experiment to Pipeline
+* removes file_set, __version__, the Ctx ledger alias, the corrupt-store status, KeySpec.coerce, and the top-level dashboard --include-temp compatibility path.
+* **keying:** enable automatic source uses
+* **dashboard:** evaluate status through engine
+* **cli:** redesign generated commands
+* **core:** rename branches.yaml to varve.yaml
+* **core:** KeySpec.config is removed and the full Config now enters the content key; Experiment.output_root gained branch/is_temporary and resolve_output_root is gone; `--config` now points to branches.yaml and semantic flags are replaced by --branch/--override/--name.
+* **cli:** own output root resolution
+
+### Features
+
+* add file set key helper ([ab1046a](https://github.com/moeakwak/varve/commit/ab1046a069a354e5553717ce732272948d77235f))
+* **cli:** own output root resolution ([04b93ff](https://github.com/moeakwak/varve/commit/04b93fff8a97f1315dc82dc6bad9924bc1ef2ea3))
+* **cli:** redesign generated commands ([cf5b729](https://github.com/moeakwak/varve/commit/cf5b72941550defd09806e9d2e70d1fc9c1c6bb9))
+* **cli:** support `refresh --prefix` ([adb2a06](https://github.com/moeakwak/varve/commit/adb2a06664ca44cf990f136d8feb3292018afa85))
+* **cli:** support Literal/Enum choices, null, help, and lighter clean ([53879bf](https://github.com/moeakwak/varve/commit/53879bffda1daadeca809b63a85e02b22c2f6f9f))
+* **context:** default tqdm progress bar for resumed batch stages ([62b33f2](https://github.com/moeakwak/varve/commit/62b33f21a8991befb604401e6833e4486a87148e))
+* **core:** branch-scoped runs with Args/Config split and full-config keying ([13dfb0f](https://github.com/moeakwak/varve/commit/13dfb0f54a377bd5f11f468af8670fe33c6854ee))
+* **dashboard:** add `refresh` command ([eebf01e](https://github.com/moeakwak/varve/commit/eebf01ebced024db197531f2bcdd33695c8b91c3))
+* **dashboard:** add read-only store dashboard ([1f32834](https://github.com/moeakwak/varve/commit/1f32834b8f256c055135d9cc8e7230c17f4bd981))
+* **dashboard:** evaluate status through engine ([c0df1b9](https://github.com/moeakwak/varve/commit/c0df1b9269c159e51e434254e1a5a67d87c329c3))
+* **dashboard:** include temporary branches ([733673a](https://github.com/moeakwak/varve/commit/733673a30631c944479364ce312e8f3fbef0d7b5))
+* **dashboard:** show persisted stage duration ([6ce520f](https://github.com/moeakwak/varve/commit/6ce520f45614c260a6ca2ed8360c601489d6f301))
+* **keying:** enable automatic source uses ([2d05a8f](https://github.com/moeakwak/varve/commit/2d05a8f8d37fb0bf04cdeb3c86bc6f3f0cedc1e4))
+* split upstream output helpers ([805cd7d](https://github.com/moeakwak/varve/commit/805cd7d8ab557e8031f4588c6655f3751909a605))
+
+
+### Bug Fixes
+
+* **cli:** refresh executable dashboard stores ([024ce71](https://github.com/moeakwak/varve/commit/024ce719dcd3e243d62a27c5c0ae40485f4e8a07))
+* **engine:** harden output-root path and lock handling ([d4c481d](https://github.com/moeakwak/varve/commit/d4c481d292bd70333d6753637cda44712c1b1ff4))
+* **keying:** stabilize `__main__` helper labels ([96916ea](https://github.com/moeakwak/varve/commit/96916eab1af66c05841fd05a7a978f8d00f5250b))
+
+
+### Documentation
+
+* sync docs with current behavior ([c9dcfb0](https://github.com/moeakwak/varve/commit/c9dcfb0df9fc1da777768ec5ddc02d4c0e11321c))
+
+
+### Code Refactoring
+
+* **core:** rename branches.yaml to varve.yaml ([4b1a369](https://github.com/moeakwak/varve/commit/4b1a3692b3631a5120bd32f9e1584820f8637390))
+* rename Experiment to Pipeline ([e994f79](https://github.com/moeakwak/varve/commit/e994f7955b011d39216fde5b5402891164a8e710))
+* simplify varve surface and tests ([07649ba](https://github.com/moeakwak/varve/commit/07649ba03a6f5ec218e1a144a7e481ec0440d27e))
+
+## Changelog
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
