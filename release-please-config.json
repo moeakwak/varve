@@ -3,7 +3,6 @@
   "packages": {
     ".": {
       "package-name": "varve",
-      "release-as": "0.1.0",
       "release-type": "python"
     }
   }
