@@ -202,6 +202,28 @@ def test_main_module_uses_stable_spec_name_for_helper_labels(
     assert "uses.__main__.helper" not in components.source
 
 
+def test_main_module_helpers_are_auto_detected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Spec:
+        name = "pkg.demo.__main__"
+
+    module = type("Module", (), {"__spec__": Spec()})()
+    monkeypatch.setitem(sys.modules, "__main__", module)
+    original_transform_module = transform.__module__
+    original_helper_module = helper.__module__
+    transform.__module__ = "__main__"
+    helper.__module__ = "__main__"
+    try:
+        components = compute_key_components(_stage_spec(), Ctx(Config(profile="a")), {})
+    finally:
+        transform.__module__ = original_transform_module
+        helper.__module__ = original_helper_module
+
+    assert "uses.pkg.demo.__main__.helper" in components.source
+    assert "uses.__main__.helper" not in components.source
+
+
 def test_content_key_changes_when_upstream_changes(tmp_path: Path) -> None:
     base = _stage_spec()
     spec = StageSpec(

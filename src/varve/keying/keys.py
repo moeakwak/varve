@@ -117,7 +117,7 @@ def _project_prefix(func: Callable[..., Any]) -> str:
 def _is_project_callable(value: Any, *, project_prefix: str) -> bool:
     if not callable(value):
         return False
-    module = getattr(value, "__module__", "")
+    module = _module_name(value)
     return bool(project_prefix) and (
         module == project_prefix or module.startswith(f"{project_prefix}.")
     )
