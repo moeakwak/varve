@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class VarveModel(BaseModel):
@@ -33,6 +33,11 @@ class KeyComponents(VarveModel):
     files: dict[str, list[FileFingerprint]]
     values: dict[str, Any]
     upstreams: dict[str, dict[str, str]]
+    # Top-level config fields this stage read at runtime; None means every field
+    # matters (conservative fallback). `config` above is projected onto this set,
+    # so unread config fields never enter the content key. Older records without
+    # this field default to None and rerun once, then self-heal.
+    config_access: list[str] | None = None
 
 
 class OutputHandle(VarveModel):

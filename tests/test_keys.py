@@ -73,6 +73,23 @@ def test_content_key_uses_all_config_fields() -> None:
     assert content_key(first) != content_key(second)
 
 
+def test_content_key_projects_onto_config_access() -> None:
+    spec = _stage_spec()
+    base = compute_key_components(
+        spec, Ctx(Config(profile="a", limit=1)), {}, config_access=["profile"]
+    )
+    unread = compute_key_components(
+        spec, Ctx(Config(profile="a", limit=2)), {}, config_access=["profile"]
+    )
+    read = compute_key_components(
+        spec, Ctx(Config(profile="b", limit=1)), {}, config_access=["profile"]
+    )
+    assert base.config == {"profile": "a"}
+    assert base.config_access == ["profile"]
+    assert content_key(base) == content_key(unread)  # limit is outside the access set
+    assert content_key(base) != content_key(read)  # profile is inside it
+
+
 def test_content_key_changes_when_value_changes(tmp_path: Path) -> None:
     def value_one(_ctx):
         return {"logic": 1}

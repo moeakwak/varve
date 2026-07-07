@@ -11,6 +11,7 @@ from typing import Annotated, Any, Protocol, Union, get_args, get_origin
 from pydantic import BaseModel
 
 from varve.keying.astkey import source_hash
+from varve.keying.config_access import project_config
 from varve.keying.fingerprint import files_fingerprints, json_sha256
 from varve.keyspec import KeySpec
 from varve.models import FileFingerprint, KeyComponents
@@ -35,7 +36,7 @@ class StageSpecLike(Protocol):
     def needs(self) -> tuple[str, ...]: ...
 
 
-def _config_data(config: Any) -> dict[str, Any]:
+def config_data(config: Any) -> dict[str, Any]:
     if isinstance(config, BaseModel):
         return config.model_dump(mode="json")
     if isinstance(config, dict):
@@ -210,7 +211,17 @@ def compute_key_components(
     ctx: Any,
     upstream_keys: Mapping[str, str],
     cached_files: Mapping[str, list[FileFingerprint]] | None = None,
+    *,
+    config_access: list[str] | None = None,
 ) -> KeyComponents:
+    """Assemble a stage's key components.
+
+    `config_access` projects the config onto the top-level fields the stage is
+    known to read (from the previous success record); `None` folds in the whole
+    config, the conservative default used on the first run and after source
+    changes.
+    """
+
     _validate_config_has_no_paths(ctx.config)
     uses = _effective_uses(stage_spec)
     _validate_uses_cover_direct_same_module_calls(stage_spec, uses)
@@ -222,7 +233,7 @@ def compute_key_components(
             raise ValueError(f"Duplicate varve uses source key: {source_key}")
         source[source_key] = source_hash(helper)
 
-    config = _config_data(ctx.config)
+    config = project_config(config_data(ctx.config), config_access)
     files = files_fingerprints(ctx, stage_spec.keyspec.files, cached_by_name=cached_files)
     values = {name: getter(ctx) for name, getter in sorted(stage_spec.keyspec.values.items())}
     upstreams = {name: {"content_key": upstream_keys[name]} for name in sorted(stage_spec.needs)}
@@ -233,6 +244,7 @@ def compute_key_components(
         files=files,
         values=values,
         upstreams=upstreams,
+        config_access=config_access,
     )
 
 

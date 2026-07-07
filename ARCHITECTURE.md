@@ -55,7 +55,19 @@ The store lives under `<output_root>/.varve/` and is latest-wins, not append-onl
 └── partial/<stage>/<content_key>/
 ```
 
-`content_key` includes stage source, discovered project callables, full `Config`, declared `KeySpec.files`, declared `KeySpec.values`, and upstream content keys. Batch partial state is scoped directly by `content_key`, so changing any Config field, including fields such as `batch_size`, makes the batch stage stale and starts a fresh run.
+`content_key` includes stage source, discovered project callables, the `Config` projected onto the fields the stage actually reads, declared `KeySpec.files`, declared `KeySpec.values`, and upstream content keys. Batch partial state is scoped directly by `content_key`.
+
+## Config Access Projection
+
+A stage's output depends only on the `Config` fields it reads, so folding the whole `Config` into every `content_key` over-invalidates: adding a tool or toggling a flag would rerun stages that never look at that field. Varve instead records which top-level fields each stage reads and keys only on those.
+
+During a run the stage's `ctx.config` is a transparent recording proxy. Plain top-level field reads (`ctx.config.tools`, including reads inside helpers the config is passed to) are captured precisely; any access that cannot be attributed to one field — `model_dump()`, `getattr` of an unknown name, iteration, `__dict__`, pickling — marks the whole `Config` as depended-on (`config_access = None`, the conservative fallback). The recorded set is stored on the success record and, on the next run, the `Config` is projected onto it before hashing, so changing an unread field is a hit.
+
+Soundness rests on the source component: if a stage's code (or a discovered callable) changes to read a new field, its source hash changes and it reruns, re-recording the set. The first run of a stage, and any run after a source change, key on the whole `Config` and then record the precise set for subsequent runs. Keying is two-phase: the hit/stale decision projects onto the previous run's set, and the committed key projects onto this run's actual reads (unioned with the previous set when the source is unchanged, so a resume that skips batches or a data-dependent branch not taken never drops a real dependency).
+
+Config reads must be deterministic for fixed keyed inputs, and must happen on every stage entry rather than only inside resume-skipped per-item work; batch stages conventionally read `Config` at the top to build their job list, which satisfies this. A stage that ships the raw `Config` object into a subprocess and reads fields there is not captured — extract the values in the parent process (which reads them through the proxy) and pass those.
+
+`Config` keeps its whole-value role for provenance and branch identity: `override_branch_name`, the manifest snapshot, and anything a stage writes to run metadata still see the full `Config`. Only keying is projected.
 
 Recorded artifact paths are output-root-relative. Stage bodies should write through `ctx.out`.
 

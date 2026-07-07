@@ -231,7 +231,9 @@ def test_batch_resume_after_failure(tmp_path: Path) -> None:
     assert (_out(tmp_path) / "summary.txt").read_text(encoding="utf-8") == "0:a,1:a,2:a,3:a"
 
 
-def test_completed_batch_artifact_missing_then_config_change_is_stale(tmp_path: Path) -> None:
+def test_completed_batch_artifact_missing_then_unread_config_change_repairs(
+    tmp_path: Path,
+) -> None:
     run(ToyPipeline, Config(), cli_out=tmp_path, upto="transform")
     (_out(tmp_path) / "transform" / "part-1.txt").unlink()
     repaired = run(ToyPipeline, Config(), cli_out=tmp_path, upto="transform")
@@ -241,10 +243,25 @@ def test_completed_batch_artifact_missing_then_config_change_is_stale(tmp_path: 
     assert record.outputs is not None
     assert [output.index for output in record.outputs] == [0, 1, 2, 3]
 
+    # transform never reads any config field (it iterates a fixed range), so its
+    # content key does not depend on batch_size. Changing batch_size therefore
+    # leaves it cached and only repairs the missing artifact.
     (_out(tmp_path) / "transform" / "part-1.txt").unlink()
-    changed_partition = run(ToyPipeline, Config(batch_size=3), cli_out=tmp_path, upto="transform")
-    assert changed_partition[-1].status == "stale"
+    unread_change = run(ToyPipeline, Config(batch_size=3), cli_out=tmp_path, upto="transform")
+    assert unread_change[-1].status == "artifact-missing"
     assert (_out(tmp_path) / "transform" / "part-1.txt").exists()
+
+
+def test_config_change_invalidates_only_stages_that_read_the_field(tmp_path: Path) -> None:
+    run(ToyPipeline, Config(), cli_out=tmp_path, upto="sample")
+
+    # sample reads config.token but not config.batch_size, so a batch_size change
+    # is a hit while a token change is stale.
+    unread = run(ToyPipeline, Config(batch_size=99), cli_out=tmp_path, upto="sample")
+    assert unread[-1].status == "hit"
+
+    read = run(ToyPipeline, Config(token="changed"), cli_out=tmp_path, upto="sample")
+    assert read[-1].status == "stale"
 
 
 def test_batch_stage_warns_when_yielding_without_ctx_resume(tmp_path: Path) -> None:

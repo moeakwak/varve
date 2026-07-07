@@ -15,7 +15,8 @@ from typing import Any
 from varve.context import Ctx
 from varve.decorators import ProducesItem, ProducesSpec
 from varve.engine.state import Decision, Status, decide_batch, decide_single
-from varve.keying.keys import compute_key_components, content_key
+from varve.keying.config_access import ConfigAccess, RecordingConfig, project_config
+from varve.keying.keys import compute_key_components, config_data, content_key
 from varve.models import (
     AttemptMarker,
     BatchRecord,
@@ -237,6 +238,47 @@ def _batch_outputs_from_records(
     return outputs
 
 
+def _merge_config_access(
+    previous: SuccessRecord | None,
+    source: dict[str, str],
+    recorded: list[str] | None,
+) -> list[str] | None:
+    """Combine a run's recorded config access with the previous record's.
+
+    `recorded` is `None` when the run touched the whole config (conservative).
+    On unchanged source we union with the previous set so a resume that skips
+    batches, or a data-dependent branch not taken this run, never drops a real
+    dependency; a source change resets the basis so fields the code no longer
+    reads do not linger.
+    """
+
+    if recorded is None:
+        return None
+    if previous is None:
+        return recorded
+    prev_access = previous.key_components.config_access
+    if prev_access is None:
+        return None
+    if previous.key_components.source != source:
+        return recorded
+    return sorted(set(prev_access) | set(recorded))
+
+
+def _commit_components(
+    probe: KeyComponents,
+    config: Any,
+    committed_access: list[str] | None,
+) -> KeyComponents:
+    """Reproject a probe's components onto the config fields actually read."""
+
+    return probe.model_copy(
+        update={
+            "config": project_config(config_data(config), committed_access),
+            "config_access": committed_access,
+        }
+    )
+
+
 async def _execute_stage(instance, stage_spec, ctx: Ctx) -> None:
     result = stage_spec.func(instance, ctx)
     if inspect.isawaitable(result):
@@ -298,6 +340,7 @@ async def _drive(
         )
         previous = store.read_success(stage_name)
         cached_files = previous.key_components.files if previous is not None else None
+        previous_access = previous.key_components.config_access if previous is not None else None
         declared_needs = frozenset(stage_spec.needs)
         ctx_for_key = Ctx(
             config=config,
@@ -307,7 +350,16 @@ async def _drive(
             stage_name=stage_name,
             declared_needs=declared_needs,
         )
-        components = compute_key_components(stage_spec, ctx_for_key, upstream_keys, cached_files)
+        # Probe key: project config onto the fields the previous run read (whole
+        # config when there is no prior record). The committed key below is
+        # reprojected onto this run's actual reads.
+        components = compute_key_components(
+            stage_spec,
+            ctx_for_key,
+            upstream_keys,
+            cached_files,
+            config_access=previous_access,
+        )
         current_key = content_key(components)
         known_content_keys[stage_name] = current_key
         attempt = store.read_attempt(stage_name)
@@ -368,8 +420,9 @@ async def _drive(
                 touched_existing=previous is not None,
             ),
         )
+        access = ConfigAccess()
         ctx = Ctx(
-            config=config,
+            config=RecordingConfig(config, access),
             args=args,
             out=out,
             store=store,
@@ -381,13 +434,15 @@ async def _drive(
             await _execute_stage(instance, stage_spec, ctx)
             produces = _produced_paths(stage_spec.produces, ctx)
             elapsed = time.monotonic() - started
+            committed_access = _merge_config_access(previous, components.source, access.resolve())
+            commit_components = _commit_components(components, config, committed_access)
             store.write_success(
                 SuccessRecord(
                     pipeline=pipeline_type.__name__,
                     stage=stage_name,
                     kind="single",
-                    content_key=current_key,
-                    key_components=components,
+                    content_key=content_key(commit_components),
+                    key_components=commit_components,
                     produces=produces,
                     committed_at=_now(),
                     elapsed=elapsed,
@@ -448,13 +503,15 @@ async def _drive(
                 for path in paths
             ]
             elapsed = time.monotonic() - started
+            committed_access = _merge_config_access(previous, components.source, access.resolve())
+            commit_components = _commit_components(components, config, committed_access)
             store.write_success(
                 SuccessRecord(
                     pipeline=pipeline_type.__name__,
                     stage=stage_name,
                     kind="batch",
-                    content_key=current_key,
-                    key_components=components,
+                    content_key=content_key(commit_components),
+                    key_components=commit_components,
                     outputs=outputs,
                     committed_at=_now(),
                     elapsed=elapsed,
