@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -100,22 +101,27 @@ def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
 
     refreshed = 0
     failed = 0
+    logger = logging.getLogger("varve")
     logging_configured = False
     for entry in entries:
         state = load_state(entry)
         if state.status not in _EXECUTABLE_STATUSES:
             continue
-        print(f"Refreshing {entry.pipeline_id} --branch {entry.branch}")
         if not logging_configured:
             configure_cli_logging()
             logging_configured = True
+        # Route the per-pipeline header through the varve logger so it shares the
+        # timestamp column and styling with the stage lines that _run_entry emits.
+        logger.info("refresh %s --branch %s", entry.pipeline_id, entry.branch)
         try:
             _run_entry(entry)
         except Exception as error:  # noqa: BLE001 - refresh should continue with later stores.
             failed += 1
-            print(
-                f"Failed to refresh {entry.pipeline_id} --branch {entry.branch}: {error}",
-                file=sys.stderr,
+            logger.error(
+                "failed to refresh %s --branch %s: %s",
+                entry.pipeline_id,
+                entry.branch,
+                error,
             )
         else:
             refreshed += 1

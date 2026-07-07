@@ -243,8 +243,8 @@ def test_refresh_runs_executable_entries_in_discovery_order(
         ("resume", "main"),
         ("artifact-missing", "main"),
     ]
-    assert "Refreshing stale --branch main" in captured.out
-    assert "Refreshing dirty --branch main" in captured.out
+    assert "refresh stale --branch main" in captured.err
+    assert "refresh dirty --branch main" in captured.err
 
 
 def test_refresh_prefix_filters_entries_by_module(
