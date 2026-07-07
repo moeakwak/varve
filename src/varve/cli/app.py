@@ -9,13 +9,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from pydantic import BaseModel
+from rich.table import Table
 
 from varve.branch_config import resolve_branch
 from varve.cli import argmap
 from varve.cli.clean import clean
-from varve.engine.runner import evaluate_state, run, selected_stages
+from varve.engine.runner import StageOutcome, evaluate_state, run, selected_stages
 from varve.log import configure_cli_logging
 from varve.pipeline import Pipeline
+from varve.style import make_console, status_text
 
 _CONFIG_COMMANDS = {"run", "status", "clean"}
 _NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
@@ -50,11 +52,35 @@ def _args_from_namespace(
 
 
 def _print_list(pipeline: type[Pipeline]) -> None:
+    table = Table(box=None)
+    table.add_column("STAGE")
+    table.add_column("KIND")
+    table.add_column("NEEDS")
     for name in pipeline.topo_order():
         spec = pipeline.stages()[name]
-        needs = ",".join(spec.needs) if spec.needs else "-"
+        needs = ", ".join(spec.needs) if spec.needs else "-"
         kind = "batch" if spec.kind == "batch" else "stage"
-        print(f"{name}\t{kind}\tneeds={needs}")
+        table.add_row(name, kind, needs)
+    make_console().print(table)
+
+
+def _format_elapsed(value: float | None) -> str:
+    return f"{value:.2f}s" if value is not None else "-"
+
+
+def _print_outcomes(outcomes: list[StageOutcome], *, elapsed: bool) -> None:
+    table = Table(box=None)
+    table.add_column("STAGE")
+    table.add_column("STATUS")
+    table.add_column("REASON")
+    if elapsed:
+        table.add_column("ELAPSED", justify="right")
+    for outcome in outcomes:
+        row = [outcome.stage, status_text(outcome.status), outcome.reason]
+        if elapsed:
+            row.append(_format_elapsed(outcome.elapsed))
+        table.add_row(*row)
+    make_console().print(table)
 
 
 def _print_plan(
@@ -88,8 +114,7 @@ def _print_status(
         branch=branch,
         is_temporary=is_temporary,
     )
-    for outcome in outcomes:
-        print(f"{outcome.stage}\t{outcome.status}\t{outcome.reason}")
+    _print_outcomes(outcomes, elapsed=False)
 
 
 def _default_confirm(message: str) -> bool:
@@ -235,7 +260,7 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         argmap.register_args(clean_parser, pipeline.Args)
 
     namespace = parser.parse_args(raw_argv)
-    configure_cli_logging(namespace.verbose)
+    configure_cli_logging(namespace.verbose, quiet=namespace.command != "run")
 
     if namespace.command == "list":
         _print_list(pipeline)
@@ -292,6 +317,5 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             is_temporary=resolved.is_temporary,
             temporary_config=resolved.temporary_config,
         )
-        for outcome in outcomes:
-            print(f"{outcome.stage}\t{outcome.status}\t{outcome.reason}")
+        _print_outcomes(outcomes, elapsed=True)
     return 0

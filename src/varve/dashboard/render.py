@@ -4,26 +4,14 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from rich.console import Console
 from rich.table import Table
-from rich.text import Text
 
-from varve.dashboard.models import PipelineState, PipelineStatus, StageState
-from varve.engine.state import Status
-
-_STATUS_STYLES: dict[Status | PipelineStatus, str] = {
-    "hit": "green",
-    "artifact-missing": "yellow",
-    "resume": "yellow",
-    "no-cache": "yellow",
-    "stale": "yellow",
-    "dirty": "red",
-    "error": "red",
-}
+from varve.dashboard.models import PipelineState, StageState
+from varve.style import make_console, status_text
 
 
 def render_overview(states: list[PipelineState]) -> None:
-    console = Console(highlight=False)
+    console = make_console()
     table = Table(box=None)
     table.add_column("PIPELINE")
     table.add_column("BRANCH")
@@ -41,7 +29,7 @@ def render_overview(states: list[PipelineState]) -> None:
         table.add_row(
             pipeline_id,
             state.entry.branch,
-            _status_text(state.status),
+            status_text(state.status),
             f"{hit_count}/{len(state.stages)}",
             _format_elapsed(_total_elapsed(state.stages)),
             _format_datetime(_last_run(state.stages)),
@@ -51,14 +39,14 @@ def render_overview(states: list[PipelineState]) -> None:
 
 
 def render_detail(state: PipelineState) -> None:
-    console = Console(highlight=False)
+    console = make_console()
     pipeline_name = state.entry.pipeline_name or state.entry.pipeline_id
     console.print(f"Pipeline: {state.entry.pipeline_id}")
     # soft_wrap keeps long output-root paths on one line; rich would otherwise
     # hard-wrap them at the console width and split the path mid-string.
     console.print(f"Output root: {state.entry.output_root}", soft_wrap=True)
     console.print(f"Name: {pipeline_name}")
-    console.print("Status: ", _status_text(state.status), sep="")
+    console.print("Status: ", status_text(state.status), sep="")
     if state.error is not None:
         console.print(f"Error: {state.error.phase}: {state.error.message}")
     console.print()
@@ -73,7 +61,7 @@ def render_detail(state: PipelineState) -> None:
     for stage in state.stages:
         stage_table.add_row(
             stage.name,
-            _status_text(stage.status),
+            status_text(stage.status),
             stage.reason,
             _format_artifacts(stage),
             _format_datetime(stage.committed_at),
@@ -99,10 +87,6 @@ def render_detail(state: PipelineState) -> None:
             printed_any = True
     if not printed_any:
         console.print("  No recorded dependencies.")
-
-
-def _status_text(status: PipelineStatus) -> Text:
-    return Text(status, style=_STATUS_STYLES[status])
 
 
 def _format_artifacts(stage: StageState) -> str:

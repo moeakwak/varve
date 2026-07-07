@@ -378,7 +378,7 @@ def test_render_detail_styles_status(
             **kwargs,
         )
 
-    monkeypatch.setattr(render, "Console", console_factory)
+    monkeypatch.setattr(render, "make_console", console_factory)
     state = PipelineState(
         entry=PipelineEntry(
             output_root=tmp_path,
@@ -411,7 +411,7 @@ def test_render_overview_groups_repeated_pipeline_names(
             **kwargs,
         )
 
-    monkeypatch.setattr(render, "Console", console_factory)
+    monkeypatch.setattr(render, "make_console", console_factory)
     states = [
         PipelineState(
             entry=PipelineEntry(
@@ -459,7 +459,7 @@ def test_render_overview_shows_total_stage_elapsed(
             **kwargs,
         )
 
-    monkeypatch.setattr(render, "Console", console_factory)
+    monkeypatch.setattr(render, "make_console", console_factory)
     state = PipelineState(
         entry=PipelineEntry(
             output_root=tmp_path / "demo" / "out" / "main",

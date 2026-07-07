@@ -14,6 +14,7 @@ src/varve/
 ├── branch_config.py     # Config construction and output-root selection
 ├── keyspec.py           # JSON and KeySpec declarations
 ├── models.py            # persisted pydantic store models
+├── style.py             # shared Rich status colors for cli and dashboard
 ├── keying/              # source/file/config/upstream key components
 ├── store/               # file lock and latest-wins Store
 ├── engine/              # cache-state decisions and runner
@@ -108,6 +109,8 @@ Per-stage clean only deletes recorded artifacts and store records for the select
 The top-level `varve` console script reads existing stores.
 
 Temporary branches under `out/.tmp` are filtered by default and included only with `--include-temp`. Discovery is zero-import; state rendering imports stored manifest modules only after discovery. `refresh` runs branches whose evaluated status is executable: `artifact-missing`, `dirty`, `no-cache`, `resume`, or `stale`.
+
+The dashboard and the generated `Pipeline.cli()` commands share `style.py` for status colors and console construction, so both render the same aligned tables and semantic status colors. Rich drops color automatically when output is not a terminal.
 
 ## Known Limitations
 
