@@ -32,6 +32,10 @@ def configure_cli_logging(verbose: bool = False, *, quiet: bool = False) -> None
             show_path=False,
             markup=False,
             log_time_format="%H:%M:%S",
+            # Stamp every line, including consecutive stage/refresh lines that
+            # land in the same second. Rich collapses repeated timestamps by
+            # default, which hides when each stage actually ran.
+            omit_repeated_times=False,
         )
         # No text prefix: the dim timestamp column already marks varve's lines.
         logger.addHandler(handler)

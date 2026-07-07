@@ -33,6 +33,11 @@ STATUS_STYLES: dict[str, str] = {
 # Style for the bracketed stage name in the live run log, e.g. "[render_ablation]".
 STAGE_STYLE = "bold"
 
+# Leading glyph and styling for a `refresh <pipeline> --branch <branch>` header.
+# The header groups the stage lines that follow it, so it gets its own accent.
+REFRESH_MARKER = "▸"
+REFRESH_STYLE = "bold cyan"
+
 
 def _theme_key(status: str) -> str:
     # Theme style names and regex group names must be valid identifiers.
@@ -41,7 +46,7 @@ def _theme_key(status: str) -> str:
 
 _THEME = Theme(
     {f"varve.{_theme_key(status)}": style for status, style in STATUS_STYLES.items()}
-    | {"varve.stage": STAGE_STYLE}
+    | {"varve.stage": STAGE_STYLE, "varve.refresh": REFRESH_STYLE}
 )
 
 
@@ -50,6 +55,8 @@ class VarveStatusHighlighter(RegexHighlighter):
 
     base_style = "varve."
     highlights = [
+        # Accent the whole `▸ refresh <pipeline> --branch <branch>` header.
+        rf"(?P<refresh>{re.escape(REFRESH_MARKER)} refresh .+)",
         r"(?P<stage>\[[^\]]+\])",
         *(rf"(?P<{_theme_key(status)}>\b{re.escape(status)}\b)" for status in STATUS_STYLES),
     ]

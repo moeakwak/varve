@@ -13,6 +13,7 @@ from varve.dashboard.render import render_detail, render_overview
 from varve.dashboard.state import import_entry_pipeline, load_state, resolve_entry_branch
 from varve.engine.runner import run
 from varve.log import configure_cli_logging
+from varve.style import REFRESH_MARKER
 
 _EXECUTABLE_STATUSES = {"artifact-missing", "dirty", "no-cache", "resume", "stale"}
 
@@ -112,7 +113,8 @@ def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
             logging_configured = True
         # Route the per-pipeline header through the varve logger so it shares the
         # timestamp column and styling with the stage lines that _run_entry emits.
-        logger.info("refresh %s --branch %s", entry.pipeline_id, entry.branch)
+        # The leading marker lets the highlighter accent the whole header line.
+        logger.info("%s refresh %s --branch %s", REFRESH_MARKER, entry.pipeline_id, entry.branch)
         try:
             _run_entry(entry)
         except Exception as error:  # noqa: BLE001 - refresh should continue with later stores.

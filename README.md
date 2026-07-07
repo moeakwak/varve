@@ -121,7 +121,7 @@ The core design choices are:
   - `clean [--branch NAME] [--downstream STAGE] [--out PATH] [--yes]`
 - `run`, `status`, and `clean` also accept generated flags from the pipeline's `Args` model.
 - Cache states for hits, stale records, missing artifacts, dirty attempts, resumable batches, and stages with no cache record.
-- `list`, `status`, and the `run` summary print as color-coded aligned tables, and the live run log carries timestamps with status colors. Color is dropped automatically when output is not a terminal.
+- `list`, `status`, and the `run` summary print as color-coded aligned tables, and the live run log stamps every line with its own timestamp and status colors. `refresh` prefixes each pipeline header with a `▸` accent so its stage lines read as a group. Color is dropped automatically when output is not a terminal.
 - `ctx.input(...)`, `ctx.inputs(...)`, and `ctx.resume(...)` for stage bodies.
 - `KeySpec.files` for pinning input file contents into the content key.
 
