@@ -72,7 +72,7 @@ Discovery follows only directly resolvable globals, closure cells, defaults, nes
 
 `engine.runner._probe_stage` is the shared ready-stage decision unit for execution probes and structured status. `probe_pipeline()` always walks the full topology so each displayed decision key uses the same whole-pipeline upstream projection. It computes source dependencies before checking missing upstream records, so invalid explicit `uses` remains strict while valid source dependencies remain available when key inputs are unavailable.
 
-`status.py` converts probes into immutable view models. `cli/status.py` renders the folded summary, single-stage key inputs, and progressively expanded dependency DAG; qualified names and known edge reasons are compacted only at this rendering boundary. The command is read-only: it does not execute stages, initialize the store, or persist dependency graphs. A displayed decision key is the current read-only cache decision input, not a promise that the next execution will commit the same final key after recording config access.
+`status.py` converts probes into immutable view models and compares current source components with the previous successful record for stale stages. `cli/status.py` renders the folded summary, single-stage key inputs, progressively expanded dependency DAG, and source change markers; qualified names, stored source locators, and known edge reasons are compacted only at this rendering boundary. The command is read-only: it does not execute stages, initialize the store, or persist dependency graphs. A displayed decision key is the current read-only cache decision input, not a promise that the next execution will commit the same final key after recording config access.
 
 ## Config Access Projection
 

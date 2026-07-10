@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from rich.console import Console, Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
@@ -9,7 +11,7 @@ from rich.text import Text
 from rich.tree import Tree
 
 from varve.keying.dependencies import DependencyNode, SourceDependencies
-from varve.status import PipelineStatus, StageStatus
+from varve.status import PipelineStatus, SourceChange, StageStatus
 from varve.style import format_elapsed, status_text
 
 _COMPACT_REASON_PREFIXES = (
@@ -19,6 +21,18 @@ _COMPACT_REASON_PREFIXES = (
     ("module attribute referenced by ", "module attribute"),
     ("base class of ", "base class"),
 )
+_REMOVED_PREVIEW_LIMIT = 5
+_REASON_KEYWORD_STYLES = {
+    "changed": "yellow",
+    "added": "green",
+    "removed": "red",
+    "missing": "yellow",
+    "dirty": "red",
+    "hit": "green",
+    "resume": "yellow",
+    "no cache": "yellow",
+    "forced": "yellow",
+}
 
 
 def format_needs(needs: tuple[str, ...]) -> str:
@@ -34,6 +48,20 @@ def compact_reason(reason: str) -> str:
         if reason.startswith(prefix):
             return compact
     return reason
+
+
+def reason_text(reason: str) -> Text:
+    upstream = re.match(r"upstream '([^']+)'", reason)
+    if upstream is None:
+        label = Text(reason)
+    else:
+        label = Text("upstream ")
+        label.append(upstream.group(1), style="bold")
+        label.append(reason[upstream.end() :])
+    for keyword, style in _REASON_KEYWORD_STYLES.items():
+        for match in re.finditer(rf"\b{re.escape(keyword)}\b", label.plain):
+            label.stylize(style, match.start(), match.end())
+    return label
 
 
 def relative_qualified_name(
@@ -98,7 +126,7 @@ def render_pipeline_summary(console: Console, status: PipelineStatus) -> None:
             format_elapsed(stage.duration),
             format_needs(stage.needs),
             dependency_summary,
-            stage.reason,
+            reason_text(stage.reason),
         )
     console.print(table)
     console.print()
@@ -121,23 +149,23 @@ def edge_reasons(graph: SourceDependencies, parent: str, child: str) -> tuple[st
     )
 
 
-def reachable_unique_count(
+def reachable_unique_identities(
     graph: SourceDependencies,
     roots: tuple[str, ...],
     *,
     exclude: set[str],
-) -> int:
+) -> set[str]:
     seen = set(exclude)
     stack = list(roots)
-    count = 0
+    reachable: set[str] = set()
     while stack:
         identity = stack.pop()
         if identity in seen:
             continue
         seen.add(identity)
-        count += 1
+        reachable.add(identity)
         stack.extend(child_identities(graph, identity))
-    return count
+    return reachable
 
 
 def key_inputs_table(stage: StageStatus) -> Table:
@@ -158,15 +186,65 @@ def key_inputs_table(stage: StageStatus) -> Table:
     return table
 
 
-def dependency_label(node: DependencyNode, *, qualified_name: str) -> Text:
+def append_change_badge(label: Text, change: SourceChange | None) -> None:
+    if change is not None:
+        label.append(f"  [{change}]", style=f"varve.dependency.{change}")
+
+
+def dependency_label(
+    node: DependencyNode,
+    *,
+    qualified_name: str,
+    change: SourceChange | None,
+) -> Text:
     label = Text()
     label.append(node.kind, style=f"varve.dependency.{node.kind}")
     label.append("  ")
     label.append(qualified_name, style="bold")
-    label.append(f"  [{node.origin}]", style="varve.dependency.metadata")
+    if node.origin == "explicit":
+        label.append("  [explicit]", style="varve.dependency.metadata")
     if node.scope:
         label.append(f"  [{node.scope}]", style="varve.dependency.broad")
+    append_change_badge(label, change)
     return label
+
+
+def removed_dependency_label(component: str) -> Text:
+    parts = component.split(".", 2)
+    if (
+        len(parts) != 3
+        or parts[0] not in {"auto", "uses"}
+        or parts[1] not in {"function", "class", "module", "value"}
+    ):
+        explicit_name = component.removeprefix("uses.")
+        label = Text(explicit_name if explicit_name != component else component, style="bold")
+        if explicit_name != component:
+            label.append("  [explicit]", style="varve.dependency.metadata")
+    else:
+        origin, kind, qualified_name = parts
+        label = Text(kind, style=f"varve.dependency.{kind}")
+        label.append("  ")
+        label.append(qualified_name, style="bold")
+        if origin == "uses":
+            label.append("  [explicit]", style="varve.dependency.metadata")
+    append_change_badge(label, "removed")
+    return label
+
+
+def append_folded_change_badges(
+    label: Text,
+    graph: SourceDependencies,
+    identities: set[str],
+    changes: dict[str, SourceChange],
+) -> None:
+    counts = {"changed": 0, "added": 0}
+    for identity in identities:
+        change = changes.get(graph.nodes[identity].component_name)
+        if change in counts:
+            counts[change] += 1
+    for change, count in counts.items():
+        if count:
+            label.append(f"  [{count} {change}]", style=f"varve.dependency.{change}")
 
 
 def add_dependency(
@@ -177,27 +255,34 @@ def add_dependency(
     graph: SourceDependencies,
     depth: int | None,
     shown: set[str],
+    changes: dict[str, SourceChange],
 ) -> None:
     node = graph.nodes[identity]
+    change = changes.get(node.component_name)
     display_name = relative_qualified_name(
         graph,
         parent=parent,
         child=identity,
     )
     if identity in shown:
-        reference = tree.add(Text(f"↳ {display_name} already shown", style="dim"))
+        reference_label = Text(f"↳ {display_name} already shown", style="dim")
+        append_change_badge(reference_label, change)
+        reference = tree.add(reference_label)
         for reason in edge_reasons(graph, parent, identity):
             reference.add(Text(compact_reason(reason), style="dim"))
         return
     shown.add(identity)
-    branch = tree.add(dependency_label(node, qualified_name=display_name))
+    branch = tree.add(dependency_label(node, qualified_name=display_name, change=change))
     for reason in edge_reasons(graph, parent, identity):
         branch.add(Text(compact_reason(reason), style="dim"))
     children = child_identities(graph, identity)
     if children and depth == 0:
-        hidden = reachable_unique_count(graph, children, exclude=shown)
+        hidden_identities = reachable_unique_identities(graph, children, exclude=shown)
+        hidden = len(hidden_identities)
         if hidden:
-            branch.add(Text(f"… {hidden} transitive dependencies folded", style="dim italic"))
+            folded_label = Text(f"… {hidden} transitive dependencies folded", style="dim italic")
+            append_folded_change_badges(folded_label, graph, hidden_identities, changes)
+            branch.add(folded_label)
             return
         for child in children:
             add_dependency(
@@ -207,6 +292,7 @@ def add_dependency(
                 graph=graph,
                 depth=depth,
                 shown=shown,
+                changes=changes,
             )
         return
     next_depth = None if depth is None else depth - 1
@@ -218,6 +304,7 @@ def add_dependency(
             graph=graph,
             depth=next_depth,
             shown=shown,
+            changes=changes,
         )
 
 
@@ -237,7 +324,7 @@ def render_stage_status(
     overview = Table(box=None, show_header=False, padding=(0, 2))
     overview.add_column(style="dim", no_wrap=True)
     overview.add_column(overflow="fold")
-    overview.add_row("Reason", stage.reason)
+    overview.add_row("Reason", reason_text(stage.reason))
     overview.add_row("Needs", ", ".join(stage.needs) if stage.needs else "-")
     if show_keys:
         overview.add_row("Decision key", stage.decision_key or "unavailable")
@@ -256,14 +343,14 @@ def render_stage_status(
         content.extend([Text(), Text("Key inputs", style="bold"), key_inputs_table(stage)])
     console.print(Panel(Group(*content), border_style="dim"))
 
-    root = Tree(
-        Text.assemble(
-            ("stage  ", "varve.dependency.stage"),
-            (stage.name, "bold"),
-            (f"  [{stage.direct_count} direct · {stage.total_count} total]", "dim"),
-        ),
-        guide_style="dim",
+    root_label = Text.assemble(
+        ("stage  ", "varve.dependency.stage"),
+        (stage.name, "bold"),
+        (f"  [{stage.direct_count} direct · {stage.total_count} total]", "dim"),
     )
+    changes = stage.source_changes if show_keys else {}
+    append_change_badge(root_label, changes.get("stage"))
+    root = Tree(root_label, guide_style="dim")
     shown: set[str] = set()
     for identity in stage.source_dependencies.direct:
         add_dependency(
@@ -273,6 +360,7 @@ def render_stage_status(
             graph=stage.source_dependencies,
             depth=depth,
             shown=shown,
+            changes=changes,
         )
     title = (
         "Source dependencies · full tree"
@@ -281,7 +369,27 @@ def render_stage_status(
         if depth == 1
         else "Source dependencies · folded"
     )
-    console.print(Panel(root, title=title, title_align="left", border_style="dim"))
+    removed = sorted(
+        component
+        for component, change in changes.items()
+        if change == "removed" and component != "stage"
+    )
+    dependency_content: RenderableType = root
+    if removed:
+        removed_tree = Tree(Text("Removed source dependencies", style="bold"))
+        visible_removed = removed if depth is None else removed[:_REMOVED_PREVIEW_LIMIT]
+        for component in visible_removed:
+            removed_tree.add(removed_dependency_label(component))
+        hidden_removed = len(removed) - len(visible_removed)
+        if hidden_removed:
+            removed_tree.add(
+                Text(
+                    f"… {hidden_removed} more removed dependencies; run with --all",
+                    style="dim italic",
+                )
+            )
+        dependency_content = Group(root, Text(), removed_tree)
+    console.print(Panel(dependency_content, title=title, title_align="left", border_style="dim"))
     if depth == 0:
         console.print(
             "[dim]Run with[/] [bold]--expand[/] [dim]to show one dependency level, "

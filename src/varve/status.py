@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from varve.engine.runner import probe_pipeline
 from varve.engine.state import Status
 from varve.keying.dependencies import SourceDependencies
 from varve.models import FileFingerprint
 from varve.pipeline import Pipeline
+
+SourceChange = Literal["changed", "added", "removed"]
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,7 @@ class StageStatus:
     stored_key: str | None
     key_inputs: KeyInputs | None
     source_dependencies: SourceDependencies
+    source_changes: dict[str, SourceChange]
     unavailable_reason: str | None
 
     @property
@@ -75,6 +79,21 @@ def reachable_identities(source: SourceDependencies) -> frozenset[str]:
     return frozenset(seen)
 
 
+def source_component_changes(
+    old: Mapping[str, str],
+    new: Mapping[str, str],
+) -> dict[str, SourceChange]:
+    changes: dict[str, SourceChange] = {}
+    for name in sorted(set(old) | set(new)):
+        if name not in old:
+            changes[name] = "added"
+        elif name not in new:
+            changes[name] = "removed"
+        elif old[name] != new[name]:
+            changes[name] = "changed"
+    return changes
+
+
 def collect_pipeline_status(
     pipeline: type[Pipeline],
     config: Any,
@@ -107,6 +126,11 @@ def collect_pipeline_status(
             )
         )
         previous = probe.previous
+        source_changes = (
+            source_component_changes(previous.key_components.source, components.source)
+            if probe.decision.status == "stale" and previous is not None and components is not None
+            else {}
+        )
         stages.append(
             StageStatus(
                 name=probe.stage,
@@ -123,6 +147,7 @@ def collect_pipeline_status(
                 stored_key=previous.content_key if previous is not None else None,
                 key_inputs=key_inputs,
                 source_dependencies=probe.source_dependencies,
+                source_changes=source_changes,
                 unavailable_reason=probe.unavailable_reason,
             )
         )

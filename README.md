@@ -143,7 +143,7 @@ Automatic discovery follows references that can be resolved directly from Python
 
 Discovery is always non-blocking and never claims to find a complete call graph. Dynamic calls, registries, `getattr`, factories, parameter type propagation, runtime dispatch, and sibling Pipeline methods reached through `self` are not inferred. Use `uses` or `KeySpec` whenever those inputs need a strict cache guarantee. Stage source, explicit `uses`, and explicit `KeySpec` inputs remain strict even when automatic discovery is enabled.
 
-Use `status` to inspect cache state and the source dependencies included in each decision key. The default all-stage summary folds source dependencies, limits long NEEDS lists, and shows DURATION from the most recent successful stage execution for usable cache states. A single stage shows folded dependencies, `--expand` adds one level, and `--all` renders the complete discovered DAG; expanded views also show the decision and stored keys.
+Use `status` to inspect cache state and the source dependencies included in each decision key. The default all-stage summary folds source dependencies, limits long NEEDS lists, and shows DURATION from the most recent successful stage execution for usable cache states. A single stage shows folded dependencies, `--expand` adds one level, and `--all` renders the complete discovered DAG; expanded views also show the decision and stored keys. For stale stages, expanded views mark changed and added source dependencies inline and list dependencies removed since the stored run. Automatically inferred dependencies are left unmarked, while dependencies declared through `uses` retain an `[explicit]` label.
 
 ```bash
 python demo.py status

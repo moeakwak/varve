@@ -35,6 +35,9 @@ def test_dependency_styles_are_available_from_shared_theme() -> None:
         "value": "green",
         "broad": "yellow",
         "metadata": "dim",
+        "changed": "yellow",
+        "added": "green",
+        "removed": "red",
     }
     assert style.DEPENDENCY_STYLES == expected
     for kind in expected:

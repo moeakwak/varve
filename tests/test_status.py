@@ -11,15 +11,16 @@ from pydantic import BaseModel
 from rich.console import Console
 
 from varve import Pipeline, stage
-from varve.cli.status import render_status
+from varve.cli.status import reason_text, render_status
 from varve.engine.runner import run
 from varve.keying.dependencies import (
     DependencyEdge,
     DependencyKind,
     DependencyNode,
+    DependencyOrigin,
     SourceDependencies,
 )
-from varve.status import PipelineStatus, collect_pipeline_status
+from varve.status import PipelineStatus, collect_pipeline_status, source_component_changes
 from varve.store.store import Store
 
 
@@ -86,6 +87,7 @@ def test_collect_status_reads_previous_record(tmp_path: Path) -> None:
     assert stage_status.decision_key is not None
     assert stage_status.stored_key is not None
     assert stage_status.duration == 1.25
+    assert stage_status.source_changes == {}
 
 
 def test_collect_status_hides_duration_for_no_cache_with_previous(
@@ -107,6 +109,18 @@ def test_collect_status_hides_duration_for_no_cache_with_previous(
     assert downstream.status == "no-cache"
     assert downstream.stored_key is not None
     assert downstream.duration is None
+    assert downstream.source_changes == {}
+
+
+def test_source_component_changes_classifies_changed_added_and_removed() -> None:
+    assert source_component_changes(
+        {"stage": "old", "auto.function.old": "same", "auto.module.removed": "old"},
+        {"stage": "new", "auto.function.old": "same", "auto.value.added": "new"},
+    ) == {
+        "auto.module.removed": "removed",
+        "auto.value.added": "added",
+        "stage": "changed",
+    }
 
 
 def test_collect_status_marks_inputs_unavailable_after_missing_upstream(
@@ -178,12 +192,27 @@ def render_to_text(
     return buffer.getvalue()
 
 
+def test_reason_highlights_upstream_stage_and_change_keyword() -> None:
+    reason = reason_text("upstream 'extract' changed (+ source)")
+    spans = {reason.plain[span.start : span.end]: span.style for span in reason.spans}
+
+    assert reason.plain == "upstream extract changed (+ source)"
+    assert spans["extract"] == "bold"
+    assert spans["changed"] == "yellow"
+
+    source_reason = reason_text("source changed")
+    source_spans = {
+        source_reason.plain[span.start : span.end]: span.style for span in source_reason.spans
+    }
+    assert source_spans["changed"] == "yellow"
+
+
 def _dependency_node(
     identity: str,
     kind: DependencyKind,
     qualified_name: str,
     *,
-    origin: str = "inferred",
+    origin: DependencyOrigin = "inferred",
 ) -> DependencyNode:
     return DependencyNode(
         identity=identity,
@@ -212,16 +241,24 @@ def dependency_tree_status(pipeline_status: PipelineStatus) -> PipelineStatus:
         "class:pixel_cache",
         "class",
         "studies.shared.render.pixel_verdict_cache.PixelVerdictCache",
+        origin="explicit",
     )
     equal_name = _dependency_node(
         "value:equal_pixel_cache",
         "value",
         cross_module.qualified_name,
-        origin="explicit",
+    )
+    deep = _dependency_node(
+        "function:deep_helper",
+        "function",
+        "studies.shared.render.render_compare._deep_helper",
     )
     source = SourceDependencies(
-        components={},
-        nodes={node.identity: node for node in (root, same_module, cross_module, equal_name)},
+        components={
+            node.component_name: node.digest
+            for node in (root, same_module, cross_module, equal_name, deep)
+        },
+        nodes={node.identity: node for node in (root, same_module, cross_module, equal_name, deep)},
         edges=(
             DependencyEdge("stage", root.identity, "global referenced by test.Pipeline.sample"),
             DependencyEdge("stage", cross_module.identity, "declared by uses"),
@@ -237,6 +274,7 @@ def dependency_tree_status(pipeline_status: PipelineStatus) -> PipelineStatus:
                 cross_module.identity,
                 f"global referenced by {same_module.qualified_name}",
             ),
+            DependencyEdge(same_module.identity, deep.identity, "custom deep reason"),
             DependencyEdge(
                 equal_name.identity,
                 cross_module.identity,
@@ -251,6 +289,33 @@ def dependency_tree_status(pipeline_status: PipelineStatus) -> PipelineStatus:
         source_dependencies=source,
     )
     return replace(pipeline_status, stages=(stage,))
+
+
+def dependency_tree_status_with_changes(pipeline_status: PipelineStatus) -> PipelineStatus:
+    status = dependency_tree_status(pipeline_status)
+    stage = status.stages[0]
+    graph = stage.source_dependencies
+    return replace(
+        status,
+        stages=(
+            replace(
+                stage,
+                status="stale",
+                reason="source changed",
+                source_changes={
+                    "stage": "changed",
+                    graph.nodes["function:render_compare_pairs"].component_name: "added",
+                    graph.nodes["class:pixel_cache"].component_name: "changed",
+                    graph.nodes["function:deep_helper"].component_name: "changed",
+                    "uses.function.studies.shared.render.old_renderer": "removed",
+                    **{
+                        f"uses.studies.shared.render.legacy_{index}": "removed"
+                        for index in range(6)
+                    },
+                },
+            ),
+        ),
+    )
 
 
 def test_summary_shows_duration_folds_needs_and_omits_key(pipeline_status) -> None:
@@ -323,7 +388,7 @@ def test_stage_depth_controls_keys_and_dependencies(pipeline_status) -> None:
     repeated = full.index("↳ shared_helper already shown")
     direct_reason = full.index("global reference", repeated)
     assert repeated < direct_reason
-    assert "[inferred]" in full
+    assert "[inferred]" not in full
 
 
 def test_expanded_stage_preserves_complete_keys_on_narrow_terminals(
@@ -352,7 +417,7 @@ def test_full_tree_uses_parent_relative_names_and_compact_reasons(
     pipeline_status,
 ) -> None:
     output = render_to_text(
-        dependency_tree_status(pipeline_status),
+        dependency_tree_status_with_changes(pipeline_status),
         stage="sample",
         depth=None,
     )
@@ -367,6 +432,24 @@ def test_full_tree_uses_parent_relative_names_and_compact_reasons(
     )
     assert "custom test reason" in output
     assert "↳ studies.shared.render.pixel_verdict_cache.PixelVerdictCache already shown" in output
+    assert "stage  sample  [3 direct · 5 total]  [changed]" in output
+    assert "render_compare_pairs  [added]" in output
+    assert "pixel_verdict_cache.PixelVerdictCache  [explicit]  [changed]" in output
+    assert "Removed source dependencies" in output
+    assert "studies.shared.render.old_renderer  [explicit]  [removed]" in output
+    assert "studies.shared.render.legacy_0  [explicit]  [removed]" in output
+    assert "[inferred]" not in output
+
+
+def test_expanded_tree_counts_changed_folded_dependencies(pipeline_status) -> None:
+    output = render_to_text(
+        dependency_tree_status_with_changes(pipeline_status),
+        stage="sample",
+        depth=1,
+    )
+
+    assert "… 1 transitive dependencies folded  [1 changed]" in output
+    assert "… 2 more removed dependencies; run with --all" in output
 
 
 def test_stage_with_missing_upstream_explains_unavailable_inputs(tmp_path: Path) -> None:

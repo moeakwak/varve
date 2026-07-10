@@ -34,6 +34,11 @@ class DependencyNode:
     source_path: str | None
     source_line: int | None
 
+    @property
+    def component_name(self) -> str:
+        prefix = "uses" if self.origin == "explicit" else "auto"
+        return f"{prefix}.{self.kind}.{self.qualified_name}"
+
 
 @dataclass(frozen=True)
 class DependencyEdge:

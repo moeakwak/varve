@@ -46,6 +46,9 @@ DEPENDENCY_STYLES = {
     "value": "green",
     "broad": "yellow",
     "metadata": "dim",
+    "changed": "yellow",
+    "added": "green",
+    "removed": "red",
 }
 
 
