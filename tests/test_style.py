@@ -20,6 +20,21 @@ def test_status_text_unknown_status_is_unstyled() -> None:
     assert status_text("mystery").style == ""
 
 
+def test_dependency_styles_are_available_from_shared_theme() -> None:
+    expected = {
+        "stage": "bold cyan",
+        "function": "cyan",
+        "class": "magenta",
+        "module": "blue",
+        "value": "green",
+        "broad": "yellow",
+        "metadata": "dim",
+    }
+    assert style.DEPENDENCY_STYLES == expected
+    for kind in expected:
+        assert style._THEME.styles[f"varve.dependency.{kind}"]
+
+
 def test_highlighter_maps_tokens_to_theme_styles() -> None:
     highlighter = VarveStatusHighlighter()
     text = Text("run done no-cache artifact-missing")

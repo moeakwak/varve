@@ -16,7 +16,13 @@ from varve.context import Ctx
 from varve.decorators import ProducesItem, ProducesSpec
 from varve.engine.state import Decision, Status, decide_batch, decide_single
 from varve.keying.config_access import ConfigAccess, RecordingConfig, project_config
-from varve.keying.keys import compute_key_components, config_data, content_key
+from varve.keying.dependencies import SourceDependencies
+from varve.keying.keys import (
+    compute_key_components,
+    compute_source_dependencies,
+    config_data,
+    content_key,
+)
 from varve.models import (
     AttemptMarker,
     BatchRecord,
@@ -36,6 +42,17 @@ class StageOutcome:
     status: Status
     reason: str
     elapsed: float | None
+
+
+@dataclass(frozen=True)
+class StageProbe:
+    stage: str
+    decision: Decision
+    decision_key: str | None
+    components: KeyComponents | None
+    previous: SuccessRecord | None
+    source_dependencies: SourceDependencies
+    unavailable_reason: str | None = None
 
 
 def _now() -> str:
@@ -279,6 +296,122 @@ def _commit_components(
     )
 
 
+def _probe_stage(
+    pipeline_type: type[Pipeline],
+    stage_name: str,
+    *,
+    config: Any,
+    args: Any,
+    out: Path,
+    store: Store,
+    known_content_keys: dict[str, str],
+    source_dependencies: SourceDependencies,
+) -> StageProbe:
+    stage_spec = pipeline_type.stages()[stage_name]
+    previous = store.read_success(stage_name)
+    upstream_keys = _upstream_keys(stage_spec, store, known_content_keys)
+    cached_files = previous.key_components.files if previous is not None else None
+    previous_access = previous.key_components.config_access if previous is not None else None
+    ctx_for_key = Ctx(
+        config=config,
+        args=args,
+        out=out,
+        store=store,
+        stage_name=stage_name,
+        declared_needs=frozenset(stage_spec.needs),
+    )
+    components = compute_key_components(
+        stage_spec,
+        ctx_for_key,
+        upstream_keys,
+        cached_files,
+        config_access=previous_access,
+        auto_uses_packages=pipeline_type.auto_uses_packages,
+        source_dependencies=source_dependencies,
+    )
+    decision_key = content_key(components)
+    attempt = store.read_attempt(stage_name)
+    if stage_spec.kind == "single":
+        produces = previous.produces if previous is not None else []
+        assert produces is not None
+        decision = decide_single(
+            current_key=decision_key,
+            current_components=components,
+            success=previous,
+            attempt=attempt,
+            produces_exist=all((out / item.path).exists() for item in produces),
+        )
+    else:
+        partial = store.read_partial(stage_name, decision_key)
+        decision = decide_batch(
+            current_key=decision_key,
+            current_components=components,
+            success=previous,
+            partial=partial,
+            attempt=None if previous is None and partial is not None else attempt,
+            output_exists=lambda path: (out / path).exists(),
+        )
+    return StageProbe(
+        stage=stage_name,
+        decision=decision,
+        decision_key=decision_key,
+        components=components,
+        previous=previous,
+        source_dependencies=source_dependencies,
+    )
+
+
+def probe_pipeline(
+    pipeline_type: type[Pipeline],
+    config: Any,
+    *,
+    args: Any,
+    out: Path,
+) -> tuple[StageProbe, ...]:
+    """Probe every stage in topology order without executing or writing state."""
+
+    store = Store(out)
+    known_content_keys: dict[str, str] = {}
+    probes: list[StageProbe] = []
+    for stage_name in pipeline_type.topo_order():
+        stage_spec = pipeline_type.stages()[stage_name]
+        source_dependencies = compute_source_dependencies(
+            stage_spec,
+            auto_uses_packages=pipeline_type.auto_uses_packages,
+        )
+        missing_upstream = next(
+            (name for name in stage_spec.needs if store.read_success(name) is None),
+            None,
+        )
+        if missing_upstream is not None:
+            probes.append(
+                StageProbe(
+                    stage=stage_name,
+                    decision=Decision("no-cache", "no cache"),
+                    decision_key=None,
+                    components=None,
+                    previous=store.read_success(stage_name),
+                    source_dependencies=source_dependencies,
+                    unavailable_reason=f"upstream {missing_upstream} has no success record",
+                )
+            )
+            continue
+        probe = _probe_stage(
+            pipeline_type,
+            stage_name,
+            config=config,
+            args=args,
+            out=out,
+            store=store,
+            known_content_keys=known_content_keys,
+            source_dependencies=source_dependencies,
+        )
+        probes.append(probe)
+        assert probe.decision_key is not None
+        known_content_keys[stage_name] = probe.decision_key
+    return tuple(probes)
+
+
 async def _execute_stage(instance, stage_spec, ctx: Ctx) -> None:
     result = stage_spec.func(instance, ctx)
     if inspect.isawaitable(result):
@@ -333,11 +466,42 @@ async def _drive(
             if missing_upstream:
                 outcomes.append(StageOutcome(stage_name, "no-cache", "no cache", None))
                 continue
-        upstream_keys = _upstream_keys(
+            source_dependencies = compute_source_dependencies(
+                stage_spec,
+                auto_uses_packages=pipeline_type.auto_uses_packages,
+            )
+            probe = _probe_stage(
+                pipeline_type,
+                stage_name,
+                config=config,
+                args=args,
+                out=out,
+                store=store,
+                known_content_keys=known_content_keys,
+                source_dependencies=source_dependencies,
+            )
+            assert probe.decision_key is not None
+            known_content_keys[stage_name] = probe.decision_key
+            logger.info(
+                "[%s] %s%s",
+                stage_name,
+                probe.decision.status,
+                (
+                    f" · {probe.decision.reason}"
+                    if probe.decision.reason != probe.decision.status
+                    else ""
+                ),
+            )
+            logger.debug("[%s] content_key %s", stage_name, probe.decision_key)
+            outcomes.append(
+                StageOutcome(stage_name, probe.decision.status, probe.decision.reason, None)
+            )
+            continue
+        source_dependencies = compute_source_dependencies(
             stage_spec,
-            store,
-            known_content_keys if not execute else None,
+            auto_uses_packages=pipeline_type.auto_uses_packages,
         )
+        upstream_keys = _upstream_keys(stage_spec, store)
         previous = store.read_success(stage_name)
         cached_files = previous.key_components.files if previous is not None else None
         previous_access = previous.key_components.config_access if previous is not None else None
@@ -359,9 +523,10 @@ async def _drive(
             upstream_keys,
             cached_files,
             config_access=previous_access,
+            auto_uses_packages=pipeline_type.auto_uses_packages,
+            source_dependencies=source_dependencies,
         )
         current_key = content_key(components)
-        known_content_keys[stage_name] = current_key
         attempt = store.read_attempt(stage_name)
 
         if stage_spec.kind == "single":
@@ -399,7 +564,7 @@ async def _drive(
                 previous=previous,
                 components=components,
             )
-        if not execute or decision.status == "hit":
+        if decision.status == "hit":
             logger.info(
                 "[%s] %s%s",
                 stage_name,

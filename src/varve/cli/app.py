@@ -14,12 +14,14 @@ from rich.table import Table
 from varve.branch_config import resolve_branch
 from varve.cli import argmap
 from varve.cli.clean import clean
+from varve.cli.details import render_details
+from varve.details import collect_pipeline_details
 from varve.engine.runner import StageOutcome, evaluate_state, run, selected_stages
 from varve.log import configure_cli_logging
 from varve.pipeline import Pipeline
 from varve.style import make_console, status_text
 
-_CONFIG_COMMANDS = {"run", "status", "clean"}
+_CONFIG_COMMANDS = {"run", "status", "details", "clean"}
 _NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
 _COMMAND_OPTION_ARITIES = {
     "run": {
@@ -32,6 +34,12 @@ _COMMAND_OPTION_ARITIES = {
         "--out": 1,
     },
     "status": {"--branch": 1, "--upto": 1, "--downstream": 1, "--out": 1},
+    "details": {
+        "--branch": 1,
+        "--out": 1,
+        "--expand": 0,
+        "--all": 0,
+    },
     "clean": {
         "--branch": 1,
         "--downstream": 1,
@@ -224,6 +232,14 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     )
     status_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
 
+    details_parser = subparsers.add_parser("details", help="show stage key details")
+    details_parser.add_argument("stage", nargs="?", choices=pipeline.topo_order())
+    details_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
+    details_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
+    details_depth = details_parser.add_mutually_exclusive_group()
+    details_depth.add_argument("--expand", action="store_true", help="Show one dependency level.")
+    details_depth.add_argument("--all", action="store_true", help="Show the full dependency tree.")
+
     clean_parser = subparsers.add_parser("clean", help="delete selected store records and outputs")
     clean_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
     clean_parser.add_argument(
@@ -256,6 +272,8 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         argmap.register_args(run_parser, pipeline.Args)
     if selected_command == "status":
         argmap.register_args(status_parser, pipeline.Args)
+    if selected_command == "details":
+        argmap.register_args(details_parser, pipeline.Args)
     if selected_command == "clean":
         argmap.register_args(clean_parser, pipeline.Args)
 
@@ -289,6 +307,22 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             branch=resolved.branch,
             is_temporary=resolved.is_temporary,
         )
+    elif namespace.command == "details":
+        details = collect_pipeline_details(
+            pipeline,
+            config,
+            args=args,
+            out=pipeline.output_root(
+                config,
+                cli_out=resolved.output_base,
+                branch=resolved.branch,
+                is_temporary=resolved.is_temporary,
+            ),
+            branch=resolved.branch,
+            stage=namespace.stage,
+        )
+        depth = None if namespace.all else 1 if namespace.expand else 0
+        render_details(make_console(), details, stage=namespace.stage, depth=depth)
     elif namespace.command == "clean":
         allowed_roots = (
             None if isinstance(config, SimpleNamespace) else pipeline.clean_roots(config)

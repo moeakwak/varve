@@ -7,6 +7,8 @@ import hashlib
 import inspect
 import textwrap
 from collections.abc import Callable
+from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 
@@ -74,3 +76,13 @@ def source_hash(func: Callable[..., Any]) -> str:
         source,
         strip_varve_decorators=hasattr(func, "__varve_stage__"),
     )
+
+
+def module_source_hash(module: ModuleType) -> str:
+    """Return a stable hash of one module source file."""
+
+    source_path = inspect.getsourcefile(module)
+    if source_path is None:
+        raise ValueError(f"Cannot locate source for module {module.__name__}")
+    source = Path(source_path).read_text(encoding="utf-8")
+    return _normalized_source_hash(source)

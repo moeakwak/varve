@@ -26,7 +26,7 @@ class StageSpec:
     produces: ProducesSpec
     keyspec: KeySpec
     auto_uses: bool = True
-    additional_uses: tuple[Callable[..., Any], ...] = ()
+    uses: tuple[Callable[..., Any], ...] = ()
 
 
 def _need_name(need: NeedItem) -> str:
@@ -56,7 +56,7 @@ def stage(
     produces: ProducesSpec = None,
     key: KeySpec | None = None,
     auto_uses: bool = True,
-    additional_uses: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
+    uses: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Declare a single-run stage.
 
@@ -73,7 +73,7 @@ def stage(
             produces=produces,
             keyspec=key if key is not None else KeySpec(),
             auto_uses=auto_uses,
-            additional_uses=tuple(additional_uses),
+            uses=tuple(uses),
         )
         return _attach_stage_spec(func, spec)
 
@@ -86,7 +86,7 @@ def batch_stage(
     produces: ProducesSpec = None,
     key: KeySpec | None = None,
     auto_uses: bool = True,
-    additional_uses: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
+    uses: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Declare an async-generator batch stage.
 
@@ -109,7 +109,7 @@ def batch_stage(
             produces=produces,
             keyspec=key if key is not None else KeySpec(),
             auto_uses=auto_uses,
-            additional_uses=tuple(additional_uses),
+            uses=tuple(uses),
         )
         return _attach_stage_spec(func, spec)
 

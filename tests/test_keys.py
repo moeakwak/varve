@@ -18,6 +18,7 @@ from varve.models import (
     ProducedPath,
     SuccessRecord,
 )
+from varve.pipeline import Pipeline
 
 
 class Config(BaseModel):
@@ -34,6 +35,9 @@ def helper(value: str) -> str:
     return value.upper()
 
 
+AUTO_VALUE = {"mode": "strict"}
+
+
 @stage()
 def transform(self, ctx):  # pragma: no cover - inspected only
     return helper(ctx.config.profile)
@@ -48,6 +52,11 @@ def transform_without_auto_uses(self, ctx):  # pragma: no cover - inspected only
     return missing_helper(ctx.config.profile)
 
 
+@stage()
+def transform_with_auto_value(self, ctx):  # pragma: no cover - inspected only
+    return ctx.config.profile, AUTO_VALUE
+
+
 def _stage_spec() -> StageSpec:
     return transform.__varve_stage__
 
@@ -59,6 +68,36 @@ def _load_module(path: Path, module_name: str) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_stage_captures_explicit_uses() -> None:
+    @stage(uses=[helper])
+    def sample(self, ctx):  # pragma: no cover - inspected only
+        return helper(ctx.config.profile)
+
+    assert sample.__varve_stage__.uses == (helper,)
+
+
+def test_stage_rejects_removed_explicit_uses_name() -> None:
+    removed_name = "additional" + "_uses"
+    with pytest.raises(TypeError, match=removed_name):
+        stage(**{removed_name: [helper]})  # type: ignore[arg-type]
+
+
+def test_pipeline_auto_uses_packages_defaults_to_none() -> None:
+    assert Pipeline.auto_uses_packages is None
+
+
+def test_pipeline_can_disable_package_recursion() -> None:
+    class Demo(Pipeline):
+        Config = Config
+        auto_uses_packages = ()
+
+        @stage()
+        def sample(self, ctx):  # pragma: no cover - inspected only
+            return ctx.config.profile
+
+    assert Demo.auto_uses_packages == ()
 
 
 def test_content_key_changes_when_config_changes(tmp_path: Path) -> None:
@@ -106,7 +145,7 @@ def test_content_key_changes_when_value_changes(tmp_path: Path) -> None:
         produces=base.produces,
         keyspec=KeySpec(values={"logic": value_one}),
         auto_uses=base.auto_uses,
-        additional_uses=base.additional_uses,
+        uses=base.uses,
     )
     two = StageSpec(
         name=base.name,
@@ -116,7 +155,7 @@ def test_content_key_changes_when_value_changes(tmp_path: Path) -> None:
         produces=base.produces,
         keyspec=KeySpec(values={"logic": value_two}),
         auto_uses=base.auto_uses,
-        additional_uses=base.additional_uses,
+        uses=base.uses,
     )
     ctx = Ctx(Config(profile="a"))
     assert content_key(compute_key_components(one, ctx, {})) != content_key(
@@ -136,7 +175,7 @@ def test_content_key_files_use_sha_not_mtime(tmp_path: Path) -> None:
         produces=None,
         keyspec=KeySpec(files={"data": lambda _ctx: data}),
         auto_uses=False,
-        additional_uses=(helper,),
+        uses=(helper,),
     )
     ctx = Ctx(Config(profile="a"))
     first = compute_key_components(spec, ctx, {})
@@ -148,7 +187,7 @@ def test_content_key_files_use_sha_not_mtime(tmp_path: Path) -> None:
     assert second.files["data"][0].mtime != first.files["data"][0].mtime
 
 
-def test_additional_uses_helpers_with_same_qualname_do_not_overwrite_each_other(
+def test_uses_helpers_with_same_qualname_do_not_overwrite_each_other(
     tmp_path: Path,
 ) -> None:
     first_module_path = tmp_path / "uses_first.py"
@@ -179,13 +218,13 @@ def helper(value):
         produces=base.produces,
         keyspec=base.keyspec,
         auto_uses=False,
-        additional_uses=(helper, first_module.helper, second_module.helper),
+        uses=(helper, first_module.helper, second_module.helper),
     )
     components = compute_key_components(spec, Ctx(Config(profile="a")), {})
 
-    assert "uses.uses_first.helper" in components.source
-    assert "uses.uses_second.helper" in components.source
-    assert len([key for key in components.source if key.startswith("uses.")]) == 3
+    assert "uses.function.uses_first.helper" in components.source
+    assert "uses.function.uses_second.helper" in components.source
+    assert len([key for key in components.source if key.startswith("uses.function.")]) == 3
 
 
 def test_main_module_uses_stable_spec_name_for_helper_labels(
@@ -208,15 +247,15 @@ def test_main_module_uses_stable_spec_name_for_helper_labels(
             produces=base.produces,
             keyspec=base.keyspec,
             auto_uses=False,
-            additional_uses=(helper,),
+            uses=(helper,),
         )
 
         components = compute_key_components(spec, Ctx(Config(profile="a")), {})
     finally:
         helper.__module__ = original_module
 
-    assert "uses.pkg.demo.__main__.helper" in components.source
-    assert "uses.__main__.helper" not in components.source
+    assert "uses.function.pkg.demo.__main__.helper" in components.source
+    assert "uses.function.__main__.helper" not in components.source
 
 
 def test_main_module_helpers_are_auto_detected(
@@ -237,8 +276,8 @@ def test_main_module_helpers_are_auto_detected(
         transform.__module__ = original_transform_module
         helper.__module__ = original_helper_module
 
-    assert "uses.pkg.demo.__main__.helper" in components.source
-    assert "uses.__main__.helper" not in components.source
+    assert "auto.function.pkg.demo.__main__.helper" in components.source
+    assert "auto.function.__main__.helper" not in components.source
 
 
 def test_content_key_changes_when_upstream_changes(tmp_path: Path) -> None:
@@ -251,7 +290,7 @@ def test_content_key_changes_when_upstream_changes(tmp_path: Path) -> None:
         produces=base.produces,
         keyspec=base.keyspec,
         auto_uses=base.auto_uses,
-        additional_uses=base.additional_uses,
+        uses=base.uses,
     )
     ctx = Ctx(Config(profile="a"))
     one = compute_key_components(spec, ctx, {"sample": "sha256:one"})
@@ -305,7 +344,7 @@ def test_config_path_values_inside_mapping_keys_are_rejected(tmp_path: Path) -> 
 def test_auto_uses_registers_same_module_helper() -> None:
     components = compute_key_components(_stage_spec(), Ctx(Config(profile="a")), {})
 
-    assert "uses.test_keys.helper" in components.source
+    assert "auto.function.test_keys.helper" in components.source
 
 
 def test_auto_uses_registers_imported_project_helpers(
@@ -344,17 +383,48 @@ def sample(self, ctx):
         {},
     )
 
-    assert "uses.demo_pkg.helpers.exported" in components.source
-    assert "uses.demo_pkg.helpers.nested" in components.source
+    assert "auto.function.demo_pkg.helpers.exported" in components.source
+    assert "auto.function.demo_pkg.helpers.nested" in components.source
 
 
-def test_missing_same_module_helper_is_rejected_when_auto_uses_is_disabled() -> None:
-    with pytest.raises(ValueError, match="missing_helper"):
-        compute_key_components(
-            transform_without_auto_uses.__varve_stage__,
-            Ctx(Config(profile="a")),
-            {},
-        )
+def test_auto_uses_disabled_does_not_reject_unlisted_helper() -> None:
+    components = compute_key_components(
+        transform_without_auto_uses.__varve_stage__,
+        Ctx(Config(profile="a")),
+        {},
+    )
+    assert set(components.source) == {"stage"}
+
+
+def test_explicit_uses_use_distinct_namespace() -> None:
+    base = _stage_spec()
+    spec = StageSpec(
+        name=base.name,
+        kind=base.kind,
+        func=base.func,
+        needs=base.needs,
+        produces=base.produces,
+        keyspec=base.keyspec,
+        auto_uses=False,
+        uses=(helper,),
+    )
+    components = compute_key_components(spec, Ctx(Config(profile="a")), {})
+    assert "uses.function.test_keys.helper" in components.source
+
+
+def test_auto_value_changes_source_key_not_explicit_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = transform_with_auto_value.__varve_stage__
+    first = compute_key_components(spec, Ctx(Config(profile="a")), {})
+    monkeypatch.setitem(transform_with_auto_value.__globals__, "AUTO_VALUE", {"mode": "loose"})
+    second = compute_key_components(spec, Ctx(Config(profile="a")), {})
+
+    locator = "auto.value.test_keys.transform_with_auto_value.global.AUTO_VALUE"
+    assert locator in first.source
+    assert first.source[locator] != second.source[locator]
+    assert first.values == second.values == {}
+    assert content_key(first) != content_key(second)
 
 
 def test_success_record_enforces_kind_specific_output_shape() -> None:

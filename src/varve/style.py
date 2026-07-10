@@ -38,6 +38,16 @@ STAGE_STYLE = "bold"
 REFRESH_MARKER = "▸"
 REFRESH_STYLE = "bold cyan"
 
+DEPENDENCY_STYLES = {
+    "stage": "bold cyan",
+    "function": "cyan",
+    "class": "magenta",
+    "module": "blue",
+    "value": "green",
+    "broad": "yellow",
+    "metadata": "dim",
+}
+
 
 def _theme_key(status: str) -> str:
     # Theme style names and regex group names must be valid identifiers.
@@ -46,6 +56,7 @@ def _theme_key(status: str) -> str:
 
 _THEME = Theme(
     {f"varve.{_theme_key(status)}": style for status, style in STATUS_STYLES.items()}
+    | {f"varve.dependency.{kind}": style for kind, style in DEPENDENCY_STYLES.items()}
     | {"varve.stage": STAGE_STYLE, "varve.refresh": REFRESH_STYLE}
 )
 

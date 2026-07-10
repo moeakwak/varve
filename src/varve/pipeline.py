@@ -29,6 +29,7 @@ class Pipeline:
 
     Args: ClassVar[type[Any]] = _EmptyArgs
     Config: ClassVar[type[Any]]
+    auto_uses_packages: ClassVar[tuple[str, ...] | None] = None
 
     @classmethod
     @cache

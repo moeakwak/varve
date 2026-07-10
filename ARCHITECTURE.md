@@ -10,15 +10,16 @@ src/varve/
 ├── pipeline.py          # Pipeline base class, stage collection, CLI hook
 ├── decorators.py        # @stage, @batch_stage, StageSpec
 ├── context.py           # Ctx passed to stage methods
+├── details.py           # read-only structured decision-key details
 ├── branch.py            # varve.yaml and override branch helpers
 ├── branch_config.py     # Config construction and output-root selection
 ├── keyspec.py           # JSON and KeySpec declarations
 ├── models.py            # persisted pydantic store models
 ├── style.py             # shared Rich status colors for cli and dashboard
-├── keying/              # source/file/config/upstream key components
+├── keying/              # source discovery and file/config/upstream key components
 ├── store/               # file lock and latest-wins Store
 ├── engine/              # cache-state decisions and runner
-├── cli/                 # generated Pipeline.cli() commands
+├── cli/                 # generated Pipeline.cli() commands and Rich details rendering
 └── dashboard/           # varve ls/show/refresh over existing stores
 ```
 
@@ -57,6 +58,22 @@ The store lives under `<output_root>/.varve/` and is latest-wins, not append-onl
 
 `content_key` includes stage source, discovered project callables, the `Config` projected onto the fields the stage actually reads, declared `KeySpec.files`, declared `KeySpec.values`, and upstream content keys. Batch partial state is scoped directly by `content_key`.
 
+## Source Dependency Discovery
+
+`keying/dependencies.py` performs bounded, positive source discovery and returns both stable flat source components and a dependency DAG. `keying/keys.py` consumes the flat components for hashing, while `details.py` consumes the same result for explanation; there is no second discovery implementation in the CLI.
+
+The stage function and explicit `uses` roots are strict inputs. Inferred project functions, whole classes, stable values, and narrow module-file fallbacks are best effort: a failure to inspect or hash one inferred branch is logged only at debug level and cannot block status evaluation or execution. Explicit `uses`, `KeySpec`, stage source, and store corruption retain their existing strict behavior.
+
+Discovery follows only directly resolvable globals, closure cells, defaults, nested code objects, simple `module.attr` reads, class-owned methods, and project base classes. It intentionally does not perform type propagation, control-flow analysis, registry inspection, factory return inference, dynamic import tracking, or runtime dispatch analysis. Calls through `self` are runtime dispatch and must be represented with `uses` or `KeySpec` when they affect caching.
+
+`Pipeline.auto_uses_packages` controls inferred recursion. `None` selects the stage function's top-level package, an explicit tuple replaces that scope, and `()` disables inferred package recursion without removing stage source or explicit `uses` roots.
+
+## Decision Probes And Details
+
+`engine.runner._probe_stage` is the shared ready-stage decision unit for `status` and `details`. Normal status evaluation keeps its selected-graph and missing-upstream short-circuit semantics. The details-only `probe_pipeline` always walks the full topology so each displayed decision key uses the same whole-pipeline upstream projection, and it retains static source dependencies when key inputs are unavailable because an upstream has no success record.
+
+`details.py` converts probes into immutable view models. `cli/details.py` renders the folded summary, single-stage key inputs, and progressively expanded dependency DAG. The command is read-only: it does not execute stages, initialize the store, or persist dependency graphs. A displayed decision key is the current read-only cache decision input, not a promise that the next execution will commit the same final key after recording config access.
+
 ## Config Access Projection
 
 A stage's output depends only on the `Config` fields it reads, so folding the whole `Config` into every `content_key` over-invalidates: adding a tool or toggling a flag would rerun stages that never look at that field. Varve instead records which top-level fields each stage reads and keys only on those.
@@ -94,7 +111,7 @@ base/.tmp/<branch>   # temporary override branches
 
 ## CLI And Config
 
-`Pipeline.cli(argv)` delegates to `varve.cli.app.main` and provides `run`, `status`, `plan`, `list`, and `clean`.
+`Pipeline.cli(argv)` delegates to `varve.cli.app.main` and provides `run`, `status`, `details`, `plan`, `list`, and `clean`.
 
 `argparse` parses commands and generated `Args` flags. `pydantic-settings` builds semantic `Config` values from branch/override values, environment variables, `.env`, and model defaults.
 
