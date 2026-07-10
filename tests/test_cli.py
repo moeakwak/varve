@@ -137,7 +137,10 @@ def test_cli_run_status_clean(tmp_path: Path, capsys) -> None:
     assert "no-cache" in capsys.readouterr().out
 
     assert CliPipeline.cli(["status", "--out", str(tmp_path), "--branch", "quick"]) == 0
-    assert "hit" in capsys.readouterr().out
+    status_output = capsys.readouterr().out
+    assert "hit" in status_output
+    assert "Pipeline status" in status_output
+    assert "Dependencies are folded." in status_output
 
     assert CliPipeline.cli(["clean", "--out", str(tmp_path), "--branch", "quick", "--yes"]) == 0
     assert not (tmp_path / ".tmp" / "quick").exists()
@@ -169,14 +172,14 @@ def test_cli_list_and_plan_do_not_require_supported_config(capsys) -> None:
     assert capsys.readouterr().out.strip() == "sample"
 
 
-@pytest.mark.parametrize("known_command", ["run", "status", "details", "clean"])
+@pytest.mark.parametrize("known_command", ["run", "status", "clean"])
 def test_cli_unknown_command_does_not_trigger_config_argmap(known_command: str) -> None:
     with pytest.raises(SystemExit) as exc_info:
         UnsupportedConfigPipeline.cli(["bogus", known_command])
     assert exc_info.value.code != 0
 
 
-@pytest.mark.parametrize("command", ["run", "status", "details", "clean"])
+@pytest.mark.parametrize("command", ["run", "status", "clean"])
 def test_cli_unknown_option_does_not_trigger_config_argmap(command: str) -> None:
     with pytest.raises(SystemExit) as exc_info:
         UnsupportedConfigPipeline.cli([command, "--bogus"])
@@ -185,7 +188,7 @@ def test_cli_unknown_option_does_not_trigger_config_argmap(command: str) -> None
 
 @pytest.mark.parametrize(
     ("command", "value_option"),
-    [("run", "--out"), ("status", "--out"), ("details", "--out"), ("clean", "--out")],
+    [("run", "--out"), ("status", "--out"), ("clean", "--out")],
 )
 def test_cli_option_like_missing_value_does_not_trigger_config_argmap(
     command: str, value_option: str
@@ -195,7 +198,7 @@ def test_cli_option_like_missing_value_does_not_trigger_config_argmap(
     assert exc_info.value.code != 0
 
 
-@pytest.mark.parametrize("command", ["run", "status", "details", "clean"])
+@pytest.mark.parametrize("command", ["run", "status", "clean"])
 def test_cli_config_commands_with_unsupported_args_still_fast_fail(command: str) -> None:
     with pytest.raises(TypeError, match="argmap does not support args field"):
         UnsupportedConfigPipeline.cli([command])
@@ -496,7 +499,7 @@ def test_cli_optional_field_accepts_null_sentinel(
     assert captured[-1][1].sample is None
 
 
-@pytest.mark.parametrize("command", ["run", "status", "details", "clean"])
+@pytest.mark.parametrize("command", ["run", "status", "clean"])
 def test_cli_help_is_handled_by_argparse(command: str, capsys) -> None:
     with pytest.raises(SystemExit) as exc_info:
         ChoiceCliPipeline.cli([command, "--help"])
@@ -504,37 +507,43 @@ def test_cli_help_is_handled_by_argparse(command: str, capsys) -> None:
     assert "--mode" in capsys.readouterr().out
 
 
-def test_cli_details_defaults_to_all_stages(tmp_path: Path, capsys) -> None:
-    assert CliPipeline.cli(["details", "--out", str(tmp_path)]) == 0
-    output = capsys.readouterr().out
-    assert "Pipeline details" in output
-    assert "sample" in output
-    assert "Dependencies are folded." in output
-
-
-def test_cli_details_accepts_optional_stage_and_expansion(tmp_path: Path, capsys) -> None:
+def test_cli_status_accepts_optional_stage_and_expansion(tmp_path: Path, capsys) -> None:
     assert (
         CliPipeline.cli(
-            ["details", "sample", "--out", str(tmp_path), "--expand", "--threshold", "-1"]
+            ["status", "sample", "--out", str(tmp_path), "--expand", "--threshold", "-1"]
         )
         == 0
     )
-    assert "Source dependencies · direct + one level" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Source dependencies · direct + one level" in output
 
 
-def test_cli_details_accepts_all_for_every_stage(tmp_path: Path, capsys) -> None:
-    assert CliPipeline.cli(["details", "--out", str(tmp_path), "--all"]) == 0
+def test_cli_status_accepts_all_for_every_stage(tmp_path: Path, capsys) -> None:
+    assert CliPipeline.cli(["status", "--out", str(tmp_path), "--all"]) == 0
     assert "Source dependencies · full tree" in capsys.readouterr().out
 
 
-def test_cli_details_rejects_expand_and_all_together(tmp_path: Path) -> None:
+def test_cli_status_rejects_expand_and_all_together(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
-        CliPipeline.cli(["details", "sample", "--out", str(tmp_path), "--expand", "--all"])
+        CliPipeline.cli(["status", "sample", "--out", str(tmp_path), "--expand", "--all"])
 
 
-def test_cli_details_unknown_stage_is_nonzero(tmp_path: Path) -> None:
+def test_cli_status_unknown_stage_is_nonzero(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
-        CliPipeline.cli(["details", "missing", "--out", str(tmp_path)])
+        CliPipeline.cli(["status", "missing", "--out", str(tmp_path)])
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["details"],
+        ["status", "--upto", "sample"],
+        ["status", "--downstream", "sample"],
+    ],
+)
+def test_cli_rejects_removed_status_interfaces(argv: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        CliPipeline.cli(argv)
 
 
 def test_cli_help_hides_internal_dest(capsys) -> None:
@@ -552,7 +561,6 @@ def test_cli_help_hides_internal_dest(capsys) -> None:
     "argv",
     [
         ["run", "--upto", "sample", "--downstream", "sample"],
-        ["status", "--upto", "sample", "--downstream", "sample"],
         ["plan", "--upto", "sample", "--downstream", "sample"],
     ],
 )

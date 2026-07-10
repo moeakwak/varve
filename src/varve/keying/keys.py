@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from varve.keying.astkey import source_hash
 from varve.keying.config_access import project_config
 from varve.keying.dependencies import SourceDependencies, discover_source_dependencies
-from varve.keying.fingerprint import files_fingerprints, json_sha256
+from varve.keying.fingerprint import file_digest_view, files_fingerprints, json_sha256
 from varve.keyspec import KeySpec
 from varve.models import FileFingerprint, KeyComponents
 
@@ -148,18 +148,11 @@ def compute_key_components(
     )
 
 
-def _file_digest_view(files: dict[str, list[FileFingerprint]]) -> dict[str, str]:
-    digest_view: dict[str, str] = {}
-    for name, members in sorted(files.items()):
-        digest_view[name] = json_sha256(sorted(member.sha256 for member in members))
-    return digest_view
-
-
 def content_key(components: KeyComponents) -> str:
     digest_view = {
         "source": components.source,
         "config": components.config,
-        "files": _file_digest_view(components.files),
+        "files": file_digest_view(components.files),
         "values": components.values,
         "upstreams": components.upstreams,
     }

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
+from varve.keying.fingerprint import file_digest_view
 from varve.models import AttemptMarker, BatchRecord, KeyComponents, SuccessRecord
 
 Status = Literal[
@@ -85,21 +86,40 @@ def decide_batch(
     return Decision("resume", "resume", frozenset(skip))
 
 
+def _with_source(reason: str, *, source_changed: bool) -> str:
+    return f"{reason} (+ source)" if source_changed else reason
+
+
 def invalidation_reason(old: KeyComponents, new: KeyComponents) -> str:
-    if old.source != new.source:
-        return "source changed"
+    source_changed = old.source != new.source
     for name in sorted(set(old.config) | set(new.config)):
         if old.config.get(name) != new.config.get(name):
-            return f"config: {name} {old.config.get(name)!r} -> {new.config.get(name)!r}"
-    if old.files != new.files:
-        for name in sorted(set(old.files) | set(new.files)):
-            if old.files.get(name) != new.files.get(name):
-                return f"file: {name} changed"
-        return "file changed"
+            return _with_source(
+                f"config: {name} {old.config.get(name)!r} -> {new.config.get(name)!r}",
+                source_changed=source_changed,
+            )
+    old_files = file_digest_view(old.files)
+    new_files = file_digest_view(new.files)
+    if old_files != new_files:
+        for name in sorted(set(old_files) | set(new_files)):
+            if old_files.get(name) != new_files.get(name):
+                return _with_source(
+                    f"file: {name} changed",
+                    source_changed=source_changed,
+                )
+        return _with_source("file changed", source_changed=source_changed)
     for name in sorted(set(old.values) | set(new.values)):
         if old.values.get(name) != new.values.get(name):
-            return f"value: {name} {old.values.get(name)!r} -> {new.values.get(name)!r}"
+            return _with_source(
+                f"value: {name} {old.values.get(name)!r} -> {new.values.get(name)!r}",
+                source_changed=source_changed,
+            )
     for name in sorted(set(old.upstreams) | set(new.upstreams)):
         if old.upstreams.get(name) != new.upstreams.get(name):
-            return f"upstream '{name}' changed"
+            return _with_source(
+                f"upstream '{name}' changed",
+                source_changed=source_changed,
+            )
+    if source_changed:
+        return "source changed"
     return "content key changed"

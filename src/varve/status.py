@@ -1,4 +1,4 @@
-"""Structured, read-only pipeline key details."""
+"""Structured, read-only pipeline status."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from varve.pipeline import Pipeline
 
 
 @dataclass(frozen=True)
-class KeyInputsDetails:
+class KeyInputs:
     config: dict[str, Any]
     files: dict[str, list[FileFingerprint]]
     values: dict[str, Any]
@@ -23,15 +23,16 @@ class KeyInputsDetails:
 
 
 @dataclass(frozen=True)
-class StageDetails:
+class StageStatus:
     name: str
     kind: str
     needs: tuple[str, ...]
     status: Status
     reason: str
+    duration: float | None
     decision_key: str | None
     stored_key: str | None
-    key_inputs: KeyInputsDetails | None
+    key_inputs: KeyInputs | None
     source_dependencies: SourceDependencies
     unavailable_reason: str | None
 
@@ -52,11 +53,11 @@ class StageDetails:
 
 
 @dataclass(frozen=True)
-class PipelineDetails:
+class PipelineStatus:
     pipeline: str
     branch: str
     output_root: Path
-    stages: tuple[StageDetails, ...]
+    stages: tuple[StageStatus, ...]
 
 
 def reachable_identities(source: SourceDependencies) -> frozenset[str]:
@@ -74,7 +75,7 @@ def reachable_identities(source: SourceDependencies) -> frozenset[str]:
     return frozenset(seen)
 
 
-def collect_pipeline_details(
+def collect_pipeline_status(
     pipeline: type[Pipeline],
     config: Any,
     *,
@@ -82,7 +83,7 @@ def collect_pipeline_details(
     out: Path,
     branch: str,
     stage: str | None = None,
-) -> PipelineDetails:
+) -> PipelineStatus:
     """Collect decision keys and dependency descriptions without executing stages."""
 
     if stage is not None and stage not in pipeline.stages():
@@ -91,35 +92,41 @@ def collect_pipeline_details(
     selected_probes = (
         probes if stage is None else tuple(probe for probe in probes if probe.stage == stage)
     )
-    stages: list[StageDetails] = []
+    stages: list[StageStatus] = []
     for probe in selected_probes:
         spec = pipeline.stages()[probe.stage]
         components = probe.components
         key_inputs = (
             None
             if components is None
-            else KeyInputsDetails(
+            else KeyInputs(
                 config=components.config,
                 files=components.files,
                 values=components.values,
                 upstreams=components.upstreams,
             )
         )
+        previous = probe.previous
         stages.append(
-            StageDetails(
+            StageStatus(
                 name=probe.stage,
                 kind=spec.kind,
                 needs=spec.needs,
                 status=probe.decision.status,
                 reason=probe.decision.reason,
+                duration=(
+                    None
+                    if probe.decision.status == "no-cache" or previous is None
+                    else previous.elapsed
+                ),
                 decision_key=probe.decision_key,
-                stored_key=(probe.previous.content_key if probe.previous is not None else None),
+                stored_key=previous.content_key if previous is not None else None,
                 key_inputs=key_inputs,
                 source_dependencies=probe.source_dependencies,
                 unavailable_reason=probe.unavailable_reason,
             )
         )
-    return PipelineDetails(
+    return PipelineStatus(
         pipeline=pipeline.__name__,
         branch=branch,
         output_root=out,

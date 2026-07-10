@@ -73,6 +73,12 @@ class VarveStatusHighlighter(RegexHighlighter):
     ]
 
 
+def format_elapsed(value: float | None, *, missing: str = "") -> str:
+    """Format persisted or live stage duration for CLI tables."""
+
+    return f"{value:.2f}s" if value is not None else missing
+
+
 def make_console(*, stderr: bool = False) -> Console:
     """Build a Console sharing the varve theme with auto-highlight disabled."""
 

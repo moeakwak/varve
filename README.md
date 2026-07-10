@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/varve.svg)](https://pypi.org/project/varve/) [![License](https://img.shields.io/pypi/l/varve.svg)](LICENSE)
 
-Varve runs Python-defined pipelines with code-aware materialized caching. Each stage is a Python method, the run/status/details/plan/list/clean CLI is generated for you, and every output is cached under a key derived automatically from your code, config, and pinned inputs, so re-runs only re-execute what actually changed. Single machine, no daemon, no pipeline YAML.
+Varve runs Python-defined pipelines with code-aware materialized caching. Each stage is a Python method, the run/status/plan/list/clean CLI is generated for you, and every output is cached under a key derived automatically from your code, config, and pinned inputs, so re-runs only re-execute what actually changed. Single machine, no daemon, no pipeline YAML.
 
 A varve is an annual layer of lake sediment: thin, ordered, and datable. This library uses the same idea for pipeline outputs: materialized layers whose keys record the code, config, inputs, and upstream layers that produced them.
 
@@ -36,7 +36,6 @@ Run the pipeline:
 ```bash
 python demo.py run
 python demo.py status
-python demo.py details
 python demo.py plan
 python demo.py list
 python demo.py clean --yes
@@ -116,8 +115,7 @@ The core design choices are:
 - Public API: `Pipeline`, `@stage`, `@batch_stage`, `KeySpec`, `Ctx`, `JSON`, and `StageSpec`.
 - Generated pipeline commands:
   - `run [--branch NAME] [--override JSON] [--upto STAGE | --downstream STAGE] [--force] [--out PATH]`
-  - `status [--branch NAME] [--upto STAGE | --downstream STAGE] [--out PATH]`
-  - `details [STAGE] [--branch NAME] [--expand | --all] [--out PATH]`
+  - `status [STAGE] [--branch NAME] [--expand | --all] [--out PATH]`
   - `plan [--upto STAGE | --downstream STAGE]`
   - `list`
   - `clean [--branch NAME] [--downstream STAGE] [--out PATH] [--yes]`
@@ -145,13 +143,13 @@ Automatic discovery follows references that can be resolved directly from Python
 
 Discovery is always non-blocking and never claims to find a complete call graph. Dynamic calls, registries, `getattr`, factories, parameter type propagation, runtime dispatch, and sibling Pipeline methods reached through `self` are not inferred. Use `uses` or `KeySpec` whenever those inputs need a strict cache guarantee. Stage source, explicit `uses`, and explicit `KeySpec` inputs remain strict even when automatic discovery is enabled.
 
-Use `details` to inspect the decision key and the source dependencies included in it. The all-stage view is folded by default; a single stage shows direct dependencies, `--expand` adds one level, and `--all` renders the complete discovered DAG.
+Use `status` to inspect cache state and the source dependencies included in each decision key. The default all-stage summary folds source dependencies, limits long NEEDS lists, and shows DURATION from the most recent successful stage execution for usable cache states. A single stage shows folded dependencies, `--expand` adds one level, and `--all` renders the complete discovered DAG; expanded views also show the decision and stored keys.
 
 ```bash
-python demo.py details
-python demo.py details normalize
-python demo.py details normalize --expand
-python demo.py details normalize --all
+python demo.py status
+python demo.py status normalize
+python demo.py status normalize --expand
+python demo.py status normalize --all
 ```
 
 ## Branches

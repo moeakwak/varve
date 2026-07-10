@@ -29,8 +29,19 @@ Do not re-export internal store, keying, runner, or dashboard types from `varve.
 - User-facing docs, examples, comments, and messages are English.
 - Follow the package boundaries in `ARCHITECTURE.md`.
 - Do not add Click, Typer, import-linter, or release tooling beyond what is already documented.
+
+## Commits
+
 - Use Conventional Commits: `<type>(<scope>)<!>: <subject>`.
 - Append `!` for public API or store schema breaks.
+- Except for truly trivial changes such as an isolated typo fix, include a Markdown-formatted body that explains why the change is needed and summarizes its meaningful behavior or architecture changes. Prefer a short bullet list when the commit contains multiple points.
+
+```text
+feat(scope): concise subject
+
+- Explain the motivation or user-visible outcome.
+- Summarize the important implementation or compatibility details.
+```
 
 ## Releases
 

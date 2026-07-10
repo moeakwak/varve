@@ -58,6 +58,17 @@ def json_sha256(obj: Any) -> str:
     return f"sha256:{digest}"
 
 
+def file_digest_view(
+    files: Mapping[str, list[FileFingerprint]],
+) -> dict[str, str]:
+    """Project file fingerprints onto the digests used by content keys."""
+
+    return {
+        name: json_sha256(sorted(member.sha256 for member in members))
+        for name, members in sorted(files.items())
+    }
+
+
 def file_fingerprint(path: Path, cached: FileFingerprint | None = None) -> FileFingerprint:
     normalized_path = path.expanduser().resolve()
     try:

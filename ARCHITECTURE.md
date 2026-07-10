@@ -10,7 +10,7 @@ src/varve/
 ├── pipeline.py          # Pipeline base class, stage collection, CLI hook
 ├── decorators.py        # @stage, @batch_stage, StageSpec
 ├── context.py           # Ctx passed to stage methods
-├── details.py           # read-only structured decision-key details
+├── status.py            # read-only structured pipeline and stage status
 ├── branch.py            # varve.yaml and override branch helpers
 ├── branch_config.py     # Config construction and output-root selection
 ├── keyspec.py           # JSON and KeySpec declarations
@@ -19,7 +19,7 @@ src/varve/
 ├── keying/              # source discovery and file/config/upstream key components
 ├── store/               # file lock and latest-wins Store
 ├── engine/              # cache-state decisions and runner
-├── cli/                 # generated Pipeline.cli() commands and Rich details rendering
+├── cli/                 # generated Pipeline.cli() commands and Rich status rendering
 └── dashboard/           # varve ls/show/refresh over existing stores
 ```
 
@@ -60,7 +60,7 @@ The store lives under `<output_root>/.varve/` and is latest-wins, not append-onl
 
 ## Source Dependency Discovery
 
-`keying/dependencies.py` performs bounded, positive source discovery and returns both stable flat source components and a dependency DAG. `keying/keys.py` consumes the flat components for hashing, while `details.py` consumes the same result for explanation; there is no second discovery implementation in the CLI.
+`keying/dependencies.py` performs bounded, positive source discovery and returns both stable flat source components and a dependency DAG. `keying/keys.py` consumes the flat components for hashing, while `status.py` consumes the same result for explanation; there is no second discovery implementation in the CLI.
 
 The stage function and explicit `uses` roots are strict inputs. Inferred project functions, whole classes, stable values, and narrow module-file fallbacks are best effort: a failure to inspect or hash one inferred branch is logged only at debug level and cannot block status evaluation or execution. Explicit `uses`, `KeySpec`, stage source, and store corruption retain their existing strict behavior.
 
@@ -68,11 +68,11 @@ Discovery follows only directly resolvable globals, closure cells, defaults, nes
 
 `Pipeline.auto_uses_packages` controls inferred recursion. `None` selects the stage function's top-level package, an explicit tuple replaces that scope, and `()` disables inferred package recursion without removing stage source or explicit `uses` roots.
 
-## Decision Probes And Details
+## Decision Probes And Status
 
-`engine.runner._probe_stage` is the shared ready-stage decision unit for `status` and `details`. Normal status evaluation keeps its selected-graph and missing-upstream short-circuit semantics. The details-only `probe_pipeline` always walks the full topology so each displayed decision key uses the same whole-pipeline upstream projection, and it retains static source dependencies when key inputs are unavailable because an upstream has no success record.
+`engine.runner._probe_stage` is the shared ready-stage decision unit for execution probes and structured status. `probe_pipeline()` always walks the full topology so each displayed decision key uses the same whole-pipeline upstream projection. It computes source dependencies before checking missing upstream records, so invalid explicit `uses` remains strict while valid source dependencies remain available when key inputs are unavailable.
 
-`details.py` converts probes into immutable view models. `cli/details.py` renders the folded summary, single-stage key inputs, and progressively expanded dependency DAG. The command is read-only: it does not execute stages, initialize the store, or persist dependency graphs. A displayed decision key is the current read-only cache decision input, not a promise that the next execution will commit the same final key after recording config access.
+`status.py` converts probes into immutable view models. `cli/status.py` renders the folded summary, single-stage key inputs, and progressively expanded dependency DAG; qualified names and known edge reasons are compacted only at this rendering boundary. The command is read-only: it does not execute stages, initialize the store, or persist dependency graphs. A displayed decision key is the current read-only cache decision input, not a promise that the next execution will commit the same final key after recording config access.
 
 ## Config Access Projection
 
@@ -111,7 +111,7 @@ base/.tmp/<branch>   # temporary override branches
 
 ## CLI And Config
 
-`Pipeline.cli(argv)` delegates to `varve.cli.app.main` and provides `run`, `status`, `details`, `plan`, `list`, and `clean`.
+`Pipeline.cli(argv)` delegates to `varve.cli.app.main` and provides `run`, `status`, `plan`, `list`, and `clean`.
 
 `argparse` parses commands and generated `Args` flags. `pydantic-settings` builds semantic `Config` values from branch/override values, environment variables, `.env`, and model defaults.
 

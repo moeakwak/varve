@@ -95,7 +95,7 @@ def test_status_missing_upstream_short_circuits_strict_uses(tmp_path: Path) -> N
     assert [(outcome.stage, outcome.status) for outcome in outcomes] == [("downstream", "no-cache")]
 
 
-def test_details_probe_missing_upstream_still_validates_strict_uses(tmp_path: Path) -> None:
+def test_status_probe_missing_upstream_still_validates_strict_uses(tmp_path: Path) -> None:
     with pytest.raises(TypeError):
         probe_pipeline(
             MissingUpstreamStrictUsesPipeline,

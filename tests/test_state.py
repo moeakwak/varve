@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from varve.engine.state import decide_batch, decide_single, invalidation_reason
 from varve.models import (
     AttemptMarker,
     BatchRecord,
+    FileFingerprint,
     KeyComponents,
     OutputHandle,
     ProducedPath,
@@ -15,6 +18,15 @@ def _components(**overrides) -> KeyComponents:
     data = dict(source={}, config={}, files={}, values={}, upstreams={})
     data.update(overrides)
     return KeyComponents(**data)
+
+
+def _file(*, sha256: str, size: int = 1, mtime: float = 1.0) -> FileFingerprint:
+    return FileFingerprint(
+        path="/tmp/input.jsonl",
+        size=size,
+        mtime=mtime,
+        sha256=sha256,
+    )
 
 
 def _single(key: str = "sha256:a") -> SuccessRecord:
@@ -63,6 +75,60 @@ def test_invalidation_reason_priority() -> None:
             _components(upstreams={"sample": {"content_key": "2"}}),
         )
         == "upstream 'sample' changed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("update", "expected"),
+    [
+        (
+            {"config": {"profile": "new"}},
+            "config: profile 'old' -> 'new' (+ source)",
+        ),
+        (
+            {"files": {"input": [_file(sha256="sha256:new")]}},
+            "file: input changed (+ source)",
+        ),
+        ({"values": {"limit": 2}}, "value: limit 1 -> 2 (+ source)"),
+        (
+            {"upstreams": {"prepare": {"content_key": "new"}}},
+            "upstream 'prepare' changed (+ source)",
+        ),
+    ],
+)
+def test_invalidation_reason_prefers_specific_change_and_notes_source(
+    update: dict,
+    expected: str,
+) -> None:
+    old = _components(
+        source={"stage": "old"},
+        config={"profile": "old"},
+        files={"input": [_file(sha256="sha256:old")]},
+        values={"limit": 1},
+        upstreams={"prepare": {"content_key": "old"}},
+    )
+
+    new = old.model_copy(update={"source": {"stage": "new"}, **update})
+    assert invalidation_reason(old, new) == expected
+
+
+def test_invalidation_reason_ignores_file_metadata_drift() -> None:
+    old_files = {"input": [_file(sha256="sha256:same")]}
+    touched_files = {"input": [_file(sha256="sha256:same", size=2, mtime=2.0)]}
+
+    assert (
+        invalidation_reason(
+            _components(source={"stage": "old"}, files=old_files),
+            _components(source={"stage": "new"}, files=touched_files),
+        )
+        == "source changed"
+    )
+    assert (
+        invalidation_reason(
+            _components(files=old_files, values={"limit": 1}),
+            _components(files=touched_files, values={"limit": 2}),
+        )
+        == "value: limit 1 -> 2"
     )
 
 

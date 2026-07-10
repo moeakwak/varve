@@ -1,4 +1,4 @@
-"""Rich rendering for structured pipeline details."""
+"""Rich rendering for structured pipeline status."""
 
 from __future__ import annotations
 
@@ -8,27 +8,83 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
-from varve.details import PipelineDetails, StageDetails
 from varve.keying.dependencies import DependencyNode, SourceDependencies
-from varve.style import status_text
+from varve.status import PipelineStatus, StageStatus
+from varve.style import format_elapsed, status_text
+
+_COMPACT_REASON_PREFIXES = (
+    ("global referenced by ", "global reference"),
+    ("closure referenced by ", "closure reference"),
+    ("default value declared by ", "default value"),
+    ("module attribute referenced by ", "module attribute"),
+    ("base class of ", "base class"),
+)
 
 
-def render_pipeline_summary(console: Console, details: PipelineDetails) -> None:
+def format_needs(needs: tuple[str, ...]) -> str:
+    if not needs:
+        return "-"
+    visible = ", ".join(needs[:2])
+    hidden = len(needs) - 2
+    return f"{visible} · +{hidden} more" if hidden > 0 else visible
+
+
+def compact_reason(reason: str) -> str:
+    for prefix, compact in _COMPACT_REASON_PREFIXES:
+        if reason.startswith(prefix):
+            return compact
+    return reason
+
+
+def relative_qualified_name(
+    graph: SourceDependencies,
+    *,
+    parent: str,
+    child: str,
+) -> str:
+    child_name = graph.nodes[child].qualified_name
+    if parent == "stage":
+        return child_name
+    parent_parts = graph.nodes[parent].qualified_name.split(".")
+    child_parts = child_name.split(".")
+    common = 0
+    for parent_part, child_part in zip(parent_parts, child_parts):
+        if parent_part != child_part:
+            break
+        common += 1
+    if common == 0 or common == len(child_parts):
+        return child_name
+    return ".".join(child_parts[common:])
+
+
+def render_pipeline_summary(console: Console, status: PipelineStatus) -> None:
     console.print(
         Text.assemble(
-            ("Pipeline details", "varve.dependency.stage"),
-            (f"  branch {details.branch} · output {details.output_root}", "dim"),
+            ("Pipeline status", "varve.dependency.stage"),
+            (f"  branch {status.branch} · output {status.output_root}", "dim"),
         )
     )
     console.print()
-    table = Table(box=None, padding=(0, 2), header_style="bold")
-    table.add_column("STAGE", style="bold")
-    table.add_column("STATUS")
-    table.add_column("NEEDS", style="dim")
-    table.add_column("KEY", style="dim")
-    table.add_column("SOURCE DEPENDENCIES")
-    table.add_column("REASON")
-    for stage in details.stages:
+    fold_core = console.width < 80
+    core_overflow = "fold" if fold_core else "ignore"
+    table = Table(box=None, padding=(0, 1), header_style="bold")
+    table.add_column(
+        "STAGE",
+        style="bold",
+        no_wrap=not fold_core,
+        overflow=core_overflow,
+    )
+    table.add_column("STATUS", no_wrap=not fold_core, overflow=core_overflow)
+    table.add_column(
+        "DURATION",
+        justify="right",
+        no_wrap=not fold_core,
+        overflow=core_overflow,
+    )
+    table.add_column("NEEDS", style="dim", overflow="fold")
+    table.add_column("SOURCE DEPENDENCIES", overflow="fold")
+    table.add_column("REASON", overflow="fold")
+    for stage in status.stages:
         dependency_summary = Text()
         dependency_summary.append(f"{stage.direct_count} direct", style="varve.dependency.function")
         dependency_summary.append(f" · {stage.total_count} total", style="dim")
@@ -39,15 +95,15 @@ def render_pipeline_summary(console: Console, details: PipelineDetails) -> None:
         table.add_row(
             stage.name,
             status_text(stage.status),
-            ", ".join(stage.needs) if stage.needs else "-",
-            stage.decision_key[:8] if stage.decision_key is not None else "-",
+            format_elapsed(stage.duration),
+            format_needs(stage.needs),
             dependency_summary,
             stage.reason,
         )
     console.print(table)
     console.print()
     console.print(
-        "[dim]Dependencies are folded. Run[/] [bold]details STAGE[/] "
+        "[dim]Dependencies are folded. Run[/] [bold]status STAGE[/] "
         "[dim]for one stage, then add[/] [bold]--expand[/] [dim]or[/] "
         "[bold]--all[/][dim].[/]"
     )
@@ -84,7 +140,7 @@ def reachable_unique_count(
     return count
 
 
-def key_inputs_table(stage: StageDetails) -> Table:
+def key_inputs_table(stage: StageStatus) -> Table:
     assert stage.key_inputs is not None
     table = Table(box=None, show_header=False, padding=(0, 2))
     table.add_column(style="dim", no_wrap=True)
@@ -102,11 +158,11 @@ def key_inputs_table(stage: StageDetails) -> Table:
     return table
 
 
-def dependency_label(node: DependencyNode) -> Text:
+def dependency_label(node: DependencyNode, *, qualified_name: str) -> Text:
     label = Text()
     label.append(node.kind, style=f"varve.dependency.{node.kind}")
     label.append("  ")
-    label.append(node.qualified_name, style="bold")
+    label.append(qualified_name, style="bold")
     label.append(f"  [{node.origin}]", style="varve.dependency.metadata")
     if node.scope:
         label.append(f"  [{node.scope}]", style="varve.dependency.broad")
@@ -123,15 +179,20 @@ def add_dependency(
     shown: set[str],
 ) -> None:
     node = graph.nodes[identity]
+    display_name = relative_qualified_name(
+        graph,
+        parent=parent,
+        child=identity,
+    )
     if identity in shown:
-        reference = tree.add(Text(f"↳ {node.qualified_name} already shown", style="dim"))
+        reference = tree.add(Text(f"↳ {display_name} already shown", style="dim"))
         for reason in edge_reasons(graph, parent, identity):
-            reference.add(Text(reason, style="dim"))
+            reference.add(Text(compact_reason(reason), style="dim"))
         return
     shown.add(identity)
-    branch = tree.add(dependency_label(node))
+    branch = tree.add(dependency_label(node, qualified_name=display_name))
     for reason in edge_reasons(graph, parent, identity):
-        branch.add(Text(reason, style="dim"))
+        branch.add(Text(compact_reason(reason), style="dim"))
     children = child_identities(graph, identity)
     if children and depth == 0:
         hidden = reachable_unique_count(graph, children, exclude=shown)
@@ -160,7 +221,13 @@ def add_dependency(
         )
 
 
-def render_stage_details(console: Console, stage: StageDetails, *, depth: int | None) -> None:
+def render_stage_status(
+    console: Console,
+    stage: StageStatus,
+    *,
+    depth: int | None,
+    show_keys: bool,
+) -> None:
     heading = Text(stage.name, style="varve.dependency.stage")
     heading.append("  ")
     heading.append_text(status_text(stage.status))
@@ -169,11 +236,12 @@ def render_stage_details(console: Console, stage: StageDetails, *, depth: int | 
 
     overview = Table(box=None, show_header=False, padding=(0, 2))
     overview.add_column(style="dim", no_wrap=True)
-    overview.add_column()
+    overview.add_column(overflow="fold")
     overview.add_row("Reason", stage.reason)
     overview.add_row("Needs", ", ".join(stage.needs) if stage.needs else "-")
-    overview.add_row("Decision key", stage.decision_key or "unavailable")
-    overview.add_row("Stored key", stage.stored_key or "-")
+    if show_keys:
+        overview.add_row("Decision key", stage.decision_key or "unavailable")
+        overview.add_row("Stored key", stage.stored_key or "-")
     overview.add_row(
         "Dependencies",
         f"{stage.direct_count} direct · {stage.total_count} total · {stage.broad_count} broad",
@@ -227,22 +295,22 @@ def render_stage_details(console: Console, stage: StageDetails, *, depth: int | 
     )
 
 
-def render_details(
+def render_status(
     console: Console,
-    details: PipelineDetails,
+    status: PipelineStatus,
     *,
     stage: str | None,
     depth: int | None,
 ) -> None:
     if stage is None and depth == 0:
-        render_pipeline_summary(console, details)
+        render_pipeline_summary(console, status)
         return
     selected = (
-        details.stages
+        status.stages
         if stage is None
-        else tuple(item for item in details.stages if item.name == stage)
+        else tuple(item for item in status.stages if item.name == stage)
     )
     for index, item in enumerate(selected):
         if index:
             console.print()
-        render_stage_details(console, item, depth=depth)
+        render_stage_status(console, item, depth=depth, show_keys=depth != 0)

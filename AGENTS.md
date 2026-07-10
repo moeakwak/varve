@@ -4,7 +4,7 @@
 
 - User-facing positioning and examples: `README.md`.
 - Package layout, dependency direction, cache/store, CLI/config, clean, and dashboard boundaries: `ARCHITECTURE.md`.
-- Contributor setup, public API policy, style, and Conventional Commits: `CONTRIBUTING.md`.
+- Contributor setup, public API policy, style, and commit requirements: `CONTRIBUTING.md`. Read it before creating any varve commit.
 
 ## Agent Rules
 

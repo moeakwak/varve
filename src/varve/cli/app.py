@@ -14,14 +14,14 @@ from rich.table import Table
 from varve.branch_config import resolve_branch
 from varve.cli import argmap
 from varve.cli.clean import clean
-from varve.cli.details import render_details
-from varve.details import collect_pipeline_details
-from varve.engine.runner import StageOutcome, evaluate_state, run, selected_stages
+from varve.cli.status import render_status
+from varve.engine.runner import StageOutcome, run, selected_stages
 from varve.log import configure_cli_logging
 from varve.pipeline import Pipeline
-from varve.style import make_console, status_text
+from varve.status import collect_pipeline_status
+from varve.style import format_elapsed, make_console, status_text
 
-_CONFIG_COMMANDS = {"run", "status", "details", "clean"}
+_CONFIG_COMMANDS = {"run", "status", "clean"}
 _NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
 _COMMAND_OPTION_ARITIES = {
     "run": {
@@ -33,8 +33,7 @@ _COMMAND_OPTION_ARITIES = {
         "-f": 0,
         "--out": 1,
     },
-    "status": {"--branch": 1, "--upto": 1, "--downstream": 1, "--out": 1},
-    "details": {
+    "status": {
         "--branch": 1,
         "--out": 1,
         "--expand": 0,
@@ -72,10 +71,6 @@ def _print_list(pipeline: type[Pipeline]) -> None:
     make_console().print(table)
 
 
-def _format_elapsed(value: float | None) -> str:
-    return f"{value:.2f}s" if value is not None else "-"
-
-
 def _print_outcomes(outcomes: list[StageOutcome], *, elapsed: bool) -> None:
     table = Table(box=None)
     table.add_column("STAGE")
@@ -86,7 +81,7 @@ def _print_outcomes(outcomes: list[StageOutcome], *, elapsed: bool) -> None:
     for outcome in outcomes:
         row = [outcome.stage, status_text(outcome.status), outcome.reason]
         if elapsed:
-            row.append(_format_elapsed(outcome.elapsed))
+            row.append(format_elapsed(outcome.elapsed, missing="-"))
         table.add_row(*row)
     make_console().print(table)
 
@@ -99,30 +94,6 @@ def _print_plan(
 ) -> None:
     selected = selected_stages(pipeline, upto=upto, downstream=downstream)
     print(" -> ".join(name for name in pipeline.topo_order() if name in selected))
-
-
-def _print_status(
-    pipeline: type[Pipeline],
-    config,
-    args,
-    *,
-    upto: str | None,
-    downstream: str | None,
-    cli_out: Path | None,
-    branch: str,
-    is_temporary: bool,
-) -> None:
-    outcomes = evaluate_state(
-        pipeline,
-        config,
-        args=args,
-        upto=upto,
-        downstream=downstream,
-        cli_out=cli_out,
-        branch=branch,
-        is_temporary=is_temporary,
-    )
-    _print_outcomes(outcomes, elapsed=False)
 
 
 def _default_confirm(message: str) -> bool:
@@ -223,22 +194,13 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     )
     run_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
 
-    status_parser = subparsers.add_parser("status", help="show read-only stage status")
+    status_parser = subparsers.add_parser("status", help="show pipeline and stage status")
+    status_parser.add_argument("stage", nargs="?", choices=pipeline.topo_order(), metavar="STAGE")
     status_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
-    status_stage = status_parser.add_mutually_exclusive_group()
-    status_stage.add_argument("--upto", metavar="STAGE", help="Show STAGE and all upstream stages.")
-    status_stage.add_argument(
-        "--downstream", metavar="STAGE", help="Show STAGE and all downstream stages."
-    )
     status_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
-
-    details_parser = subparsers.add_parser("details", help="show stage key details")
-    details_parser.add_argument("stage", nargs="?", choices=pipeline.topo_order())
-    details_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
-    details_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
-    details_depth = details_parser.add_mutually_exclusive_group()
-    details_depth.add_argument("--expand", action="store_true", help="Show one dependency level.")
-    details_depth.add_argument("--all", action="store_true", help="Show the full dependency tree.")
+    status_depth = status_parser.add_mutually_exclusive_group()
+    status_depth.add_argument("--expand", action="store_true", help="Show one dependency level.")
+    status_depth.add_argument("--all", action="store_true", help="Show the full dependency tree.")
 
     clean_parser = subparsers.add_parser("clean", help="delete selected store records and outputs")
     clean_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
@@ -272,8 +234,6 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         argmap.register_args(run_parser, pipeline.Args)
     if selected_command == "status":
         argmap.register_args(status_parser, pipeline.Args)
-    if selected_command == "details":
-        argmap.register_args(details_parser, pipeline.Args)
     if selected_command == "clean":
         argmap.register_args(clean_parser, pipeline.Args)
 
@@ -297,18 +257,7 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     config = resolved.config
     args = _args_from_namespace(pipeline, namespace)
     if namespace.command == "status":
-        _print_status(
-            pipeline,
-            config,
-            args,
-            upto=namespace.upto,
-            downstream=namespace.downstream,
-            cli_out=resolved.output_base,
-            branch=resolved.branch,
-            is_temporary=resolved.is_temporary,
-        )
-    elif namespace.command == "details":
-        details = collect_pipeline_details(
+        status = collect_pipeline_status(
             pipeline,
             config,
             args=args,
@@ -322,7 +271,7 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             stage=namespace.stage,
         )
         depth = None if namespace.all else 1 if namespace.expand else 0
-        render_details(make_console(), details, stage=namespace.stage, depth=depth)
+        render_status(make_console(), status, stage=namespace.stage, depth=depth)
     elif namespace.command == "clean":
         allowed_roots = (
             None if isinstance(config, SimpleNamespace) else pipeline.clean_roots(config)

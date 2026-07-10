@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.text import Text
 
 from varve import style
-from varve.style import VarveStatusHighlighter, status_text
+from varve.style import VarveStatusHighlighter, format_elapsed, status_text
 
 
 def test_status_text_uses_semantic_style() -> None:
@@ -18,6 +18,12 @@ def test_status_text_uses_semantic_style() -> None:
 
 def test_status_text_unknown_status_is_unstyled() -> None:
     assert status_text("mystery").style == ""
+
+
+def test_format_elapsed_uses_shared_precision_and_configurable_missing_text() -> None:
+    assert format_elapsed(1.25) == "1.25s"
+    assert format_elapsed(None) == ""
+    assert format_elapsed(None, missing="-") == "-"
 
 
 def test_dependency_styles_are_available_from_shared_theme() -> None:
