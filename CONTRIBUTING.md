@@ -33,7 +33,9 @@ Do not re-export internal store, keying, runner, or dashboard types from `varve.
 ## Commits
 
 - Use Conventional Commits: `<type>(<scope>)<!>: <subject>`.
-- Append `!` for public API or store schema breaks.
+- Append `!` only when the final change breaks compatibility with the most recent released version. Judge compatibility against that release, never against an earlier commit in the same unreleased series.
+- Adding, revising, or removing functionality that has not appeared in a release is not a breaking change. If a later commit eliminates a break introduced by an earlier unreleased commit, rewrite or squash the series so the obsolete `!` and `BREAKING CHANGE` notice are removed from the earlier commit as well.
+- Use `!` for public API or store schema breaks that remain relative to the most recent release.
 - Except for truly trivial changes such as an isolated typo fix, include a Markdown-formatted body that explains why the change is needed and summarizes its meaningful behavior or architecture changes. Prefer a short bullet list when the commit contains multiple points.
 
 ```text
