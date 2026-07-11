@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -18,17 +19,20 @@ def discover_pipelines(root: Path, *, include_temporary: bool = False) -> list[P
         return []
 
     entries: list[PipelineEntry] = []
-    for store_root in root.rglob(".varve"):
-        if not store_root.is_dir():
+    for current, directories, _files in os.walk(root):
+        if ".varve" not in directories:
             continue
+        directories.remove(".varve")
+        output_root = Path(current)
+        store_root = output_root / ".varve"
         manifest_path = store_root / "manifest.json"
         if not manifest_path.exists():
             continue
-        output_root = store_root.parent
-        if _is_temporary_output_root(output_root) and not include_temporary:
-            continue
         split = _branch_output_id(root, output_root)
         if split is None:
+            continue
+        directories.clear()
+        if _is_temporary_output_root(output_root) and not include_temporary:
             continue
         pipeline_id, branch = split
         manifest, manifest_error = _read_manifest(manifest_path)

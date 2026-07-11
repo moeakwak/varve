@@ -7,6 +7,7 @@ import inspect
 import logging
 import time
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,7 @@ from varve.engine.run_display import (
 )
 from varve.engine.state import Decision, decide_batch, decide_single
 from varve.keying.config_access import ConfigAccess, RecordingConfig, project_config
-from varve.keying.dependencies import SourceDependencies
+from varve.keying.dependencies import SourceDependencies, SourceInspectionSession
 from varve.keying.fingerprint import FingerprintSession
 from varve.keying.keys import (
     compute_key_components,
@@ -57,22 +58,46 @@ class StageProbe:
 
 @dataclass
 class _KeyingSession:
-    """Command-scoped source discovery and filesystem snapshot caches."""
+    """Command-scoped source, filesystem, and success-record snapshots."""
 
     fingerprints: FingerprintSession = field(default_factory=FingerprintSession)
+    inspection: SourceInspectionSession = field(default_factory=SourceInspectionSession)
+    records: dict[tuple[Path, str], SuccessRecord | object] = field(default_factory=dict)
     sources: dict[tuple[int, tuple[int, ...], bool, tuple[str, ...] | None], SourceDependencies] = (
         field(default_factory=dict)
     )
 
-    def fresh_fingerprints(self) -> _KeyingSession:
-        """Share source discovery while starting a new filesystem snapshot."""
+    def fresh_observations(self) -> _KeyingSession:
+        """Share static source inspection while starting fresh mutable observations."""
 
-        return _KeyingSession(sources=self.sources)
+        return _KeyingSession(inspection=self.inspection, sources=self.sources)
 
     def refresh_fingerprints(self) -> None:
-        """Discard filesystem observations after a stage executes successfully."""
+        """Discard filesystem observations after a successful stage."""
 
         self.fingerprints = FingerprintSession()
+
+    def refresh_observations(self) -> None:
+        """Discard filesystem and record observations after possible side effects."""
+
+        self.fingerprints = FingerprintSession()
+        self.records.clear()
+
+    def read_success(self, store: Store, stage: str) -> SuccessRecord | None:
+        key = (store.root, stage)
+        cached = self.records.get(key, _RECORD_UNOBSERVED)
+        if cached is _RECORD_UNOBSERVED:
+            record = store.read_success(stage)
+            self.records[key] = _RECORD_MISSING if record is None else record
+            return record
+        return None if cached is _RECORD_MISSING else cached  # type: ignore[return-value]
+
+    def write_success(self, store: Store, record: SuccessRecord) -> None:
+        store.write_success(record)
+        self.records[(store.root, record.stage)] = record
+
+    def discard_success(self, store: Store, stage: str) -> None:
+        self.records.pop((store.root, stage), None)
 
     def source_dependencies(
         self,
@@ -88,12 +113,25 @@ class _KeyingSession:
         )
         result = self.sources.get(key)
         if result is None:
-            result = compute_source_dependencies(
-                stage_spec,
-                auto_uses_packages=auto_uses_packages,
-            )
+            try:
+                result = compute_source_dependencies(
+                    stage_spec,
+                    auto_uses_packages=auto_uses_packages,
+                    inspection=self.inspection,
+                )
+            except TypeError as error:
+                if "unexpected keyword argument 'inspection'" not in str(error):
+                    raise
+                result = compute_source_dependencies(
+                    stage_spec,
+                    auto_uses_packages=auto_uses_packages,
+                )
             self.sources[key] = result
         return result
+
+
+_RECORD_UNOBSERVED = object()
+_RECORD_MISSING = object()
 
 
 def _now() -> str:
@@ -145,6 +183,7 @@ def _refresh_fingerprint_cache(
     store: Store,
     previous: SuccessRecord | None,
     components: KeyComponents,
+    keying_session: _KeyingSession,
 ) -> None:
     """Rewrite a hit stage's success record when file fingerprints drifted.
 
@@ -165,7 +204,7 @@ def _refresh_fingerprint_cache(
             "key_components": previous.key_components.model_copy(update={"files": components.files})
         }
     )
-    store.write_success(refreshed)
+    keying_session.write_success(store, refreshed)
 
 
 def _produced_paths(produces: ProducesSpec, ctx: Ctx[Any, Any]) -> list[ProducedPath]:
@@ -255,6 +294,7 @@ def selected_stages(
 def _upstream_keys(
     stage_spec,
     store: Store,
+    keying_session: _KeyingSession,
     known_content_keys: dict[str, str] | None = None,
 ) -> dict[str, str]:
     keys: dict[str, str] = {}
@@ -262,7 +302,7 @@ def _upstream_keys(
         if known_content_keys is not None and name in known_content_keys:
             keys[name] = known_content_keys[name]
             continue
-        record = store.read_success(name)
+        record = keying_session.read_success(store, name)
         if record is None:
             raise ValueError(f"Upstream stage has no success record: {name}")
         keys[name] = record.content_key
@@ -279,6 +319,7 @@ def _validate_external_upstreams(
     args: Any,
     keying_session: _KeyingSession,
 ) -> None:
+    validation_session = keying_session.fresh_observations()
     stages = graph.stages
     external = {
         upstream
@@ -296,7 +337,7 @@ def _validate_external_upstreams(
         if stage_name not in external:
             continue
         attempt = store.read_attempt(stage_name)
-        record = store.read_success(stage_name)
+        record = validation_session.read_success(store, stage_name)
         if attempt is not None:
             raise ValueError(f"Upstream stage is dirty: {stage_name}")
         if record is None:
@@ -309,7 +350,7 @@ def _validate_external_upstreams(
         args=args,
         out=out,
         graph=graph,
-        _keying_session=keying_session.fresh_fingerprints(),
+        _keying_session=validation_session,
         _stage_names=validation_stages,
     )
     for probe in probes:
@@ -397,11 +438,11 @@ def _probe_stage(
     store: Store,
     known_content_keys: dict[str, str],
     source_dependencies: SourceDependencies,
-    fingerprint_session: FingerprintSession,
+    keying_session: _KeyingSession,
 ) -> StageProbe:
     stage_spec = graph.stages[stage_name]
-    previous = store.read_success(stage_name)
-    upstream_keys = _upstream_keys(stage_spec, store, known_content_keys)
+    previous = keying_session.read_success(store, stage_name)
+    upstream_keys = _upstream_keys(stage_spec, store, keying_session, known_content_keys)
     cached_files = previous.key_components.files if previous is not None else None
     previous_access = previous.key_components.config_access if previous is not None else None
     ctx_for_key = Ctx(
@@ -424,7 +465,7 @@ def _probe_stage(
         config_access=previous_access,
         auto_uses_packages=pipeline_type.auto_uses_packages,
         source_dependencies=source_dependencies,
-        fingerprint_session=fingerprint_session,
+        fingerprint_session=keying_session.fingerprints,
     )
     decision_key = content_key(components)
     attempt = store.read_attempt(stage_name)
@@ -489,7 +530,7 @@ def probe_pipeline(
             auto_uses_packages=pipeline_type.auto_uses_packages,
         )
         missing_upstream = next(
-            (name for name in stage_spec.needs if store.read_success(name) is None),
+            (name for name in stage_spec.needs if keying_session.read_success(store, name) is None),
             None,
         )
         if missing_upstream is not None:
@@ -499,7 +540,7 @@ def probe_pipeline(
                     decision=Decision("no-cache", "no cache"),
                     decision_key=None,
                     components=None,
-                    previous=store.read_success(stage_name),
+                    previous=keying_session.read_success(store, stage_name),
                     source_dependencies=source_dependencies,
                     unavailable_reason=f"upstream {missing_upstream} has no success record",
                 )
@@ -515,7 +556,7 @@ def probe_pipeline(
             store=store,
             known_content_keys=known_content_keys,
             source_dependencies=source_dependencies,
-            fingerprint_session=keying_session.fingerprints,
+            keying_session=keying_session,
         )
         probes.append(probe)
         assert probe.decision_key is not None
@@ -557,9 +598,11 @@ async def _drive(
     display_mode: RunDisplayMode,
     reporter: RunReporter | None = None,
     slices: tuple[str, ...] = (),
+    keying_session: _KeyingSession | None = None,
+    record_callback: Callable[[str, SuccessRecord | None], None] | None = None,
 ) -> list[StageOutcome]:
     store = Store(out)
-    keying_session = _KeyingSession()
+    keying_session = keying_session or _KeyingSession()
     selected = selected_stages(
         graph,
         upto=upto,
@@ -587,6 +630,7 @@ async def _drive(
     instance = pipeline_type()
     outcomes: list[StageOutcome] = []
     known_content_keys: dict[str, str] = {}
+    known_success: dict[str, bool] = {}
     reporter.log_plan(graph.topo_order())
 
     for stage_name in graph.topo_order():
@@ -595,8 +639,16 @@ async def _drive(
         stage_spec = graph.stages[stage_name]
         reporter.start(stage_name)
         if not execute:
-            missing_upstream = any(store.read_success(name) is None for name in stage_spec.needs)
+            for name in stage_spec.needs:
+                if name not in known_success:
+                    known_success[name] = keying_session.read_success(store, name) is not None
+            missing_upstream = any(not known_success[name] for name in stage_spec.needs)
             if missing_upstream:
+                previous = keying_session.read_success(store, stage_name)
+                known_success[stage_name] = previous is not None
+                if record_callback is not None:
+                    record_callback(stage_name, previous)
+                    keying_session.discard_success(store, stage_name)
                 outcome = display_plan.outcome(stage_name, "no-cache", "no cache", None)
                 outcomes.append(outcome)
                 reporter.record(outcome)
@@ -615,10 +667,14 @@ async def _drive(
                 store=store,
                 known_content_keys=known_content_keys,
                 source_dependencies=source_dependencies,
-                fingerprint_session=keying_session.fingerprints,
+                keying_session=keying_session,
             )
             assert probe.decision_key is not None
             known_content_keys[stage_name] = probe.decision_key
+            known_success[stage_name] = probe.previous is not None
+            if record_callback is not None:
+                record_callback(stage_name, probe.previous)
+                keying_session.discard_success(store, stage_name)
             reporter.lifecycle(stage_name, probe.decision.status, probe.decision.reason)
             reporter.content_key(stage_name, probe.decision_key)
             outcome = display_plan.outcome(
@@ -631,8 +687,8 @@ async def _drive(
             stage_spec,
             auto_uses_packages=pipeline_type.auto_uses_packages,
         )
-        upstream_keys = _upstream_keys(stage_spec, store)
-        previous = store.read_success(stage_name)
+        upstream_keys = _upstream_keys(stage_spec, store, keying_session)
+        previous = keying_session.read_success(store, stage_name)
         cached_files = previous.key_components.files if previous is not None else None
         previous_access = previous.key_components.config_access if previous is not None else None
         declared_needs = frozenset(stage_spec.logical_needs)
@@ -698,6 +754,7 @@ async def _drive(
                 store=store,
                 previous=previous,
                 components=components,
+                keying_session=keying_session,
             )
         if decision.status == "hit":
             reporter.lifecycle(stage_name, decision.status, decision.reason)
@@ -738,7 +795,8 @@ async def _drive(
             elapsed = time.monotonic() - started
             committed_access = _merge_config_access(previous, components.source, access.resolve())
             commit_components = _commit_components(components, config, committed_access)
-            store.write_success(
+            keying_session.write_success(
+                store,
                 SuccessRecord(
                     pipeline=pipeline_type.__name__,
                     stage=stage_name,
@@ -748,7 +806,7 @@ async def _drive(
                     produces=produces,
                     committed_at=_now(),
                     elapsed=elapsed,
-                )
+                ),
             )
         else:
             if force or decision.status != "resume":
@@ -813,7 +871,8 @@ async def _drive(
             elapsed = time.monotonic() - started
             committed_access = _merge_config_access(previous, components.source, access.resolve())
             commit_components = _commit_components(components, config, committed_access)
-            store.write_success(
+            keying_session.write_success(
+                store,
                 SuccessRecord(
                     pipeline=pipeline_type.__name__,
                     stage=stage_name,
@@ -823,7 +882,7 @@ async def _drive(
                     outputs=outputs,
                     committed_at=_now(),
                     elapsed=elapsed,
-                )
+                ),
             )
         store.clear_attempt(stage_name)
         keying_session.refresh_fingerprints()
@@ -920,6 +979,8 @@ def evaluate_state(
     is_temporary: bool = False,
     axes: dict[str, tuple[str, ...]] | None = None,
     graph: PipelineGraph | None = None,
+    _keying_session: _KeyingSession | None = None,
+    _record_callback: Callable[[str, SuccessRecord | None], None] | None = None,
 ) -> list[StageOutcome]:
     if args is None:
         args = pipeline.Args()
@@ -943,5 +1004,7 @@ def evaluate_state(
             force=False,
             execute=False,
             display_mode="expand",
+            keying_session=_keying_session,
+            record_callback=_record_callback,
         )
     )

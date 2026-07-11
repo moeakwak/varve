@@ -145,3 +145,22 @@ def test_discover_pipelines_treats_manifest_schema_errors_as_unreadable(
     assert entries[0].branch == "main"
     assert entries[0].pipeline_name is None
     assert entries[0].manifest_error
+
+
+def test_discovery_stops_at_valid_output_root_but_not_invalid_varve_dir(
+    tmp_path: Path,
+) -> None:
+    terminal = tmp_path / "outer" / "out" / "main"
+    Store(terminal).ensure_initialized("Outer")
+    Store(terminal / "artifact" / "inner" / "out" / "main").ensure_initialized("Inner")
+
+    invalid = tmp_path / "ordinary"
+    Store(invalid).ensure_initialized("Invalid")
+    Store(invalid / "nested" / "out" / "main").ensure_initialized("Nested")
+
+    entries = discover_pipelines(tmp_path)
+
+    assert [(entry.pipeline_id, entry.branch) for entry in entries] == [
+        ("ordinary.nested", "main"),
+        ("outer", "main"),
+    ]

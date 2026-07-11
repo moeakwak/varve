@@ -5,16 +5,17 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 from varve.dashboard.discovery import discover_pipelines
 from varve.dashboard.models import PipelineEntry
 from varve.dashboard.render import render_detail, render_overview
 from varve.dashboard.state import import_entry_pipeline, load_state, resolve_entry_branch
-from varve.engine.runner import run
+from varve.engine.runner import _KeyingSession, run
 from varve.log import configure_cli_logging
 from varve.matrix import build_graph
-from varve.style import REFRESH_MARKER
+from varve.style import REFRESH_MARKER, make_console
 
 _EXECUTABLE_STATUSES = {"artifact-missing", "dirty", "no-cache", "resume", "stale"}
 
@@ -63,19 +64,32 @@ def _add_include_temp(parser: argparse.ArgumentParser) -> None:
 
 
 def _ls(root: Path, include_temp: bool) -> int:
-    entries = discover_pipelines(root, include_temporary=include_temp)
+    console = make_console()
+    with _loading(console, "Discovering pipelines…") as loading:
+        entries = discover_pipelines(root, include_temporary=include_temp)
+        session = _KeyingSession()
+        states = []
+        for index, entry in enumerate(entries, start=1):
+            if loading is not None:
+                loading.update(f"Evaluating pipeline state {index}/{len(entries)}…")
+            states.append(load_state(entry, session))
     if not entries:
         print(f"No pipelines found under {root}", file=sys.stderr)
         return 1
-    states = [load_state(entry) for entry in entries]
     render_overview(states)
     return 0
 
 
 def _show(root: Path, pipeline_id: str, branch: str, include_temp: bool) -> int:
-    entries = discover_pipelines(root, include_temporary=include_temp)
-    by_key = {(entry.pipeline_id, entry.branch): entry for entry in entries}
-    entry = by_key.get((pipeline_id, branch))
+    console = make_console()
+    with _loading(console, "Discovering pipelines…") as loading:
+        entries = discover_pipelines(root, include_temporary=include_temp)
+        by_key = {(entry.pipeline_id, entry.branch): entry for entry in entries}
+        entry = by_key.get((pipeline_id, branch))
+        if entry is not None:
+            if loading is not None:
+                loading.update("Evaluating pipeline state 1/1…")
+            state = load_state(entry, _KeyingSession())
     if entry is None:
         print(f"Unknown pipeline: {pipeline_id} (branch {branch})", file=sys.stderr)
         if by_key:
@@ -85,12 +99,14 @@ def _show(root: Path, pipeline_id: str, branch: str, include_temp: bool) -> int:
         else:
             print(f"No pipelines found under {root}", file=sys.stderr)
         return 1
-    render_detail(load_state(entry))
+    render_detail(state)
     return 0
 
 
 def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
-    entries = discover_pipelines(root, include_temporary=include_temp)
+    console = make_console()
+    with _loading(console, "Discovering pipelines…"):
+        entries = discover_pipelines(root, include_temporary=include_temp)
     if prefix is not None:
         entries = [
             entry
@@ -105,8 +121,10 @@ def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
     failed = 0
     logger = logging.getLogger("varve")
     logging_configured = False
-    for entry in entries:
-        state = load_state(entry)
+    session = _KeyingSession()
+    for index, entry in enumerate(entries, start=1):
+        with _loading(console, f"Evaluating pipeline state {index}/{len(entries)}…"):
+            state = load_state(entry, session)
         if state.status not in _EXECUTABLE_STATUSES:
             continue
         if not logging_configured:
@@ -128,6 +146,8 @@ def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
             )
         else:
             refreshed += 1
+        finally:
+            session.refresh_observations()
 
     if refreshed == 0 and failed == 0:
         print("No executable pipelines found")
@@ -150,3 +170,9 @@ def _run_entry(entry: PipelineEntry) -> None:
         temporary_axes=resolved.temporary_axes,
         graph=graph,
     )
+
+
+def _loading(console, message: str):
+    if not console.is_terminal:
+        return nullcontext(None)
+    return console.status(message, spinner="dots")

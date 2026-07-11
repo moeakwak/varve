@@ -15,16 +15,16 @@ from varve.dashboard.models import (
     StageState,
     StateError,
 )
-from varve.engine.runner import evaluate_state
+from varve.engine.runner import _KeyingSession, evaluate_state
 from varve.engine.state import Status, aggregate_status
 from varve.matrix import build_graph
 from varve.models import SuccessRecord
 from varve.pipeline import Pipeline
-from varve.store.store import Store
 
 
-def load_state(entry: PipelineEntry) -> PipelineState:
+def load_state(entry: PipelineEntry, session: _KeyingSession | None = None) -> PipelineState:
     """Load one pipeline branch's current cache state."""
+    session = session or _KeyingSession()
     if entry.manifest_error:
         return _error(entry, "manifest", entry.manifest_error)
     if entry.pipeline_name is None:
@@ -44,6 +44,18 @@ def load_state(entry: PipelineEntry) -> PipelineState:
 
     try:
         graph = build_graph(pipeline, resolved.axes)
+        record_views: dict[
+            str,
+            tuple[list[ArtifactState], datetime | None, float | None],
+        ] = {}
+
+        def consume_record(name: str, success: SuccessRecord | None) -> None:
+            record_views[name] = (
+                _artifacts(entry, success) if success is not None else [],
+                _parse_datetime(success.committed_at) if success is not None else None,
+                success.elapsed if success is not None else None,
+            )
+
         outcomes = evaluate_state(
             pipeline,
             resolved.config,
@@ -53,24 +65,25 @@ def load_state(entry: PipelineEntry) -> PipelineState:
             is_temporary=resolved.is_temporary,
             axes=resolved.axes,
             graph=graph,
+            _keying_session=session,
+            _record_callback=consume_record,
         )
     except Exception as error:  # noqa: BLE001 - dashboard reports evaluator diagnostics.
         return _error(entry, "evaluate", str(error))
 
     outcomes_by_stage = {outcome.stage: outcome for outcome in outcomes}
-    store = Store(entry.output_root)
     stages: list[StageState] = []
     for name in graph.topo_order():
         outcome = outcomes_by_stage[name]
-        success = store.read_success(name)
+        artifacts, committed_at, elapsed = record_views[name]
         stages.append(
             StageState(
                 name=name,
                 status=outcome.status,
                 reason=outcome.reason,
-                artifacts=_artifacts(entry, success) if success is not None else [],
-                committed_at=_parse_datetime(success.committed_at) if success is not None else None,
-                elapsed=success.elapsed if success is not None else None,
+                artifacts=artifacts,
+                committed_at=committed_at,
+                elapsed=elapsed,
                 upstreams=list(graph.stages[name].needs),
             )
         )

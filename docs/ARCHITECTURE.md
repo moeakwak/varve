@@ -69,6 +69,14 @@ Upstream keys enter through reads. A stage body takes upstream outputs via `ctx.
 
 A record resolves to one of six cache states: `hit`, `stale`, `artifact-missing`, `dirty`, `resume`, and `no-cache`.
 
+## Command-scoped observation snapshots
+
+Exact state evaluation shares filesystem fingerprints, static Python source inspection, and parsed success records within one command. The snapshot stays in memory, never enters content keys or the store schema, and never survives into another command.
+
+Static inspection is reusable, but globals, closures, defaults, values, and package scope are resolved for each dependency graph against current bindings. Success records are parsed once per probe; dashboard state keeps only the artifact and timing fields needed for display.
+
+`status`, `show`, and dashboard `ls` share one read-only command session. Runs use an independent snapshot for external-upstream validation, refresh filesystem observations after each successful stage, and update the cached success record after commit. Dashboard `refresh` clears filesystem and record observations after every attempted run, including failures, while retaining static source inspection.
+
 ## Source dependency discovery
 
 `keying/dependencies.py` performs bounded, positive source discovery and returns both stable flat source components and a dependency DAG. `keying/keys.py` consumes the flat components for hashing, while `status.py` consumes the same result for explanation; there is no second discovery implementation in the CLI.
@@ -174,11 +182,13 @@ Per-stage clean only deletes recorded artifacts and store records for the select
 
 ## Dashboard
 
-The top-level `varve` console script reads existing stores. Discovery is zero-import and stops descending once it finds a valid branch output root, so materialized artifacts are never treated as further scan roots. Temporary branches under `out/.tmp` are filtered out unless `--include-temp` is passed.
+The top-level `varve` console script reads existing stores. Discovery is zero-import and stops descending once `_branch_output_id()` confirms a valid branch output root, so materialized artifacts are never treated as further scan roots. A valid temporary output root remains terminal even when it is filtered out because `--include-temp` was not passed. An invalid `.varve` directory does not stop traversal and therefore cannot hide a deeper valid store.
 
 `varve ls`, `show`, and `refresh` use the same exact state loader. It imports stored manifest modules, resolves branches, builds graphs, fingerprints current inputs, and probes artifacts. `ls` renders `STATUS` and hit/total `STAGES`; `refresh` runs branches whose evaluated status is executable — `artifact-missing`, `dirty`, `no-cache`, `resume`, or `stale`.
 
 The dashboard and the generated `Pipeline.cli()` commands share `style.py` for status colors and console construction, so both render the same aligned tables and semantic colors. Rich drops color automatically when output is not a terminal.
+
+Potentially slow discovery and exact evaluation use transient Rich status spinners only when the shared console is attached to a TTY. The status context ends before final tables or refresh run logs are emitted; redirected output contains only the existing final command output.
 
 ## Known limitations
 

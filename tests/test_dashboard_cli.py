@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
+from time import sleep
 from typing import cast
 
 import pytest
@@ -10,7 +11,7 @@ from rich.console import Console
 
 from varve import Pipeline, stage
 from varve.dashboard import render
-from varve.dashboard.cli import main
+from varve.dashboard.cli import _loading, main
 from varve.dashboard.models import (
     PipelineEntry,
     PipelineState,
@@ -221,7 +222,7 @@ def test_refresh_runs_executable_entries_in_discovery_order(
         assert include_temporary is True
         return entries
 
-    def fake_state(entry: PipelineEntry):
+    def fake_state(entry: PipelineEntry, _session):
         status = cast(PipelineStatus, entry.pipeline_id if entry.pipeline_id != "hit" else "hit")
         return PipelineState(entry=entry, stages=[], status=status, error=None)
 
@@ -281,7 +282,7 @@ def test_refresh_prefix_filters_entries_by_module(
     )
     checked: list[str] = []
 
-    def fake_state(entry: PipelineEntry):
+    def fake_state(entry: PipelineEntry, _session):
         checked.append(entry.pipeline_id)
         return PipelineState(entry=entry, stages=[], status="stale", error=None)
 
@@ -315,7 +316,7 @@ def test_refresh_initializes_cli_logging(
     )
     monkeypatch.setattr(
         "varve.dashboard.cli.load_state",
-        lambda item: PipelineState(entry=item, stages=[], status="stale", error=None),
+        lambda item, _session: PipelineState(entry=item, stages=[], status="stale", error=None),
     )
     calls: list[bool] = []
     monkeypatch.setattr(
@@ -349,7 +350,7 @@ def test_refresh_noops_when_no_entries_are_executable(
     )
     monkeypatch.setattr(
         "varve.dashboard.cli.load_state",
-        lambda item: PipelineState(entry=item, stages=[], status="hit", error=None),
+        lambda item, _session: PipelineState(entry=item, stages=[], status="hit", error=None),
     )
     monkeypatch.setattr(
         "varve.dashboard.cli._run_entry",
@@ -496,3 +497,91 @@ def test_render_overview_shows_total_stage_elapsed(
     output = buffer.getvalue()
     assert "DURATION" in output
     assert "3.75s" in output
+
+
+def test_ls_shares_one_keying_session_across_pipeline_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = [
+        PipelineEntry(
+            output_root=tmp_path / name / "out" / "main",
+            pipeline_id=name,
+            pipeline_name="Demo",
+            branch="main",
+            module="tests.demo",
+        )
+        for name in ("first", "second")
+    ]
+    sessions = []
+    monkeypatch.setattr(
+        "varve.dashboard.cli.discover_pipelines",
+        lambda root, *, include_temporary=False: entries,
+    )
+
+    def fake_load(entry, session):
+        sessions.append(session)
+        return PipelineState(entry=entry, stages=[], status="hit", error=None)
+
+    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_load)
+    monkeypatch.setattr("varve.dashboard.cli.render_overview", lambda states: None)
+
+    assert main(["ls", "--root", str(tmp_path)]) == 0
+    assert sessions[0] is sessions[1]
+
+
+def test_refresh_discards_dashboard_observations_after_failed_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = [
+        PipelineEntry(
+            output_root=tmp_path / name / "out" / "main",
+            pipeline_id=name,
+            pipeline_name="Demo",
+            branch="main",
+            module="tests.demo",
+        )
+        for name in ("first", "second")
+    ]
+    observed_record_counts = []
+    monkeypatch.setattr(
+        "varve.dashboard.cli.discover_pipelines",
+        lambda root, *, include_temporary=False: entries,
+    )
+
+    def fake_load(entry, session):
+        observed_record_counts.append(len(session.records))
+        session.records[(entry.output_root, "stage")] = object()
+        return PipelineState(entry=entry, stages=[], status="stale", error=None)
+
+    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_load)
+    calls = 0
+
+    def fake_run(_entry):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("failed after side effect")
+
+    monkeypatch.setattr("varve.dashboard.cli._run_entry", fake_run)
+
+    assert main(["refresh", "--root", str(tmp_path)]) == 1
+    assert observed_record_counts == [0, 0]
+
+
+def test_loading_status_is_tty_only_and_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    tty_buffer = StringIO()
+    tty_console = Console(file=tty_buffer, force_terminal=True, force_interactive=True)
+    with _loading(tty_console, "Discovering pipelines…") as status:
+        assert status is not None
+        assert status.status == "Discovering pipelines…"
+        sleep(0.12)
+    assert "Discovering pipelines…" in tty_buffer.getvalue()
+
+    redirected_buffer = StringIO()
+    redirected_console = Console(file=redirected_buffer, force_terminal=False)
+    with _loading(redirected_console, "Discovering pipelines…"):
+        pass
+    assert redirected_buffer.getvalue() == ""

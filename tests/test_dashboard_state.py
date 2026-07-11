@@ -73,6 +73,8 @@ def test_load_state_uses_engine_outcomes_and_topo_order(
     store.write_success(_single("sample"))
 
     def fake_evaluate_state(*args, **kwargs):
+        kwargs["_record_callback"]("sample", store.read_success("sample"))
+        kwargs["_record_callback"]("summary", None)
         return [
             StageOutcome("sample", "hit", "hit", None),
             StageOutcome("summary", "stale", "source changed", None),
@@ -102,13 +104,15 @@ def test_load_state_reads_stage_elapsed(
     store.ensure_initialized("Demo", module=Demo.__module__)
     store.write_success(_single("sample", elapsed=1.25))
 
-    monkeypatch.setattr(
-        "varve.dashboard.state.evaluate_state",
-        lambda *args, **kwargs: [
+    def fake_evaluate_state(*args, **kwargs):
+        kwargs["_record_callback"]("sample", store.read_success("sample"))
+        kwargs["_record_callback"]("summary", None)
+        return [
             StageOutcome("sample", "hit", "hit", None),
             StageOutcome("summary", "no-cache", "no cache", None),
-        ],
-    )
+        ]
+
+    monkeypatch.setattr("varve.dashboard.state.evaluate_state", fake_evaluate_state)
 
     state = load_state(_entry(output_root))
 

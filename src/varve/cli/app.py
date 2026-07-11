@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -350,20 +351,27 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         raise ValueError("--slice is only allowed on temporary branches")
     args = _args_from_namespace(pipeline, namespace)
     if namespace.command == "status":
-        status = collect_pipeline_status(
-            pipeline,
-            config,
-            args=args,
-            out=pipeline.output_root(
-                config,
-                cli_out=resolved.output_base,
-                branch=resolved.branch,
-                is_temporary=resolved.is_temporary,
-            ),
-            branch=resolved.branch,
-            stage=namespace.stage,
-            graph=graph,
+        console = make_console()
+        loading = (
+            console.status("Evaluating pipeline status…", spinner="dots")
+            if console.is_terminal
+            else nullcontext()
         )
+        with loading:
+            status = collect_pipeline_status(
+                pipeline,
+                config,
+                args=args,
+                out=pipeline.output_root(
+                    config,
+                    cli_out=resolved.output_base,
+                    branch=resolved.branch,
+                    is_temporary=resolved.is_temporary,
+                ),
+                branch=resolved.branch,
+                stage=namespace.stage,
+                graph=graph,
+            )
         if namespace.expand and (is_matrix_base or (namespace.stage is None and has_matrix)):
             view = "cells"
         elif namespace.stage is None or is_matrix_base:
@@ -378,7 +386,7 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             else 0
         )
         render_status(
-            make_console(),
+            console,
             status,
             view=view,
             dependency_depth=dependency_depth,

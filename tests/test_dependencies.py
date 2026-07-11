@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import linecache
 import sys
 import textwrap
 from collections.abc import Iterator
@@ -13,7 +14,11 @@ from types import ModuleType
 import pytest
 
 from varve.keying import dependencies
-from varve.keying.dependencies import default_packages, discover_source_dependencies
+from varve.keying.dependencies import (
+    SourceInspectionSession,
+    default_packages,
+    discover_source_dependencies,
+)
 
 
 @contextmanager
@@ -421,14 +426,14 @@ def test_inferred_source_failure_skips_only_that_branch(
             """,
         },
     ) as module:
-        original = dependencies.source_hash
+        original = SourceInspectionSession.inspect_callable
 
-        def selective_failure(value):
+        def selective_failure(self, value):
             if value is module.bad:
                 raise ValueError("cannot inspect")
-            return original(value)
+            return original(self, value)
 
-        monkeypatch.setattr(dependencies, "source_hash", selective_failure)
+        monkeypatch.setattr(SourceInspectionSession, "inspect_callable", selective_failure)
         result = discover_source_dependencies(
             module.stage,
             explicit_uses=(),
@@ -438,6 +443,77 @@ def test_inferred_source_failure_skips_only_that_branch(
 
         assert result.find("sample_project.pipeline.good") is not None
         assert result.find("sample_project.pipeline.bad") is None
+
+
+def test_command_inspection_reuses_static_source_but_resolves_current_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with loaded_project(
+        tmp_path,
+        {
+            "sample_project.pipeline": """
+                def first(value): return value
+                def second(value): return value + 1
+                helper = first
+                def stage_a(value): return helper(value)
+                def stage_b(value): return helper(value)
+            """,
+        },
+    ) as module:
+        session = SourceInspectionSession()
+        original = dependencies.inspect.getsourcelines
+        helper_calls = 0
+
+        def counted(value):
+            nonlocal helper_calls
+            if value is module.first:
+                helper_calls += 1
+            return original(value)
+
+        monkeypatch.setattr(dependencies.inspect, "getsourcelines", counted)
+        first = discover_source_dependencies(
+            module.stage_a,
+            explicit_uses=(),
+            auto_uses=True,
+            packages=("sample_project",),
+            inspection=session,
+        )
+        second = discover_source_dependencies(
+            module.stage_b,
+            explicit_uses=(),
+            auto_uses=True,
+            packages=("sample_project",),
+            inspection=session,
+        )
+
+        assert first.find("sample_project.pipeline.first") is not None
+        assert second.find("sample_project.pipeline.first") is not None
+        assert helper_calls == 1
+
+        setattr(module, "helper", module.second)
+        rebound = discover_source_dependencies(
+            module.stage_a,
+            explicit_uses=(),
+            auto_uses=True,
+            packages=("sample_project",),
+            inspection=session,
+        )
+        assert rebound.find("sample_project.pipeline.second") is not None
+        assert rebound.find("sample_project.pipeline.first") is None
+
+
+def test_source_hash_does_not_leak_across_command_sessions(tmp_path: Path) -> None:
+    with loaded_project(
+        tmp_path,
+        {"sample_project.pipeline": "def stage(value): return value + 1\n"},
+    ) as module:
+        first = SourceInspectionSession().inspect_callable(module.stage).digest
+        assert module.__file__ is not None
+        Path(module.__file__).write_text("def stage(value): return value + 2\n", encoding="utf-8")
+        linecache.checkcache(module.__file__)
+        second = SourceInspectionSession().inspect_callable(module.stage).digest
+
+        assert second != first
 
 
 def test_unexpected_discovery_failure_preserves_explicit_roots(

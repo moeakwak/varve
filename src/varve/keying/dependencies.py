@@ -7,11 +7,12 @@ import inspect
 import logging
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from types import CodeType, ModuleType
 from typing import Any, Literal
 
-from varve.keying.astkey import module_source_hash, source_hash
+from varve.keying.astkey import _normalized_source_hash
 from varve.keying.fingerprint import json_sha256
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,102 @@ DependencyOrigin = Literal["inferred", "explicit"]
 
 _STAGE_ROOT = "stage"
 _UNSUPPORTED = object()
+
+
+@dataclass(frozen=True)
+class _CallableInspection:
+    digest: str
+    source_path: str | None
+    source_line: int
+
+
+@dataclass(frozen=True)
+class _InstructionReference:
+    kind: Literal["global", "closure"]
+    name: str
+    attribute: str | None = None
+
+
+@dataclass
+class SourceInspectionSession:
+    """Cache static Python inspection for one command without caching bindings."""
+
+    callables: dict[Callable[..., Any], _CallableInspection] = field(default_factory=dict)
+    modules: dict[ModuleType, tuple[str, str | None]] = field(default_factory=dict)
+    instructions: dict[CodeType, tuple[_InstructionReference, ...]] = field(default_factory=dict)
+    classes: dict[
+        type[Any], tuple[tuple[tuple[str, Callable[..., Any]], ...], tuple[type[Any], ...]]
+    ] = field(default_factory=dict)
+
+    def inspect_callable(self, value: Callable[..., Any]) -> _CallableInspection:
+        cached = self.callables.get(value)
+        if cached is not None:
+            return cached
+        try:
+            lines, line = inspect.getsourcelines(value)
+        except OSError as error:
+            raise ValueError(f"Cannot inspect source for {value!r}") from error
+        try:
+            path = inspect.getsourcefile(value)
+        except (OSError, TypeError):
+            path = None
+        result = _CallableInspection(
+            digest=_normalized_source_hash(
+                "".join(lines),
+                strip_varve_decorators=hasattr(value, "__varve_stage__"),
+            ),
+            source_path=path,
+            source_line=line,
+        )
+        self.callables[value] = result
+        return result
+
+    def inspect_module(self, module: ModuleType) -> tuple[str, str | None]:
+        cached = self.modules.get(module)
+        if cached is not None:
+            return cached
+        source_path = inspect.getsourcefile(module)
+        if source_path is None:
+            raise ValueError(f"Cannot locate source for module {module.__name__}")
+        source = Path(source_path).read_text(encoding="utf-8")
+        result = (_normalized_source_hash(source), source_path)
+        self.modules[module] = result
+        return result
+
+    def instruction_plan(self, code: CodeType) -> tuple[_InstructionReference, ...]:
+        cached = self.instructions.get(code)
+        if cached is not None:
+            return cached
+        result: list[_InstructionReference] = []
+        for nested in nested_codes(code):
+            instructions = tuple(dis.get_instructions(nested))
+            for index, instruction in enumerate(instructions):
+                if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}:
+                    following = instructions[index + 1] if index + 1 < len(instructions) else None
+                    attribute = (
+                        str(following.argval)
+                        if following is not None
+                        and following.opname in {"LOAD_ATTR", "LOAD_METHOD"}
+                        else None
+                    )
+                    result.append(
+                        _InstructionReference("global", str(instruction.argval), attribute)
+                    )
+                elif instruction.opname == "LOAD_DEREF":
+                    result.append(_InstructionReference("closure", str(instruction.argval)))
+        planned = tuple(result)
+        self.instructions[code] = planned
+        return planned
+
+    def inspect_class(
+        self, cls: type[Any]
+    ) -> tuple[tuple[tuple[str, Callable[..., Any]], ...], tuple[type[Any], ...]]:
+        cached = self.classes.get(cls)
+        if cached is not None:
+            return cached
+        result = (class_functions(cls), tuple(cls.__bases__))
+        self.classes[cls] = result
+        return result
 
 
 @dataclass(frozen=True)
@@ -130,53 +227,50 @@ def _closure_values(func: Callable[..., Any]) -> dict[str, Any]:
     return values
 
 
-def function_references(func: Callable[..., Any]) -> tuple[Reference, ...]:
+def function_references(
+    func: Callable[..., Any],
+    inspection: SourceInspectionSession | None = None,
+) -> tuple[Reference, ...]:
+    inspection = inspection or SourceInspectionSession()
     references: list[Reference] = []
     globals_dict = getattr(func, "__globals__", {})
     owner = qualified_name(func)
     closure_values = _closure_values(func)
 
-    for code in nested_codes(func.__code__):
-        instructions = tuple(dis.get_instructions(code))
-        for index, instruction in enumerate(instructions):
-            if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}:
-                name = str(instruction.argval)
-                if name not in globals_dict:
-                    continue
-                value = globals_dict[name]
-                following = instructions[index + 1] if index + 1 < len(instructions) else None
-                if (
-                    isinstance(value, ModuleType)
-                    and following is not None
-                    and following.opname in {"LOAD_ATTR", "LOAD_METHOD"}
-                ):
-                    attribute = str(following.argval)
-                    references.append(
-                        Reference(
-                            locator=f"auto.value.{value.__name__}.attr.{attribute}",
-                            value=getattr(value, attribute, _UNSUPPORTED),
-                            reason=f"module attribute referenced by {owner}",
-                            module=value,
-                        )
+    for reference in inspection.instruction_plan(func.__code__):
+        if reference.kind == "global":
+            name = reference.name
+            if name not in globals_dict:
+                continue
+            value = globals_dict[name]
+            if isinstance(value, ModuleType) and reference.attribute is not None:
+                attribute = reference.attribute
+                references.append(
+                    Reference(
+                        locator=f"auto.value.{value.__name__}.attr.{attribute}",
+                        value=getattr(value, attribute, _UNSUPPORTED),
+                        reason=f"module attribute referenced by {owner}",
+                        module=value,
                     )
-                else:
-                    references.append(
-                        Reference(
-                            locator=f"auto.value.{owner}.global.{name}",
-                            value=value,
-                            reason=f"global referenced by {owner}",
-                        )
+                )
+            else:
+                references.append(
+                    Reference(
+                        locator=f"auto.value.{owner}.global.{name}",
+                        value=value,
+                        reason=f"global referenced by {owner}",
                     )
-            elif instruction.opname == "LOAD_DEREF":
-                name = str(instruction.argval)
-                if name in closure_values:
-                    references.append(
-                        Reference(
-                            locator=f"auto.value.{owner}.closure.{name}",
-                            value=closure_values[name],
-                            reason=f"closure referenced by {owner}",
-                        )
+                )
+        else:
+            name = reference.name
+            if name in closure_values:
+                references.append(
+                    Reference(
+                        locator=f"auto.value.{owner}.closure.{name}",
+                        value=closure_values[name],
+                        reason=f"closure referenced by {owner}",
                     )
+                )
 
     for name, parameter in inspect.signature(func).parameters.items():
         if parameter.default is inspect.Parameter.empty:
@@ -221,21 +315,15 @@ def class_functions(cls: type[Any]) -> tuple[tuple[str, Callable[..., Any]], ...
     return tuple(result)
 
 
-def _source_location(value: Any) -> tuple[str | None, int | None]:
-    try:
-        path = inspect.getsourcefile(value)
-    except (OSError, TypeError):
-        path = None
-    try:
-        line = inspect.getsourcelines(value)[1]
-    except (OSError, TypeError):
-        line = None
-    return path, line
-
-
 class _Builder:
-    def __init__(self, packages: tuple[str, ...], stage_func: Callable[..., Any]) -> None:
+    def __init__(
+        self,
+        packages: tuple[str, ...],
+        stage_func: Callable[..., Any],
+        inspection: SourceInspectionSession,
+    ) -> None:
         self.packages = packages
+        self.inspection = inspection
         self.stage_identity = self._identity(stage_func)
         self.components: dict[str, str] = {}
         self.nodes: dict[str, DependencyNode] = {}
@@ -255,19 +343,18 @@ class _Builder:
         scope = "whole class" if kind == "class" else None
         name = qualified_name(value)
         identity = f"{kind}:{name}"
-        digest = source_hash(value)
-        path, line = _source_location(value)
+        inspected = self.inspection.inspect_callable(value)
         self.nodes[identity] = DependencyNode(
             identity=identity,
             kind=kind,
             qualified_name=name,
-            digest=digest,
+            digest=inspected.digest,
             origin="explicit",
             scope=scope,
-            source_path=path,
-            source_line=line,
+            source_path=inspected.source_path,
+            source_line=inspected.source_line,
         )
-        self.components[f"uses.{kind}.{name}"] = digest
+        self.components[f"uses.{kind}.{name}"] = inspected.digest
         self._connect(_STAGE_ROOT, identity, "declared by uses", direct=True)
 
     def add_inferred_from(self, value: Callable[..., Any], *, stage_root: bool = False) -> None:
@@ -293,7 +380,7 @@ class _Builder:
             return
         self.scanned.add(identity)
         try:
-            references = function_references(func)
+            references = function_references(func, self.inspection)
         except Exception:
             logger.debug("auto_uses could not inspect %s", qualified_name(func), exc_info=True)
             return
@@ -312,9 +399,10 @@ class _Builder:
         if identity in self.scanned:
             return
         self.scanned.add(identity)
-        for _, func in class_functions(cls):
+        functions, bases = self.inspection.inspect_class(cls)
+        for _, func in functions:
             try:
-                references = function_references(func)
+                references = function_references(func, self.inspection)
             except Exception:
                 logger.debug("auto_uses could not inspect %s", qualified_name(func), exc_info=True)
                 continue
@@ -327,7 +415,7 @@ class _Builder:
                         qualified_name(func),
                         exc_info=True,
                     )
-        for base in cls.__bases__:
+        for base in bases:
             if base is object:
                 continue
             self._add_inferred_object(
@@ -387,22 +475,21 @@ class _Builder:
             return
         if identity not in self.nodes:
             try:
-                digest = source_hash(value)
+                inspected = self.inspection.inspect_callable(value)
             except Exception:
                 logger.debug("auto_uses could not hash %s", name, exc_info=True)
                 return
-            path, line = _source_location(value)
             self.nodes[identity] = DependencyNode(
                 identity=identity,
                 kind=kind,
                 qualified_name=name,
-                digest=digest,
+                digest=inspected.digest,
                 origin="inferred",
                 scope="whole class" if kind == "class" else None,
-                source_path=path,
-                source_line=line,
+                source_path=inspected.source_path,
+                source_line=inspected.source_line,
             )
-            self.components[f"auto.{kind}.{name}"] = digest
+            self.components[f"auto.{kind}.{name}"] = inspected.digest
         self._connect(parent, identity, reason, direct=direct)
         if inspect.isclass(value):
             self._scan_class(value, parent=identity, direct=False)
@@ -423,11 +510,10 @@ class _Builder:
         identity = f"module:{name}"
         if identity not in self.nodes:
             try:
-                digest = module_source_hash(module)
+                digest, path = self.inspection.inspect_module(module)
             except Exception:
                 logger.debug("auto_uses could not hash module %s", name, exc_info=True)
                 return
-            path, _ = _source_location(module)
             self.nodes[identity] = DependencyNode(
                 identity=identity,
                 kind="module",
@@ -486,9 +572,10 @@ def discover_source_dependencies(
     explicit_uses: tuple[Callable[..., Any], ...],
     auto_uses: bool,
     packages: tuple[str, ...] | None,
+    inspection: SourceInspectionSession | None = None,
 ) -> SourceDependencies:
     resolved_packages = default_packages(stage_func) if packages is None else packages
-    builder = _Builder(resolved_packages, stage_func)
+    builder = _Builder(resolved_packages, stage_func, inspection or SourceInspectionSession())
     for explicit in explicit_uses:
         builder.add_explicit(explicit)
     if auto_uses:

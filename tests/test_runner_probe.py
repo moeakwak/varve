@@ -536,3 +536,27 @@ def test_all_hit_matrix_cells_share_one_fingerprint_session(
     assert {outcome.status for outcome in outcomes} == {"hit"}
     assert len(sessions) == 97
     assert all(session is sessions[0] for session in sessions)
+
+
+def test_probe_reads_each_success_record_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run(MatrixProbePipeline, Config(), args=MatrixProbePipeline.Args(), cli_out=tmp_path)
+    reads: dict[str, int] = {}
+    original = Store.read_success
+
+    def counted(self, stage):
+        reads[stage] = reads.get(stage, 0) + 1
+        return original(self, stage)
+
+    monkeypatch.setattr(Store, "read_success", counted)
+    probes = probe_pipeline(
+        MatrixProbePipeline,
+        Config(),
+        args=MatrixProbePipeline.Args(),
+        out=tmp_path / "main",
+    )
+
+    assert len(probes) == 4
+    assert reads == {stage: 1 for stage in MatrixProbePipeline.graph().topo_order()}

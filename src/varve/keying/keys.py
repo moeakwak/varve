@@ -9,9 +9,12 @@ from typing import Annotated, Any, Protocol, Union, get_args, get_origin
 
 from pydantic import BaseModel
 
-from varve.keying.astkey import source_hash
 from varve.keying.config_access import project_config
-from varve.keying.dependencies import SourceDependencies, discover_source_dependencies
+from varve.keying.dependencies import (
+    SourceDependencies,
+    SourceInspectionSession,
+    discover_source_dependencies,
+)
 from varve.keying.fingerprint import (
     FingerprintSession,
     file_digest_view,
@@ -109,14 +112,17 @@ def compute_source_dependencies(
     stage_spec: StageSpecLike,
     *,
     auto_uses_packages: tuple[str, ...] | None = None,
+    inspection: SourceInspectionSession | None = None,
 ) -> SourceDependencies:
+    inspection = inspection or SourceInspectionSession()
     discovered = discover_source_dependencies(
         stage_spec.func,
         explicit_uses=stage_spec.uses,
         auto_uses=stage_spec.auto_uses,
         packages=auto_uses_packages,
+        inspection=inspection,
     )
-    return discovered.with_component("stage", source_hash(stage_spec.func))
+    return discovered.with_component("stage", inspection.inspect_callable(stage_spec.func).digest)
 
 
 def compute_key_components(
