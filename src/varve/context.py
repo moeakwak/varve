@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Callable, Iterable
 from pathlib import Path
 from typing import Any, Generic, TypeVar, cast
 
+from varve.matrix import Cell
 from varve.store.store import Store
 
 ConfigT = TypeVar("ConfigT")
@@ -70,14 +71,20 @@ class Ctx(Generic[ConfigT, ArgsT]):
         resume_skip: frozenset[int] | None = None,
         stage_name: str | None = None,
         declared_needs: frozenset[str] | None = None,
+        cell: Cell | None = None,
+        cell_out: Path | None = None,
+        need_cells: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         self.config: ConfigT = config
         self.args: ArgsT = cast(ArgsT, args)
         self.out = out
+        self.cell = cell or Cell()
+        self.cell_out = cell_out or out
         self._store = store
         self._resume_skip = resume_skip or frozenset()
         self._stage_name = stage_name
         self._declared_needs = declared_needs
+        self._need_cells = need_cells
         self._current_batch_index: int | None = None
         self._used_resume = False
 
@@ -92,16 +99,24 @@ class Ctx(Generic[ConfigT, ArgsT]):
 
     def _input_paths(self, stage: str) -> list[Path]:
         self._check_declared_need(stage)
-        record = self._store.read_success(stage)
-        if record is None:
-            raise ValueError(f"Upstream stage has no success record: {stage}")
-        if record.kind == "single":
-            assert record.produces is not None
-            return [self.out / item.path for item in record.produces]
-        assert record.outputs is not None
-        return [
-            self.out / item.path for item in sorted(record.outputs, key=lambda item: item.index)
-        ]
+        concrete_names = (
+            self._need_cells.get(stage, ()) if self._need_cells is not None else (stage,)
+        )
+        paths: list[Path] = []
+        for concrete_name in concrete_names:
+            record = self._store.read_success(concrete_name)
+            if record is None:
+                raise ValueError(f"Upstream stage has no success record: {concrete_name}")
+            if record.kind == "single":
+                assert record.produces is not None
+                paths.extend(self.out / item.path for item in record.produces)
+            else:
+                assert record.outputs is not None
+                paths.extend(
+                    self.out / item.path
+                    for item in sorted(record.outputs, key=lambda item: item.index)
+                )
+        return paths
 
     def input(self, stage: str) -> Path:
         """Return the single output path produced by an upstream stage.

@@ -11,6 +11,7 @@ from typing import Any, Literal
 from varve.engine.runner import probe_pipeline
 from varve.engine.state import Status
 from varve.keying.dependencies import SourceDependencies
+from varve.matrix import PipelineGraph, build_graph
 from varve.models import FileFingerprint
 from varve.pipeline import Pipeline
 
@@ -102,18 +103,21 @@ def collect_pipeline_status(
     out: Path,
     branch: str,
     stage: str | None = None,
+    graph: PipelineGraph | None = None,
 ) -> PipelineStatus:
     """Collect decision keys and dependency descriptions without executing stages."""
 
-    if stage is not None and stage not in pipeline.stages():
-        raise ValueError(f"Unknown varve stage: {stage}")
-    probes = probe_pipeline(pipeline, config, args=args, out=out)
+    graph = graph or build_graph(pipeline)
+    selected_names = None if stage is None else set(graph.names_for(stage))
+    probes = probe_pipeline(pipeline, config, args=args, out=out, graph=graph)
     selected_probes = (
-        probes if stage is None else tuple(probe for probe in probes if probe.stage == stage)
+        probes
+        if selected_names is None
+        else tuple(probe for probe in probes if probe.stage in selected_names)
     )
     stages: list[StageStatus] = []
     for probe in selected_probes:
-        spec = pipeline.stages()[probe.stage]
+        spec = graph.stages[probe.stage]
         components = probe.components
         key_inputs = (
             None

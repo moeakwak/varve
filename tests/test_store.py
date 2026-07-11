@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from varve.models import (
     AttemptMarker,
     BatchRecord,
     KeyComponents,
+    Manifest,
     OutputHandle,
     SuccessRecord,
 )
@@ -20,13 +22,23 @@ def _components() -> KeyComponents:
 
 def test_store_initializes_gitignore_and_manifest(tmp_path: Path) -> None:
     store = Store(tmp_path)
-    store.ensure_initialized("Demo", module="pkg.demo", temporary_config={"token": "x"})
+    store.ensure_initialized(
+        "Demo",
+        module="pkg.demo",
+        temporary_config={"token": "x"},
+        temporary_axes={"bench": ("a", "b")},
+    )
     assert (tmp_path / ".varve" / ".gitignore").read_text(encoding="utf-8") == "*\n"
     manifest = store.read_manifest()
     assert manifest is not None
+    assert manifest.schema_version == 4
     assert manifest.pipeline == "Demo"
     assert manifest.module == "pkg.demo"
     assert manifest.temporary_config == {"token": "x"}
+    assert manifest.temporary_axes == {"bench": ["a", "b"]}
+    manifest_data = json.loads((store.root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest_data["schema_version"] == 4
+    assert manifest_data["temporary_axes"] == {"bench": ["a", "b"]}
     with pytest.raises(ValueError, match="belongs to Demo"):
         store.ensure_initialized("Other")
 
@@ -57,6 +69,48 @@ def test_success_round_trip_and_tmp_does_not_pollute(tmp_path: Path) -> None:
     )
     store.write_success(record)
     (tmp_path / ".varve" / "stages" / "transform.json.tmp").write_text("{bad", encoding="utf-8")
+    assert store.read_success("transform") == record
+    record_data = json.loads((store.root / "stages" / "transform.json").read_text(encoding="utf-8"))
+    assert record_data["schema_version"] == 4
+
+
+@pytest.mark.parametrize("schema_version", [2, 3])
+def test_store_reads_older_manifest_and_success(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    store = Store(tmp_path)
+    store.root.mkdir(parents=True)
+    (store.root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "pipeline": "Demo",
+                "module": "pkg.demo",
+                "temporary_config": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    record = SuccessRecord(
+        schema_version=schema_version,
+        pipeline="Demo",
+        stage="transform",
+        kind="batch",
+        content_key="sha256:a",
+        key_components=_components(),
+        outputs=[OutputHandle(index=0, path="part-0.txt")],
+        committed_at="now",
+    )
+    store.write_success(record)
+
+    assert store.read_manifest() == Manifest(
+        schema_version=schema_version,
+        pipeline="Demo",
+        module="pkg.demo",
+        temporary_config=None,
+        temporary_axes=None,
+    )
     assert store.read_success("transform") == record
 
 

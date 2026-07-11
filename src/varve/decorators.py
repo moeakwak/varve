@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -27,6 +27,18 @@ class StageSpec:
     keyspec: KeySpec
     auto_uses: bool = True
     uses: tuple[Callable[..., Any], ...] = ()
+    matrix: tuple[Any, ...] = ()
+    logical_needs: tuple[str, ...] = ()
+    cell: tuple[tuple[Any, Any], ...] = ()
+    need_cells: dict[str, tuple[str, ...]] | None = None
+
+    def expanded(self, *, name: str, cell: tuple[tuple[Any, Any], ...]) -> StageSpec:
+        return replace(self, name=name, logical_needs=self.needs, cell=cell)
+
+    def with_wiring(
+        self, needs: tuple[str, ...], need_cells: dict[str, tuple[str, ...]]
+    ) -> StageSpec:
+        return replace(self, needs=needs, need_cells=need_cells)
 
 
 def _need_name(need: NeedItem) -> str:
@@ -112,5 +124,21 @@ def batch_stage(
             uses=tuple(uses),
         )
         return _attach_stage_spec(func, spec)
+
+    return decorate
+
+
+def matrix(*axes: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Expand a stage over the Cartesian product of the supplied axes."""
+    if not axes:
+        raise ValueError("matrix requires at least one Axis")
+    if len({id(axis) for axis in axes}) != len(axes):
+        raise ValueError("matrix axes must not repeat")
+
+    def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+        spec = getattr(func, "__varve_stage__", None)
+        if spec is None:
+            raise TypeError("@matrix must be stacked above @stage or @batch_stage")
+        return _attach_stage_spec(func, replace(spec, matrix=tuple(axes)))
 
     return decorate

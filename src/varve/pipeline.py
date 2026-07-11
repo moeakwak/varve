@@ -66,6 +66,12 @@ class Pipeline:
         return list(TopologicalSorter(graph).static_order())
 
     @classmethod
+    def graph(cls, axes: dict[str, list[str] | tuple[str, ...]] | None = None):
+        from varve.matrix import build_graph
+
+        return build_graph(cls, axes)
+
+    @classmethod
     def import_module_name(cls) -> str:
         if cls.__module__ != "__main__":
             return cls.__module__

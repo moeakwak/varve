@@ -136,7 +136,15 @@ def compute_key_components(
     config = project_config(config_data(ctx.config), config_access)
     files = files_fingerprints(ctx, stage_spec.keyspec.files, cached_by_name=cached_files)
     values = {name: getter(ctx) for name, getter in sorted(stage_spec.keyspec.values.items())}
-    upstreams = {name: {"content_key": upstream_keys[name]} for name in sorted(stage_spec.needs)}
+    need_cells = getattr(stage_spec, "need_cells", None) or {}
+    has_matrix_fan_in = any(len(names) > 1 for names in need_cells.values())
+    upstreams = {
+        name: {
+            "content_key": upstream_keys[name],
+            **({"position": str(index)} if has_matrix_fan_in else {}),
+        }
+        for index, name in enumerate(stage_spec.needs)
+    }
 
     return KeyComponents(
         source=source_result.components,

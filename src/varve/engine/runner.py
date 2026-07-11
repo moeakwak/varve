@@ -23,6 +23,7 @@ from varve.keying.keys import (
     config_data,
     content_key,
 )
+from varve.matrix import Cell, PipelineGraph, build_graph
 from varve.models import (
     AttemptMarker,
     BatchRecord,
@@ -128,16 +129,32 @@ def _produced_paths(produces: ProducesSpec, ctx: Ctx[Any, Any]) -> list[Produced
     result = []
     for item in paths:
         declared = Path(item)
-        path = declared if declared.is_absolute() else ctx.out / declared
+        path = declared if declared.is_absolute() else ctx.cell_out / declared
         if not path.exists():
             raise FileNotFoundError(f"Declared varve output does not exist: {path}")
         relative = _relative_to_out(
             path,
-            ctx.out,
+            ctx.cell_out if ctx.cell else ctx.out,
             description="Declared varve output",
         )
+        relative = _relative_to_out(path, ctx.out, description="Declared varve output")
         result.append(ProducedPath(path=relative, kind="dir" if path.is_dir() else "file"))
     return result
+
+
+def _validate_static_produces_location(produces: ProducesSpec, ctx: Ctx[Any, Any]) -> None:
+    if produces is None or callable(produces):
+        return
+    paths: list[ProducesItem] = [produces] if isinstance(produces, str | Path) else list(produces)
+    for item in paths:
+        declared = Path(item)
+        path = declared if declared.is_absolute() else ctx.cell_out / declared
+        if ctx.cell:
+            _relative_to_out(
+                path,
+                ctx.cell_out,
+                description="Declared matrix stage output",
+            )
 
 
 def _success_outputs_exist(record: SuccessRecord, out: Path) -> bool:
@@ -149,9 +166,9 @@ def _success_outputs_exist(record: SuccessRecord, out: Path) -> bool:
 
 
 def _stage_sets(
-    pipeline_type: type[Pipeline],
+    graph: PipelineGraph,
 ) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    stages = pipeline_type.stages()
+    stages = graph.stages
     ancestors = {name: set(spec.needs) for name, spec in stages.items()}
     descendants = {name: set() for name in stages}
     for name, spec in stages.items():
@@ -173,24 +190,19 @@ def _closure(seed: str, graph: dict[str, set[str]]) -> set[str]:
 
 
 def selected_stages(
-    pipeline_type: type[Pipeline],
+    pipeline_or_graph: type[Pipeline] | PipelineGraph,
     *,
     upto: str | None = None,
     downstream: str | None = None,
+    only: str | None = None,
+    slices: tuple[str, ...] | list[str] = (),
 ) -> set[str]:
-    specified = [item is not None for item in (upto, downstream)]
-    if sum(specified) > 1:
-        raise ValueError("upto and downstream are mutually exclusive")
-    stages = pipeline_type.stages()
-    for name in (upto, downstream):
-        if name is not None and name not in stages:
-            raise ValueError(f"Unknown varve stage: {name}")
-    ancestors, descendants = _stage_sets(pipeline_type)
-    if downstream is not None:
-        return _closure(downstream, descendants)
-    if upto is not None:
-        return _closure(upto, ancestors)
-    return set(stages)
+    graph = (
+        pipeline_or_graph
+        if isinstance(pipeline_or_graph, PipelineGraph)
+        else build_graph(pipeline_or_graph)
+    )
+    return graph.selected(upto=upto, downstream=downstream, only=only, slices=slices)
 
 
 def _upstream_keys(
@@ -212,11 +224,14 @@ def _upstream_keys(
 
 def _validate_external_upstreams(
     pipeline_type: type[Pipeline],
+    graph: PipelineGraph,
     selected: set[str],
     store: Store,
     out: Path,
+    config: Any,
+    args: Any,
 ) -> None:
-    stages = pipeline_type.stages()
+    stages = graph.stages
     for stage_name in selected:
         for upstream in stages[stage_name].needs:
             if upstream in selected:
@@ -229,6 +244,30 @@ def _validate_external_upstreams(
                 raise ValueError(f"Upstream stage has not been built: {upstream}")
             if not _success_outputs_exist(record, out):
                 raise ValueError(f"Upstream stage artifacts are missing: {upstream}")
+    external = {
+        upstream
+        for stage_name in selected
+        for upstream in stages[stage_name].needs
+        if upstream not in selected
+    }
+    if not external:
+        return
+    probes = {
+        probe.stage: probe
+        for probe in probe_pipeline(
+            pipeline_type,
+            config,
+            args=args,
+            out=out,
+            graph=graph,
+        )
+    }
+    for upstream in sorted(external):
+        decision = probes[upstream].decision
+        if decision.status != "hit":
+            raise ValueError(
+                f"Upstream stage is not current: {upstream} ({decision.status}: {decision.reason})"
+            )
 
 
 def _batch_outputs_from_records(
@@ -298,6 +337,7 @@ def _commit_components(
 
 def _probe_stage(
     pipeline_type: type[Pipeline],
+    graph: PipelineGraph,
     stage_name: str,
     *,
     config: Any,
@@ -307,7 +347,7 @@ def _probe_stage(
     known_content_keys: dict[str, str],
     source_dependencies: SourceDependencies,
 ) -> StageProbe:
-    stage_spec = pipeline_type.stages()[stage_name]
+    stage_spec = graph.stages[stage_name]
     previous = store.read_success(stage_name)
     upstream_keys = _upstream_keys(stage_spec, store, known_content_keys)
     cached_files = previous.key_components.files if previous is not None else None
@@ -318,7 +358,10 @@ def _probe_stage(
         out=out,
         store=store,
         stage_name=stage_name,
-        declared_needs=frozenset(stage_spec.needs),
+        declared_needs=frozenset(stage_spec.logical_needs),
+        cell=Cell(stage_spec.cell),
+        cell_out=out / stage_name if stage_spec.cell else out,
+        need_cells=stage_spec.need_cells,
     )
     components = compute_key_components(
         stage_spec,
@@ -367,14 +410,17 @@ def probe_pipeline(
     *,
     args: Any,
     out: Path,
+    axes: dict[str, tuple[str, ...]] | None = None,
+    graph: PipelineGraph | None = None,
 ) -> tuple[StageProbe, ...]:
     """Probe every stage in topology order without executing or writing state."""
 
     store = Store(out)
     known_content_keys: dict[str, str] = {}
     probes: list[StageProbe] = []
-    for stage_name in pipeline_type.topo_order():
-        stage_spec = pipeline_type.stages()[stage_name]
+    graph = graph or build_graph(pipeline_type, axes)
+    for stage_name in graph.topo_order():
+        stage_spec = graph.stages[stage_name]
         source_dependencies = compute_source_dependencies(
             stage_spec,
             auto_uses_packages=pipeline_type.auto_uses_packages,
@@ -398,6 +444,7 @@ def probe_pipeline(
             continue
         probe = _probe_stage(
             pipeline_type,
+            graph,
             stage_name,
             config=config,
             args=args,
@@ -413,13 +460,15 @@ def probe_pipeline(
 
 
 async def _execute_stage(instance, stage_spec, ctx: Ctx) -> None:
-    result = stage_spec.func(instance, ctx)
+    coordinates = {axis.name: value for axis, value in stage_spec.cell}
+    result = stage_spec.func(instance, ctx, **coordinates)
     if inspect.isawaitable(result):
         await result
 
 
 async def _execute_batch(instance, stage_spec, ctx: Ctx):
-    generator = stage_spec.func(instance, ctx)
+    coordinates = {axis.name: value for axis, value in stage_spec.cell}
+    generator = stage_spec.func(instance, ctx, **coordinates)
     if not hasattr(generator, "__aiter__"):
         raise TypeError(f"Batch stage must return an async iterator: {stage_spec.name}")
     async for yielded in generator:
@@ -431,36 +480,39 @@ async def _execute_batch(instance, stage_spec, ctx: Ctx):
 
 async def _drive(
     pipeline_type: type[Pipeline],
+    graph: PipelineGraph,
     config,
     *,
     args,
     out: Path,
     upto: str | None,
     downstream: str | None,
+    only: str | None,
     force: bool,
     execute: bool,
+    slices: tuple[str, ...] = (),
 ) -> list[StageOutcome]:
     store = Store(out)
     selected = selected_stages(
-        pipeline_type,
+        graph,
         upto=upto,
         downstream=downstream,
+        only=only,
+        slices=slices,
     )
     if execute:
-        _validate_external_upstreams(pipeline_type, selected, store, out)
+        _validate_external_upstreams(pipeline_type, graph, selected, store, out, config, args)
 
     instance = pipeline_type()
     outcomes: list[StageOutcome] = []
     known_content_keys: dict[str, str] = {}
     logger = logging.getLogger("varve")
-    logger.info(
-        "plan: %s", " -> ".join(name for name in pipeline_type.topo_order() if name in selected)
-    )
+    logger.info("plan: %s", " -> ".join(name for name in graph.topo_order() if name in selected))
 
-    for stage_name in pipeline_type.topo_order():
+    for stage_name in graph.topo_order():
         if stage_name not in selected:
             continue
-        stage_spec = pipeline_type.stages()[stage_name]
+        stage_spec = graph.stages[stage_name]
         if not execute:
             missing_upstream = any(store.read_success(name) is None for name in stage_spec.needs)
             if missing_upstream:
@@ -472,6 +524,7 @@ async def _drive(
             )
             probe = _probe_stage(
                 pipeline_type,
+                graph,
                 stage_name,
                 config=config,
                 args=args,
@@ -505,7 +558,7 @@ async def _drive(
         previous = store.read_success(stage_name)
         cached_files = previous.key_components.files if previous is not None else None
         previous_access = previous.key_components.config_access if previous is not None else None
-        declared_needs = frozenset(stage_spec.needs)
+        declared_needs = frozenset(stage_spec.logical_needs)
         ctx_for_key = Ctx(
             config=config,
             args=args,
@@ -513,6 +566,9 @@ async def _drive(
             store=store,
             stage_name=stage_name,
             declared_needs=declared_needs,
+            cell=Cell(stage_spec.cell),
+            cell_out=out / stage_name if stage_spec.cell else out,
+            need_cells=stage_spec.need_cells,
         )
         # Probe key: project config onto the fields the previous run read (whole
         # config when there is no prior record). The committed key below is
@@ -574,6 +630,7 @@ async def _drive(
             logger.debug("[%s] content_key %s", stage_name, current_key)
             outcomes.append(StageOutcome(stage_name, decision.status, decision.reason, None))
             continue
+        _validate_static_produces_location(stage_spec.produces, ctx_for_key)
         started = time.monotonic()
         logger.info("[%s] run · %s", stage_name, decision.reason)
         logger.debug("[%s] content_key %s", stage_name, current_key)
@@ -594,6 +651,9 @@ async def _drive(
             resume_skip=decision.resume_skip,
             stage_name=stage_name,
             declared_needs=declared_needs,
+            cell=Cell(stage_spec.cell),
+            cell_out=out / stage_name if stage_spec.cell else out,
+            need_cells=stage_spec.need_cells,
         )
         if stage_spec.kind == "single":
             await _execute_stage(instance, stage_spec, ctx)
@@ -644,12 +704,18 @@ async def _drive(
                 index = yielded_index if yielded_index is not None else len(outputs_by_index)
                 yielded = []
                 for path in index_paths:
-                    absolute = path if path.is_absolute() else out / path
+                    absolute = path if path.is_absolute() else ctx.cell_out / path
                     if not absolute.exists():
-                        hint = _cwd_relative_path_hint(path, out)
+                        hint = _cwd_relative_path_hint(path, ctx.cell_out)
                         if hint is not None:
                             raise ValueError(hint)
                         raise FileNotFoundError(f"Yielded varve output does not exist: {absolute}")
+                    if stage_spec.cell:
+                        _relative_to_out(
+                            absolute,
+                            ctx.cell_out,
+                            description="Yielded matrix stage output",
+                        )
                     yielded.append(_relative_to_out(absolute, out))
                 if partial_enabled:
                     store.write_batch(
@@ -695,11 +761,16 @@ def run(
     args=None,
     upto: str | None = None,
     downstream: str | None = None,
+    only: str | None = None,
     force: bool = False,
     cli_out: Path | None = None,
     branch: str = "main",
     is_temporary: bool = False,
     temporary_config: dict[str, Any] | None = None,
+    axes: dict[str, tuple[str, ...]] | None = None,
+    slices: tuple[str, ...] = (),
+    temporary_axes: dict[str, tuple[str, ...]] | None = None,
+    graph: PipelineGraph | None = None,
 ) -> list[StageOutcome]:
     if args is None:
         args = pipeline.Args()
@@ -710,23 +781,30 @@ def run(
         is_temporary=is_temporary,
     )
     store = Store(out)
+    graph = graph or build_graph(pipeline, axes)
+    if is_temporary:
+        logging.getLogger("varve").info("running temporary branch %s at %s", branch, out)
     store.root.mkdir(parents=True, exist_ok=True)
     with OutputLock(store.root):
         store.ensure_initialized(
             pipeline.__name__,
             module=pipeline.import_module_name(),
             temporary_config=temporary_config,
+            temporary_axes=temporary_axes,
         )
         return asyncio.run(
             _drive(
                 pipeline,
+                graph,
                 config,
                 args=args,
                 out=out,
                 upto=upto,
                 downstream=downstream,
+                only=only,
                 force=force,
                 execute=True,
+                slices=slices,
             )
         )
 
@@ -738,9 +816,12 @@ def evaluate_state(
     args=None,
     upto: str | None = None,
     downstream: str | None = None,
+    only: str | None = None,
     cli_out: Path | None = None,
     branch: str = "main",
     is_temporary: bool = False,
+    axes: dict[str, tuple[str, ...]] | None = None,
+    graph: PipelineGraph | None = None,
 ) -> list[StageOutcome]:
     if args is None:
         args = pipeline.Args()
@@ -750,14 +831,17 @@ def evaluate_state(
         branch=branch,
         is_temporary=is_temporary,
     )
+    graph = graph or build_graph(pipeline, axes)
     return asyncio.run(
         _drive(
             pipeline,
+            graph,
             config,
             args=args,
             out=out,
             upto=upto,
             downstream=downstream,
+            only=only,
             force=False,
             execute=False,
         )

@@ -13,6 +13,7 @@ from varve.dashboard.render import render_detail, render_overview
 from varve.dashboard.state import import_entry_pipeline, load_state, resolve_entry_branch
 from varve.engine.runner import run
 from varve.log import configure_cli_logging
+from varve.matrix import build_graph
 from varve.style import REFRESH_MARKER
 
 _EXECUTABLE_STATUSES = {"artifact-missing", "dirty", "no-cache", "resume", "stale"}
@@ -136,6 +137,7 @@ def _refresh(root: Path, include_temp: bool, prefix: str | None = None) -> int:
 def _run_entry(entry: PipelineEntry) -> None:
     pipeline = import_entry_pipeline(entry)
     resolved = resolve_entry_branch(entry, pipeline)
+    graph = build_graph(pipeline, resolved.axes)
     run(
         pipeline,
         resolved.config,
@@ -144,4 +146,7 @@ def _run_entry(entry: PipelineEntry) -> None:
         branch=resolved.branch,
         is_temporary=resolved.is_temporary,
         temporary_config=resolved.temporary_config,
+        axes=resolved.axes,
+        temporary_axes=resolved.temporary_axes,
+        graph=graph,
     )

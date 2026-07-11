@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class VarveModel(BaseModel):
@@ -18,6 +18,7 @@ class Manifest(VarveModel):
     pipeline: str
     module: str | None = None
     temporary_config: dict[str, Any] | None = None
+    temporary_axes: dict[str, list[str]] | None = None
 
 
 class FileFingerprint(VarveModel):

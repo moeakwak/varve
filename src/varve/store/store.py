@@ -61,9 +61,15 @@ class Store:
         *,
         module: str | None = None,
         temporary_config: dict[str, Any] | None = None,
+        temporary_axes: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / ".gitignore").write_text("*\n", encoding="utf-8")
+        normalized_axes = (
+            {name: list(values) for name, values in temporary_axes.items()}
+            if temporary_axes is not None
+            else None
+        )
 
         manifest_path = self.root / "manifest.json"
         manifest = self.read_manifest()
@@ -74,6 +80,7 @@ class Store:
                     pipeline=pipeline,
                     module=module,
                     temporary_config=temporary_config,
+                    temporary_axes=normalized_axes,
                 ),
             )
             return
@@ -83,6 +90,8 @@ class Store:
             )
         if temporary_config is not None and manifest.temporary_config != temporary_config:
             raise ValueError(f"Varve store has a different temporary config: {manifest_path}")
+        if normalized_axes is not None and manifest.temporary_axes != normalized_axes:
+            raise ValueError(f"Varve store has different temporary axes: {manifest_path}")
         if module is not None and manifest.module != module:
             _atomic_write_json(
                 manifest_path,
@@ -90,6 +99,7 @@ class Store:
                     pipeline=manifest.pipeline,
                     module=module if module is not None else manifest.module,
                     temporary_config=manifest.temporary_config,
+                    temporary_axes=manifest.temporary_axes,
                 ),
             )
 

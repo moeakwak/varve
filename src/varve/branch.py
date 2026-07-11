@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,14 @@ def validate_branch_name(name: str) -> str:
     return name
 
 
-def load_branches(yaml_path: Path | None) -> dict[str, tuple[dict[str, Any], bool]]:
+@dataclass(frozen=True)
+class BranchDefinition:
+    config: dict[str, Any]
+    axes: dict[str, list[str]]
+    is_temporary: bool
+
+
+def load_branches(yaml_path: Path | None) -> dict[str, BranchDefinition]:
     """Load all branch configs from a varve.yaml file."""
     if yaml_path is None or not Path(yaml_path).exists():
         return {}
@@ -38,18 +46,40 @@ def load_branches(yaml_path: Path | None) -> dict[str, tuple[dict[str, Any], boo
     for name in raw:
         validate_branch_name(name)
 
-    result: dict[str, tuple[dict[str, Any], bool]] = {}
+    result: dict[str, BranchDefinition] = {}
     for branch, section in raw.items():
         if section is None:
             section = {}
         if not isinstance(section, Mapping):
             raise ValueError(f"Varve branch {branch!r} must be a mapping in {yaml_path}")
 
-        config = dict(section)
-        is_temporary = config.pop("is_temporary", False)
+        unknown = set(section) - {"config", "axes", "is_temporary"}
+        if unknown:
+            raise ValueError(
+                f"Varve branch {branch!r} uses the removed flat config format in {yaml_path}; "
+                "move Config fields under 'config:'"
+            )
+        config = section.get("config", {})
+        axes = section.get("axes", {})
+        is_temporary = section.get("is_temporary", False)
+        if not isinstance(config, Mapping):
+            raise ValueError(f"Varve branch {branch!r} config must be a mapping in {yaml_path}")
+        if not isinstance(axes, Mapping) or any(
+            not isinstance(name, str)
+            or not isinstance(values, list)
+            or any(not isinstance(value, str) for value in values)
+            for name, values in axes.items()
+        ):
+            raise ValueError(
+                f"Varve branch {branch!r} axes must map axis names to lists of ids in {yaml_path}"
+            )
         if not isinstance(is_temporary, bool):
             raise ValueError(f"Varve branch {branch!r} has non-boolean is_temporary in {yaml_path}")
-        result[branch] = (config, is_temporary)
+        result[branch] = BranchDefinition(
+            config=dict(config),
+            axes={name: list(values) for name, values in axes.items()},
+            is_temporary=is_temporary,
+        )
     return result
 
 
@@ -77,9 +107,10 @@ def canonical_config_json(config: Mapping[str, Any]) -> str:
     return json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def override_branch_name(config: Mapping[str, Any]) -> str:
+def override_branch_name(config: Mapping[str, Any], axes: Mapping[str, Any] | None = None) -> str:
     """Derive the hash override branch name from a complete config snapshot."""
-    digest = hashlib.sha256(canonical_config_json(config).encode("utf-8")).hexdigest()[:12]
+    identity = {"config": dict(config), "axes": dict(axes or {})}
+    digest = hashlib.sha256(canonical_config_json(identity).encode("utf-8")).hexdigest()[:12]
     return f"main_override_{digest}"
 
 

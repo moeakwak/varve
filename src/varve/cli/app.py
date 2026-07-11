@@ -17,6 +17,7 @@ from varve.cli.clean import clean
 from varve.cli.status import render_status
 from varve.engine.runner import StageOutcome, run, selected_stages
 from varve.log import configure_cli_logging
+from varve.matrix import build_graph
 from varve.pipeline import Pipeline
 from varve.status import collect_pipeline_status
 from varve.style import format_elapsed, make_console, status_text
@@ -29,6 +30,8 @@ _COMMAND_OPTION_ARITIES = {
         "--override": 1,
         "--upto": 1,
         "--downstream": 1,
+        "--only": 1,
+        "--slice": 1,
         "--force": 0,
         "-f": 0,
         "--out": 1,
@@ -46,7 +49,7 @@ _COMMAND_OPTION_ARITIES = {
         "--yes": 0,
         "-y": 0,
     },
-    "plan": {"--upto": 1, "--downstream": 1},
+    "plan": {"--upto": 1, "--downstream": 1, "--only": 1, "--branch": 1, "--out": 1},
 }
 
 
@@ -63,11 +66,13 @@ def _print_list(pipeline: type[Pipeline]) -> None:
     table.add_column("STAGE")
     table.add_column("KIND")
     table.add_column("NEEDS")
+    table.add_column("MATRIX")
     for name in pipeline.topo_order():
         spec = pipeline.stages()[name]
         needs = ", ".join(spec.needs) if spec.needs else "-"
         kind = "batch" if spec.kind == "batch" else "stage"
-        table.add_row(name, kind, needs)
+        axes = ", ".join(axis.name for axis in spec.matrix) if spec.matrix else "-"
+        table.add_row(name, kind, needs, axes)
     make_console().print(table)
 
 
@@ -87,13 +92,14 @@ def _print_outcomes(outcomes: list[StageOutcome], *, elapsed: bool) -> None:
 
 
 def _print_plan(
-    pipeline: type[Pipeline],
+    graph,
     *,
     upto: str | None,
     downstream: str | None,
+    only: str | None,
 ) -> None:
-    selected = selected_stages(pipeline, upto=upto, downstream=downstream)
-    print(" -> ".join(name for name in pipeline.topo_order() if name in selected))
+    selected = selected_stages(graph, upto=upto, downstream=downstream, only=only)
+    print(" -> ".join(name for name in graph.topo_order() if name in selected))
 
 
 def _default_confirm(message: str) -> bool:
@@ -189,13 +195,17 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     run_stage.add_argument(
         "--downstream", metavar="STAGE", help="Run STAGE and all downstream stages."
     )
+    run_stage.add_argument("--only", metavar="STAGE", help="Run every cell of STAGE only.")
+    run_parser.add_argument(
+        "--slice", action="append", default=[], metavar="AXIS=ID", help="Slice a temporary branch."
+    )
     run_parser.add_argument(
         "--force", "-f", action="store_true", help="Ignore cache for selected stages."
     )
     run_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
 
     status_parser = subparsers.add_parser("status", help="show pipeline and stage status")
-    status_parser.add_argument("stage", nargs="?", choices=pipeline.topo_order(), metavar="STAGE")
+    status_parser.add_argument("stage", nargs="?", metavar="STAGE")
     status_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
     status_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
     status_depth = status_parser.add_mutually_exclusive_group()
@@ -218,6 +228,9 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     plan_stage.add_argument(
         "--downstream", metavar="STAGE", help="Print STAGE and all downstream stages."
     )
+    plan_stage.add_argument("--only", metavar="STAGE", help="Print every cell of STAGE only.")
+    plan_parser.add_argument("--branch", default="main", metavar="NAME")
+    plan_parser.add_argument("--out", type=Path, metavar="PATH")
 
     subparsers.add_parser("list")
 
@@ -244,7 +257,15 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         _print_list(pipeline)
         return 0
     if namespace.command == "plan":
-        _print_plan(pipeline, upto=namespace.upto, downstream=namespace.downstream)
+        resolved = resolve_branch(
+            pipeline, branch=namespace.branch, override_json=None, cli_out=namespace.out
+        )
+        _print_plan(
+            build_graph(pipeline, resolved.axes),
+            upto=namespace.upto,
+            downstream=namespace.downstream,
+            only=namespace.only,
+        )
         return 0
 
     resolved = resolve_branch(
@@ -255,6 +276,14 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         allow_bare_output_root=namespace.command == "clean",
     )
     config = resolved.config
+    graph = build_graph(pipeline, resolved.axes)
+    if namespace.command == "status" and namespace.stage is not None:
+        try:
+            graph.names_for(namespace.stage)
+        except ValueError as error:
+            parser.error(str(error))
+    if namespace.command == "run" and namespace.slice and not resolved.is_temporary:
+        raise ValueError("--slice is only allowed on temporary branches")
     args = _args_from_namespace(pipeline, namespace)
     if namespace.command == "status":
         status = collect_pipeline_status(
@@ -269,6 +298,7 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             ),
             branch=resolved.branch,
             stage=namespace.stage,
+            graph=graph,
         )
         depth = None if namespace.all else 1 if namespace.expand else 0
         render_status(make_console(), status, stage=namespace.stage, depth=depth)
@@ -286,6 +316,8 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             yes=namespace.yes,
             allowed_roots=allowed_roots,
             confirm=_default_confirm,
+            axes=resolved.axes,
+            graph=graph,
         )
     elif namespace.command == "run":
         outcomes = run(
@@ -299,6 +331,11 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             branch=resolved.branch,
             is_temporary=resolved.is_temporary,
             temporary_config=resolved.temporary_config,
+            axes=resolved.axes,
+            temporary_axes=resolved.temporary_axes,
+            only=namespace.only,
+            slices=tuple(namespace.slice),
+            graph=graph,
         )
         _print_outcomes(outcomes, elapsed=True)
     return 0

@@ -413,11 +413,7 @@ def render_status(
     if stage is None and depth == 0:
         render_pipeline_summary(console, status)
         return
-    selected = (
-        status.stages
-        if stage is None
-        else tuple(item for item in status.stages if item.name == stage)
-    )
+    selected = status.stages
     for index, item in enumerate(selected):
         if index:
             console.print()

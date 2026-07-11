@@ -45,7 +45,7 @@ class DemoPipeline(Pipeline):
         encoding="utf-8",
     )
     (tmp_path / "varve.yaml").write_text(
-        "alt:\n  token: branch\n",
+        "alt:\n  config:\n    token: branch\n",
         encoding="utf-8",
     )
     module = _load_module(module_path, "demo_exp")

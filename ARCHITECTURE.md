@@ -56,6 +56,8 @@ The store lives under `<output_root>/.varve/` and is latest-wins, not append-onl
 └── partial/<stage>/<content_key>/
 ```
 
+`schema_version` is a shared envelope version for manifests and successful stage records, so both advance together even when a schema change affects only one record type. Version 4 adds `temporary_axes` to manifests because older strict readers reject that new field. Current readers remain backward-compatible with version 2 and 3 manifests and success records; in an older manifest, a missing `temporary_axes` field defaults to `None`. Varve reads these records in place and does not migrate or rewrite the store merely because its schema version is old.
+
 `content_key` includes stage source, discovered project callables, the `Config` projected onto the fields the stage actually reads, declared `KeySpec.files`, declared `KeySpec.values`, and upstream content keys. Batch partial state is scoped directly by `content_key`.
 
 ## Source Dependency Discovery
@@ -108,6 +110,16 @@ base/.tmp/<branch>   # temporary override branches
 ```
 
 `varve.yaml` is discovered next to the pipeline module. Missing `varve.yaml` is allowed for `main`.
+
+Each branch section has three independent facets: `config`, `axes`, and `is_temporary`. `config` controls stage behavior and participates in content keys. `axes` selects a branch's active matrix domain and controls graph construction without entering content keys. Temporary manifests snapshot both the validated Config and normalized active axes so later status and refresh operations reconstruct the same graph.
+
+## Matrix Graph Expansion
+
+`Pipeline.stages()` collects branch-independent stage templates. After branch resolution, `build_graph(pipeline, axes)` constructs an immutable `PipelineGraph`: it expands each matrix template into concrete cell stages, resolves logical dependencies by equality on shared `Axis` object identities, and computes the concrete topology once. Runners, status, clean, and dashboard state all consume that branch-scoped graph. Dashboard discovery remains zero-import.
+
+Concrete cell names encode coordinates in declaration order. Store slots and partial records therefore remain unchanged structurally: a cell is an ordinary stage with an independent name and content key. Coordinates do not add a key component. Logical `ctx.input()` and `ctx.inputs()` calls map to the aligned concrete upstream cells, ordered by upstream axis declaration order and then batch index.
+
+Managed matrix artifacts are contained under `ctx.cell_out`, which is `<output-root>/<cell-name>/`. Relative `produces` declarations and batch yields resolve there; absolute paths must remain inside it. Store records continue to hold paths relative to the branch output root. Ordinary stages retain the existing output behavior.
 
 ## CLI And Config
 

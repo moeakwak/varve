@@ -95,6 +95,40 @@ Batch stages run serially at the varve level so partial writes stay simple and d
 
 Varve warns when a batch stage yields outputs without first iterating `ctx.resume(...)`, because those outputs cannot be resumed safely. Such stages may still complete successfully, but varve treats them as non-resumable: failed runs do not leave resumable partial state, and later runs start from the stage body instead of recorded batch positions. For resumable batches, a batch item may yield zero paths; varve records the completed index but does not validate item-level completeness.
 
+## Matrix stages
+
+Use `Axis` and stack `@matrix(...)` above `@stage` or `@batch_stage` to turn a Cartesian product into independently keyed cells. Coordinates are injected as typed keyword-only parameters. Shared axes align dependencies automatically; axes present only upstream become a deterministic fan-in.
+
+```python
+from varve import Axis, Ctx, Pipeline, matrix, stage
+
+BENCH = Axis("bench", ["ocrbench_v2", "unimer"])
+MODEL = Axis("model", ["qwen3-vl-8b", "internvl3-8b"])
+
+class Evaluation(Pipeline):
+    Config = Config
+
+    @matrix(BENCH)
+    @stage(produces="ground-truth.parquet")
+    def prepare(self, ctx: Ctx, *, bench: str) -> None:
+        ctx.cell_out.mkdir(parents=True, exist_ok=True)
+        write_ground_truth(bench, ctx.cell_out / "ground-truth.parquet")
+
+    @matrix(BENCH, MODEL)
+    @stage(needs="prepare", produces="score.json")
+    def score(self, ctx: Ctx, *, bench: str, model: str) -> None:
+        ctx.cell_out.mkdir(parents=True, exist_ok=True)
+        score_one(bench, model, ctx.input("prepare"), ctx.cell_out / "score.json")
+
+    @stage(needs="score", produces="summary.json")
+    def summarize(self, ctx: Ctx) -> None:
+        write_summary(ctx.inputs("score"), ctx.out / "summary.json")
+```
+
+Each cell is a concrete stage such as `score@bench=unimer,model=qwen3-vl-8b`. Matrix artifacts must live under `ctx.cell_out`; relative declared and yielded paths resolve there. `ctx.out` remains the branch output root, and ordinary stages keep `ctx.cell_out == ctx.out`. Key getters can read coordinates through `ctx.cell.model` or `ctx.cell["model"]`.
+
+Use `--only score` to select every active cell of one base stage. `--slice model=qwen3-vl-8b` selects matching cells plus their aligned upstream closure and is accepted only for temporary branches. Matrix cells remain serial at the varve scheduler level.
+
 ## Why varve
 
 Varve is for pipelines where Python code is already the best source of truth. It is intentionally closer to a small library such as redun, Hamilton, or pydoit than to a workflow platform.
@@ -112,11 +146,11 @@ The core design choices are:
 
 ## Features
 
-- Public API: `Pipeline`, `@stage`, `@batch_stage`, `KeySpec`, `Ctx`, `JSON`, and `StageSpec`.
+- Public API: `Pipeline`, `@stage`, `@batch_stage`, `Axis`, `@matrix`, `KeySpec`, `Ctx`, `JSON`, and `StageSpec`.
 - Generated pipeline commands:
-  - `run [--branch NAME] [--override JSON] [--upto STAGE | --downstream STAGE] [--force] [--out PATH]`
+  - `run [--branch NAME] [--override JSON] [--only STAGE | --upto STAGE | --downstream STAGE] [--slice AXIS=ID] [--force] [--out PATH]`
   - `status [STAGE] [--branch NAME] [--expand | --all] [--out PATH]`
-  - `plan [--upto STAGE | --downstream STAGE]`
+  - `plan [--branch NAME] [--only STAGE | --upto STAGE | --downstream STAGE]`
   - `list`
   - `clean [--branch NAME] [--downstream STAGE] [--out PATH] [--yes]`
 - `run`, `status`, and `clean` also accept generated flags from the pipeline's `Args` model.
@@ -155,6 +189,20 @@ python demo.py status normalize --all
 ## Branches
 
 `varve.yaml` lives next to the pipeline module. The `main` branch is the default and may rely entirely on Config defaults when the file is missing.
+
+Branch sections separate behavior config from the active matrix domain:
+
+```yaml
+main:
+  config:
+    bootstrap_b: 1000
+  axes:
+    model: [qwen3-vl-8b, internvl3-8b]
+
+full: {}
+```
+
+An omitted axis uses its complete declared domain. Axis ids must come from the corresponding `Axis`; their order always follows the declaration. The previous flat branch Config format is intentionally rejected—move those fields under `config:`.
 
 Varve resolves the output root from `--out` or `Pipeline.default_output_root(config)`, then appends the selected branch:
 

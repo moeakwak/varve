@@ -149,7 +149,7 @@ def test_cli_run_status_clean(tmp_path: Path, capsys) -> None:
 def test_cli_reads_yaml_config(tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch) -> None:
     config_path = tmp_path / "config.yaml"
     out = tmp_path / "out"
-    config_path.write_text("main:\n  token: yaml\n", encoding="utf-8")
+    config_path.write_text("main:\n  config:\n    token: yaml\n", encoding="utf-8")
     monkeypatch.setattr(
         CliPipeline,
         "varve_config_path",
@@ -361,7 +361,7 @@ def test_cli_end_to_end_equivalence_with_nested_config(
     config_path = tmp_path / "config.yaml"
     yaml_out = tmp_path / "yaml-out"
     config_path.write_text(
-        "main:\n  token: yaml\n",
+        "main:\n  config:\n    token: yaml\n",
         encoding="utf-8",
     )
 
@@ -635,7 +635,7 @@ def test_cli_rejects_yaml_branch_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = tmp_path / "varve.yaml"
-    config_path.write_text("alt:\n  token: alt\n", encoding="utf-8")
+    config_path.write_text("alt:\n  config:\n    token: alt\n", encoding="utf-8")
     monkeypatch.setattr(
         CliPipeline,
         "varve_config_path",
@@ -652,7 +652,7 @@ def test_cli_yaml_branch_does_not_require_valid_main_config(
 ) -> None:
     out = tmp_path / "out"
     config_path = tmp_path / "varve.yaml"
-    config_path.write_text("main: {}\nalt:\n  dataset: beta\n", encoding="utf-8")
+    config_path.write_text("main: {}\nalt:\n  config:\n    dataset: beta\n", encoding="utf-8")
     monkeypatch.setattr(
         RequiredExtraCliPipeline,
         "varve_config_path",

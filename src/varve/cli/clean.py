@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from varve.engine.runner import selected_stages
+from varve.matrix import PipelineGraph, build_graph
 from varve.models import Manifest
 from varve.pipeline import Pipeline
 from varve.store.lock import OutputLock
@@ -77,6 +78,8 @@ def clean(
     yes: bool = False,
     allowed_roots: list[Path] | None = None,
     confirm: Callable[[str], bool] | None = None,
+    axes: dict[str, tuple[str, ...]] | None = None,
+    graph: PipelineGraph | None = None,
 ) -> None:
     root = pipeline.output_root(
         config,
@@ -94,7 +97,7 @@ def clean(
             shutil.rmtree(root)
             return
 
-        stage_names = selected_stages(pipeline, downstream=target)
+        stage_names = selected_stages(graph or build_graph(pipeline, axes), downstream=target)
         records = {}
         for stage_name in stage_names:
             record = store.read_success(stage_name)

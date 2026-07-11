@@ -17,6 +17,7 @@ from varve.dashboard.models import (
 )
 from varve.engine.runner import evaluate_state
 from varve.engine.state import Status
+from varve.matrix import build_graph
 from varve.models import SuccessRecord
 from varve.pipeline import Pipeline
 from varve.store.store import Store
@@ -52,6 +53,7 @@ def load_state(entry: PipelineEntry) -> PipelineState:
         return _error(entry, "resolve", str(error))
 
     try:
+        graph = build_graph(pipeline, resolved.axes)
         outcomes = evaluate_state(
             pipeline,
             resolved.config,
@@ -59,6 +61,8 @@ def load_state(entry: PipelineEntry) -> PipelineState:
             cli_out=resolved.output_base,
             branch=resolved.branch,
             is_temporary=resolved.is_temporary,
+            axes=resolved.axes,
+            graph=graph,
         )
     except Exception as error:  # noqa: BLE001 - dashboard reports evaluator diagnostics.
         return _error(entry, "evaluate", str(error))
@@ -66,7 +70,7 @@ def load_state(entry: PipelineEntry) -> PipelineState:
     outcomes_by_stage = {outcome.stage: outcome for outcome in outcomes}
     store = Store(entry.output_root)
     stages: list[StageState] = []
-    for name in pipeline.topo_order():
+    for name in graph.topo_order():
         outcome = outcomes_by_stage[name]
         success = store.read_success(name)
         stages.append(
@@ -77,7 +81,7 @@ def load_state(entry: PipelineEntry) -> PipelineState:
                 artifacts=_artifacts(entry, success) if success is not None else [],
                 committed_at=_parse_datetime(success.committed_at) if success is not None else None,
                 elapsed=success.elapsed if success is not None else None,
-                upstreams=list(pipeline.stages()[name].needs),
+                upstreams=list(graph.stages[name].needs),
             )
         )
 
