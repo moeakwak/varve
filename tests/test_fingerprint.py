@@ -69,17 +69,23 @@ def test_fingerprint_session_shares_path_snapshot_and_keeps_files_distinct(
     second_path.write_text("second", encoding="utf-8")
     cached = file_fingerprint(first_path)
     stale = cached.model_copy(update={"mtime": cached.mtime - 1, "sha256": "sha256:stale"})
+    # Python 3.10 Path.resolve() calls Path.stat() internally. Resolve first so
+    # this test counts only the session's explicit stat calls on every version.
+    resolved_paths = {
+        first_path: first_path.resolve(),
+        second_path: second_path.resolve(),
+    }
 
     resolve_calls: list[Path] = []
     stat_calls: list[Path] = []
     hash_calls: list[Path] = []
-    original_resolve = Path.resolve
     original_stat = Path.stat
     original_hash = fingerprint_module._sha256_file
 
     def counted_resolve(path: Path, *args, **kwargs):
+        del args, kwargs
         resolve_calls.append(path)
-        return original_resolve(path, *args, **kwargs)
+        return resolved_paths[path]
 
     def counted_stat(path: Path, *args, **kwargs):
         stat_calls.append(path)
