@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from varve.keying.fingerprint import canonical_json, file_fingerprint, files_fingerprints
+from varve.keying import fingerprint as fingerprint_module
+from varve.keying.fingerprint import (
+    FingerprintSession,
+    canonical_json,
+    file_fingerprint,
+    files_fingerprints,
+)
 
 
 def test_file_fingerprint_reuses_cached_sha_when_size_and_mtime_match(tmp_path: Path) -> None:
@@ -51,3 +57,69 @@ def test_files_fingerprints_are_order_independent(tmp_path: Path) -> None:
     one = files_fingerprints(Ctx(), {"datasets": lambda _ctx: [b, a]})
     two = files_fingerprints(Ctx(), {"datasets": lambda _ctx: [a, b]})
     assert [item.sha256 for item in one["datasets"]] == [item.sha256 for item in two["datasets"]]
+
+
+def test_fingerprint_session_shares_path_snapshot_and_keeps_files_distinct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_path = tmp_path / "first.txt"
+    second_path = tmp_path / "second.txt"
+    first_path.write_text("first", encoding="utf-8")
+    second_path.write_text("second", encoding="utf-8")
+    cached = file_fingerprint(first_path)
+    stale = cached.model_copy(update={"mtime": cached.mtime - 1, "sha256": "sha256:stale"})
+
+    resolve_calls: list[Path] = []
+    stat_calls: list[Path] = []
+    hash_calls: list[Path] = []
+    original_resolve = Path.resolve
+    original_stat = Path.stat
+    original_hash = fingerprint_module._sha256_file
+
+    def counted_resolve(path: Path, *args, **kwargs):
+        resolve_calls.append(path)
+        return original_resolve(path, *args, **kwargs)
+
+    def counted_stat(path: Path, *args, **kwargs):
+        stat_calls.append(path)
+        return original_stat(path, *args, **kwargs)
+
+    def counted_hash(path: Path) -> str:
+        hash_calls.append(path)
+        return original_hash(path)
+
+    monkeypatch.setattr(Path, "resolve", counted_resolve)
+    monkeypatch.setattr(Path, "stat", counted_stat)
+    monkeypatch.setattr(fingerprint_module, "_sha256_file", counted_hash)
+
+    session = FingerprintSession()
+    refreshed = file_fingerprint(first_path, cached=stale, session=session)
+    shared = file_fingerprint(first_path, cached=cached, session=session)
+    distinct = file_fingerprint(second_path, session=session)
+
+    assert shared is refreshed
+    assert refreshed.sha256 == cached.sha256
+    assert distinct.sha256 != refreshed.sha256
+    assert resolve_calls == [first_path, second_path]
+    assert stat_calls == [first_path, second_path]
+    assert hash_calls == [first_path, second_path]
+
+
+def test_fingerprint_session_keeps_stage_cached_fingerprints_independent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "input.txt"
+    path.write_text("content", encoding="utf-8")
+    first = file_fingerprint(path)
+    second = first.model_copy(update={"sha256": "sha256:other-stage-record"})
+    session = FingerprintSession()
+
+    def unexpected_hash(_path: Path) -> str:
+        raise AssertionError("matching cached fingerprints must not read file content")
+
+    monkeypatch.setattr(fingerprint_module, "_sha256_file", unexpected_hash)
+
+    assert file_fingerprint(path, cached=first, session=session) is first
+    assert file_fingerprint(path, cached=second, session=session) is second

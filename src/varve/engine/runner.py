@@ -7,7 +7,7 @@ import inspect
 import logging
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,7 @@ from varve.decorators import ProducesItem, ProducesSpec
 from varve.engine.state import Decision, Status, decide_batch, decide_single
 from varve.keying.config_access import ConfigAccess, RecordingConfig, project_config
 from varve.keying.dependencies import SourceDependencies
+from varve.keying.fingerprint import FingerprintSession
 from varve.keying.keys import (
     compute_key_components,
     compute_source_dependencies,
@@ -54,6 +55,47 @@ class StageProbe:
     previous: SuccessRecord | None
     source_dependencies: SourceDependencies
     unavailable_reason: str | None = None
+
+
+@dataclass
+class _KeyingSession:
+    """Command-scoped source discovery and filesystem snapshot caches."""
+
+    fingerprints: FingerprintSession = field(default_factory=FingerprintSession)
+    sources: dict[tuple[int, tuple[int, ...], bool, tuple[str, ...] | None], SourceDependencies] = (
+        field(default_factory=dict)
+    )
+
+    def fresh_fingerprints(self) -> _KeyingSession:
+        """Share source discovery while starting a new filesystem snapshot."""
+
+        return _KeyingSession(sources=self.sources)
+
+    def refresh_fingerprints(self) -> None:
+        """Discard filesystem observations after a stage executes successfully."""
+
+        self.fingerprints = FingerprintSession()
+
+    def source_dependencies(
+        self,
+        stage_spec,
+        *,
+        auto_uses_packages: tuple[str, ...] | None,
+    ) -> SourceDependencies:
+        key = (
+            id(stage_spec.func),
+            tuple(id(item) for item in stage_spec.uses),
+            stage_spec.auto_uses,
+            auto_uses_packages,
+        )
+        result = self.sources.get(key)
+        if result is None:
+            result = compute_source_dependencies(
+                stage_spec,
+                auto_uses_packages=auto_uses_packages,
+            )
+            self.sources[key] = result
+        return result
 
 
 def _now() -> str:
@@ -230,20 +272,9 @@ def _validate_external_upstreams(
     out: Path,
     config: Any,
     args: Any,
+    keying_session: _KeyingSession,
 ) -> None:
     stages = graph.stages
-    for stage_name in selected:
-        for upstream in stages[stage_name].needs:
-            if upstream in selected:
-                continue
-            attempt = store.read_attempt(upstream)
-            record = store.read_success(upstream)
-            if attempt is not None:
-                raise ValueError(f"Upstream stage is dirty: {upstream}")
-            if record is None:
-                raise ValueError(f"Upstream stage has not been built: {upstream}")
-            if not _success_outputs_exist(record, out):
-                raise ValueError(f"Upstream stage artifacts are missing: {upstream}")
     external = {
         upstream
         for stage_name in selected
@@ -252,21 +283,36 @@ def _validate_external_upstreams(
     }
     if not external:
         return
-    probes = {
-        probe.stage: probe
-        for probe in probe_pipeline(
-            pipeline_type,
-            config,
-            args=args,
-            out=out,
-            graph=graph,
-        )
-    }
-    for upstream in sorted(external):
-        decision = probes[upstream].decision
+    ancestors, _ = _stage_sets(graph)
+    validation_stages: set[str] = set()
+    for upstream in external:
+        validation_stages.update(_closure(upstream, ancestors))
+    for stage_name in graph.topo_order():
+        if stage_name not in external:
+            continue
+        attempt = store.read_attempt(stage_name)
+        record = store.read_success(stage_name)
+        if attempt is not None:
+            raise ValueError(f"Upstream stage is dirty: {stage_name}")
+        if record is None:
+            raise ValueError(f"Upstream stage has not been built: {stage_name}")
+        if not _success_outputs_exist(record, out):
+            raise ValueError(f"Upstream stage artifacts are missing: {stage_name}")
+    probes = probe_pipeline(
+        pipeline_type,
+        config,
+        args=args,
+        out=out,
+        graph=graph,
+        _keying_session=keying_session.fresh_fingerprints(),
+        _stage_names=validation_stages,
+    )
+    for probe in probes:
+        decision = probe.decision
         if decision.status != "hit":
             raise ValueError(
-                f"Upstream stage is not current: {upstream} ({decision.status}: {decision.reason})"
+                f"Upstream stage is not current: {probe.stage} "
+                f"({decision.status}: {decision.reason})"
             )
 
 
@@ -346,6 +392,7 @@ def _probe_stage(
     store: Store,
     known_content_keys: dict[str, str],
     source_dependencies: SourceDependencies,
+    fingerprint_session: FingerprintSession,
 ) -> StageProbe:
     stage_spec = graph.stages[stage_name]
     previous = store.read_success(stage_name)
@@ -371,6 +418,7 @@ def _probe_stage(
         config_access=previous_access,
         auto_uses_packages=pipeline_type.auto_uses_packages,
         source_dependencies=source_dependencies,
+        fingerprint_session=fingerprint_session,
     )
     decision_key = content_key(components)
     attempt = store.read_attempt(stage_name)
@@ -412,16 +460,25 @@ def probe_pipeline(
     out: Path,
     axes: dict[str, tuple[str, ...]] | None = None,
     graph: PipelineGraph | None = None,
+    _keying_session: _KeyingSession | None = None,
+    _stage_names: set[str] | None = None,
 ) -> tuple[StageProbe, ...]:
-    """Probe every stage in topology order without executing or writing state."""
+    """Probe all or an internal ancestor-closed stage set without writing state."""
 
     store = Store(out)
     known_content_keys: dict[str, str] = {}
     probes: list[StageProbe] = []
     graph = graph or build_graph(pipeline_type, axes)
-    for stage_name in graph.topo_order():
+    keying_session = _keying_session or _KeyingSession()
+    topo_order = graph.topo_order()
+    if _stage_names is not None:
+        unknown = _stage_names.difference(graph.stages)
+        if unknown:
+            raise ValueError(f"Unknown varve stages to probe: {sorted(unknown)!r}")
+        topo_order = [name for name in topo_order if name in _stage_names]
+    for stage_name in topo_order:
         stage_spec = graph.stages[stage_name]
-        source_dependencies = compute_source_dependencies(
+        source_dependencies = keying_session.source_dependencies(
             stage_spec,
             auto_uses_packages=pipeline_type.auto_uses_packages,
         )
@@ -452,6 +509,7 @@ def probe_pipeline(
             store=store,
             known_content_keys=known_content_keys,
             source_dependencies=source_dependencies,
+            fingerprint_session=keying_session.fingerprints,
         )
         probes.append(probe)
         assert probe.decision_key is not None
@@ -493,6 +551,7 @@ async def _drive(
     slices: tuple[str, ...] = (),
 ) -> list[StageOutcome]:
     store = Store(out)
+    keying_session = _KeyingSession()
     selected = selected_stages(
         graph,
         upto=upto,
@@ -501,7 +560,16 @@ async def _drive(
         slices=slices,
     )
     if execute:
-        _validate_external_upstreams(pipeline_type, graph, selected, store, out, config, args)
+        _validate_external_upstreams(
+            pipeline_type,
+            graph,
+            selected,
+            store,
+            out,
+            config,
+            args,
+            keying_session,
+        )
 
     instance = pipeline_type()
     outcomes: list[StageOutcome] = []
@@ -518,7 +586,7 @@ async def _drive(
             if missing_upstream:
                 outcomes.append(StageOutcome(stage_name, "no-cache", "no cache", None))
                 continue
-            source_dependencies = compute_source_dependencies(
+            source_dependencies = keying_session.source_dependencies(
                 stage_spec,
                 auto_uses_packages=pipeline_type.auto_uses_packages,
             )
@@ -532,6 +600,7 @@ async def _drive(
                 store=store,
                 known_content_keys=known_content_keys,
                 source_dependencies=source_dependencies,
+                fingerprint_session=keying_session.fingerprints,
             )
             assert probe.decision_key is not None
             known_content_keys[stage_name] = probe.decision_key
@@ -550,7 +619,7 @@ async def _drive(
                 StageOutcome(stage_name, probe.decision.status, probe.decision.reason, None)
             )
             continue
-        source_dependencies = compute_source_dependencies(
+        source_dependencies = keying_session.source_dependencies(
             stage_spec,
             auto_uses_packages=pipeline_type.auto_uses_packages,
         )
@@ -581,6 +650,7 @@ async def _drive(
             config_access=previous_access,
             auto_uses_packages=pipeline_type.auto_uses_packages,
             source_dependencies=source_dependencies,
+            fingerprint_session=keying_session.fingerprints,
         )
         current_key = content_key(components)
         attempt = store.read_attempt(stage_name)
@@ -749,6 +819,7 @@ async def _drive(
                 )
             )
         store.clear_attempt(stage_name)
+        keying_session.refresh_fingerprints()
         logger.info("[%s] done · %.2fs", stage_name, elapsed)
         outcomes.append(StageOutcome(stage_name, decision.status, decision.reason, elapsed))
     return outcomes

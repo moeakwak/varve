@@ -12,7 +12,12 @@ from pydantic import BaseModel
 from varve.keying.astkey import source_hash
 from varve.keying.config_access import project_config
 from varve.keying.dependencies import SourceDependencies, discover_source_dependencies
-from varve.keying.fingerprint import file_digest_view, files_fingerprints, json_sha256
+from varve.keying.fingerprint import (
+    FingerprintSession,
+    file_digest_view,
+    files_fingerprints,
+    json_sha256,
+)
 from varve.keyspec import KeySpec
 from varve.models import FileFingerprint, KeyComponents
 
@@ -118,6 +123,7 @@ def compute_key_components(
     config_access: list[str] | None = None,
     auto_uses_packages: tuple[str, ...] | None = None,
     source_dependencies: SourceDependencies | None = None,
+    fingerprint_session: FingerprintSession | None = None,
 ) -> KeyComponents:
     """Assemble a stage's key components.
 
@@ -134,7 +140,12 @@ def compute_key_components(
     )
 
     config = project_config(config_data(ctx.config), config_access)
-    files = files_fingerprints(ctx, stage_spec.keyspec.files, cached_by_name=cached_files)
+    files = files_fingerprints(
+        ctx,
+        stage_spec.keyspec.files,
+        cached_by_name=cached_files,
+        session=fingerprint_session,
+    )
     values = {name: getter(ctx) for name, getter in sorted(stage_spec.keyspec.values.items())}
     need_cells = getattr(stage_spec, "need_cells", None) or {}
     has_matrix_fan_in = any(len(names) > 1 for names in need_cells.values())

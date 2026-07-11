@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from varve import Axis, Ctx, Pipeline, batch_stage, matrix, stage
 from varve.branch_config import resolve_branch
+from varve.engine import runner as runner_module
 from varve.engine.runner import run, selected_stages
 from varve.matrix import build_graph
 from varve.store.store import Store
@@ -320,6 +321,79 @@ def test_only_rejects_stale_external_upstream(tmp_path: Path) -> None:
     run(Only, TokenConfig(token="old"), cli_out=tmp_path)
     with pytest.raises(ValueError, match="Upstream stage is not current"):
         run(Only, TokenConfig(token="new"), cli_out=tmp_path, only="result")
+
+
+@pytest.mark.parametrize(
+    ("only", "downstream", "slices", "expected_probes"),
+    [
+        (
+            "score",
+            None,
+            (),
+            ["source@bench=a", "source@bench=b"],
+        ),
+        (
+            "finish",
+            None,
+            (),
+            [
+                "source@bench=a",
+                "source@bench=b",
+                "score@bench=a,model=small",
+                "score@bench=a,model=large",
+                "score@bench=b,model=small",
+                "score@bench=b,model=large",
+            ],
+        ),
+        (
+            None,
+            "score",
+            (),
+            ["source@bench=a", "source@bench=b"],
+        ),
+        (
+            "score",
+            None,
+            ("model=small",),
+            [],
+        ),
+        (
+            None,
+            "score",
+            ("model=small",),
+            [],
+        ),
+    ],
+)
+def test_matrix_scoped_runs_probe_exact_external_closure_in_graph_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    only: str | None,
+    downstream: str | None,
+    slices: tuple[str, ...],
+    expected_probes: list[str],
+) -> None:
+    run(MatrixPipeline, Config(), cli_out=tmp_path)
+    probed: list[str] = []
+    original = runner_module._probe_stage
+
+    def counted(*call_args, **call_kwargs):
+        result = original(*call_args, **call_kwargs)
+        probed.append(result.stage)
+        return result
+
+    monkeypatch.setattr(runner_module, "_probe_stage", counted)
+
+    run(
+        MatrixPipeline,
+        Config(),
+        cli_out=tmp_path,
+        only=only,
+        downstream=downstream,
+        slices=slices,
+    )
+
+    assert probed == expected_probes
 
 
 def test_matrix_batch_outputs_are_cell_isolated(tmp_path: Path) -> None:
