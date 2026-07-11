@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.0](https://github.com/moeakwak/varve/compare/varve-v0.2.0...varve-v0.3.0) (2026-07-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* stage source components now include automatically discovered dependencies under new component keys, so existing cached stages may become stale.
+* **keying:** SCHEMA_VERSION 2 -> 3; KeyComponents gains config_access. Records written by older varve lack the field and default to whole-config keying (one conservative rerun, then self-heal).
+
+### Features
+
+* **cli:** consolidate pipeline status diagnostics ([4cd2ee4](https://github.com/moeakwak/varve/commit/4cd2ee4d158657debe145ce8229493e2d1fd8d0e))
+* **cli:** highlight stale source changes in status ([b67f2a5](https://github.com/moeakwak/varve/commit/b67f2a52c154677d5f561325f1330f787d86422f))
+* **cli:** render pipeline status/run/list as colored tables ([248a450](https://github.com/moeakwak/varve/commit/248a4508ce8e761c06c711de4b8a024d3c9ae555))
+* **dashboard:** route refresh header through the rich logger ([f29d26e](https://github.com/moeakwak/varve/commit/f29d26e0d01b07e00aa0395dd84360f56cec4698))
+* improve source dependency discovery and add details ([8175c0d](https://github.com/moeakwak/varve/commit/8175c0d5d5622d65dc221d175926f60d555be70a))
+* **keying:** key stages on the config fields they read ([7af0a54](https://github.com/moeakwak/varve/commit/7af0a549a02422c6b610a6f6be7d5433e6efeb49))
+* **log:** accent refresh headers and stamp every log line ([8ddce7c](https://github.com/moeakwak/varve/commit/8ddce7cb7883e523b0dc5d4ecc876df9e62ed677))
+
 ## [0.2.0](https://github.com/moeakwak/varve/compare/varve-v0.1.0...varve-v0.2.0) (2026-07-05)
 
 
