@@ -78,6 +78,7 @@ def test_themed_console_renders_status_color() -> None:
         file=buffer,
         force_terminal=True,
         color_system="standard",
+        no_color=False,
         theme=style._THEME,
         highlighter=VarveStatusHighlighter(),
     )
@@ -85,3 +86,30 @@ def test_themed_console_renders_status_color() -> None:
     output = buffer.getvalue()
     assert "\x1b[36mrun\x1b[0m" in output  # varve.run -> cyan
     assert "\x1b[32mdone\x1b[0m" in output  # varve.done -> green
+
+
+def test_themed_console_respects_disabled_color() -> None:
+    buffer = StringIO()
+    console = Console(
+        file=buffer,
+        force_terminal=True,
+        color_system="standard",
+        no_color=True,
+        theme=style._THEME,
+        highlighter=VarveStatusHighlighter(),
+    )
+    console.print("run done", markup=False)
+    assert buffer.getvalue() == "run done\n"
+
+
+def test_themed_console_omits_color_for_non_terminal_output() -> None:
+    buffer = StringIO()
+    console = Console(
+        file=buffer,
+        force_terminal=False,
+        no_color=False,
+        theme=style._THEME,
+        highlighter=VarveStatusHighlighter(),
+    )
+    console.print("run done", markup=False)
+    assert buffer.getvalue() == "run done\n"

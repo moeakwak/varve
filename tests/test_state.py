@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from varve.engine.state import decide_batch, decide_single, invalidation_reason
@@ -14,10 +16,21 @@ from varve.models import (
 )
 
 
-def _components(**overrides) -> KeyComponents:
-    data = dict(source={}, config={}, files={}, values={}, upstreams={})
-    data.update(overrides)
-    return KeyComponents(**data)
+def _components(
+    *,
+    source: dict[str, str] | None = None,
+    config: dict[str, Any] | None = None,
+    files: dict[str, list[FileFingerprint]] | None = None,
+    values: dict[str, Any] | None = None,
+    upstreams: dict[str, dict[str, str]] | None = None,
+) -> KeyComponents:
+    return KeyComponents(
+        source=source or {},
+        config=config or {},
+        files=files or {},
+        values=values or {},
+        upstreams=upstreams or {},
+    )
 
 
 def _file(*, sha256: str, size: int = 1, mtime: float = 1.0) -> FileFingerprint:
