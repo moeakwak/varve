@@ -24,7 +24,7 @@ from varve.keying.keys import (
     config_data,
     content_key,
 )
-from varve.matrix import Cell, PipelineGraph, build_graph
+from varve.matrix import Cell, PipelineGraph, build_graph, cell_output_path
 from varve.models import (
     AttemptMarker,
     BatchRecord,
@@ -407,7 +407,7 @@ def _probe_stage(
         stage_name=stage_name,
         declared_needs=frozenset(stage_spec.logical_needs),
         cell=Cell(stage_spec.cell),
-        cell_out=out / stage_name if stage_spec.cell else out,
+        cell_out=cell_output_path(out, stage_spec),
         need_cells=stage_spec.need_cells,
     )
     components = compute_key_components(
@@ -636,7 +636,7 @@ async def _drive(
             stage_name=stage_name,
             declared_needs=declared_needs,
             cell=Cell(stage_spec.cell),
-            cell_out=out / stage_name if stage_spec.cell else out,
+            cell_out=cell_output_path(out, stage_spec),
             need_cells=stage_spec.need_cells,
         )
         # Probe key: project config onto the fields the previous run read (whole
@@ -722,7 +722,7 @@ async def _drive(
             stage_name=stage_name,
             declared_needs=declared_needs,
             cell=Cell(stage_spec.cell),
-            cell_out=out / stage_name if stage_spec.cell else out,
+            cell_out=cell_output_path(out, stage_spec),
             need_cells=stage_spec.need_cells,
         )
         if stage_spec.kind == "single":

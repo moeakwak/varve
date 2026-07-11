@@ -30,10 +30,17 @@ class StageSpec:
     matrix: tuple[Any, ...] = ()
     logical_needs: tuple[str, ...] = ()
     cell: tuple[tuple[Any, Any], ...] = ()
+    base_name: str | None = None
     need_cells: dict[str, tuple[str, ...]] | None = None
 
     def expanded(self, *, name: str, cell: tuple[tuple[Any, Any], ...]) -> StageSpec:
-        return replace(self, name=name, logical_needs=self.needs, cell=cell)
+        return replace(
+            self,
+            name=name,
+            logical_needs=self.needs,
+            cell=cell,
+            base_name=self.name if cell else None,
+        )
 
     def with_wiring(
         self, needs: tuple[str, ...], need_cells: dict[str, tuple[str, ...]]

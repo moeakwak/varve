@@ -125,7 +125,7 @@ class Evaluation(Pipeline):
         write_summary(ctx.inputs("score"), ctx.out / "summary.json")
 ```
 
-Each cell is a concrete stage such as `score@bench=unimer,model=qwen3-vl-8b`. Matrix artifacts must live under `ctx.cell_out`; relative declared and yielded paths resolve there. `ctx.out` remains the branch output root, and ordinary stages keep `ctx.cell_out == ctx.out`. Key getters can read coordinates through `ctx.cell.model` or `ctx.cell["model"]`.
+Each cell is a concrete stage such as `score@bench=unimer,model=qwen3-vl-8b`. Its managed artifact directory is `<output-root>/.matrix/score/bench=unimer/model=qwen3-vl-8b/`: the base stage comes first, followed by one `<axis-name>=<canonical-id>` level for each axis in declaration order. This physical layout does not change the concrete stage or store identity. Matrix artifacts must live under `ctx.cell_out`; relative declared and yielded paths resolve there. `ctx.out` remains the branch output root, and ordinary stages keep `ctx.cell_out == ctx.out`. Key getters can read coordinates through `ctx.cell.model` or `ctx.cell["model"]`.
 
 Use `--only score` to select every active cell of one base stage. `--slice model=qwen3-vl-8b` selects matching cells plus their aligned upstream closure and is accepted only for temporary branches. Matrix cells remain serial at the varve scheduler level.
 

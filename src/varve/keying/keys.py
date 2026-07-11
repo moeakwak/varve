@@ -22,6 +22,8 @@ from varve.keyspec import KeySpec
 from varve.models import FileFingerprint, KeyComponents
 
 _UNION_ORIGINS = (Union, types.UnionType)
+_MATRIX_LAYOUT_KEY = "__varve_matrix_layout__"
+_MATRIX_LAYOUT_VERSION = 2
 
 
 class StageSpecLike(Protocol):
@@ -39,6 +41,9 @@ class StageSpecLike(Protocol):
 
     @property
     def needs(self) -> tuple[str, ...]: ...
+
+    @property
+    def cell(self) -> tuple[tuple[Any, Any], ...]: ...
 
 
 def config_data(config: Any) -> dict[str, Any]:
@@ -147,6 +152,10 @@ def compute_key_components(
         session=fingerprint_session,
     )
     values = {name: getter(ctx) for name, getter in sorted(stage_spec.keyspec.values.items())}
+    if stage_spec.cell:
+        if _MATRIX_LAYOUT_KEY in values:
+            raise ValueError(f"KeySpec.values name {_MATRIX_LAYOUT_KEY!r} is reserved by varve")
+        values[_MATRIX_LAYOUT_KEY] = _MATRIX_LAYOUT_VERSION
     need_cells = getattr(stage_spec, "need_cells", None) or {}
     has_matrix_fan_in = any(len(names) > 1 for names in need_cells.values())
     upstreams = {

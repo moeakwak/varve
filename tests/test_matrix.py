@@ -8,9 +8,12 @@ from pydantic import BaseModel
 
 from varve import Axis, Ctx, Pipeline, batch_stage, matrix, stage
 from varve.branch_config import resolve_branch
+from varve.cli.clean import clean
 from varve.engine import runner as runner_module
-from varve.engine.runner import run, selected_stages
-from varve.matrix import build_graph
+from varve.engine.runner import probe_pipeline, run, selected_stages
+from varve.keying.keys import content_key
+from varve.matrix import build_graph, cell_output_path
+from varve.models import BatchRecord, ProducedPath, SuccessRecord
 from varve.store.store import Store
 
 
@@ -68,6 +71,15 @@ def test_graph_expands_and_wires_shared_axes_in_declaration_order() -> None:
     assert graph.stages["finish"].needs == graph.base_cells["score"]
 
 
+def test_cell_output_path_uses_base_stage_and_axis_declaration_order(tmp_path: Path) -> None:
+    graph = build_graph(MatrixPipeline)
+
+    assert cell_output_path(tmp_path, graph.stages["score@bench=a,model=small"]) == (
+        tmp_path / ".matrix" / "score" / "bench=a" / "model=small"
+    )
+    assert cell_output_path(tmp_path, graph.stages["finish"]) == tmp_path
+
+
 def test_branch_axis_domain_limits_expansion_without_reordering() -> None:
     graph = build_graph(MatrixPipeline, {"model": ["large"], "bench": ["b", "a"]})
 
@@ -82,13 +94,60 @@ def test_matrix_run_injects_coordinates_fans_in_and_isolates_outputs(tmp_path: P
     out = tmp_path / "main"
 
     assert [outcome.stage for outcome in outcomes] == build_graph(MatrixPipeline).topo_order()
-    assert (out / "score@bench=a,model=small" / "score.txt").read_text() == "a:small"
+    assert (
+        out / ".matrix" / "score" / "bench=a" / "model=small" / "score.txt"
+    ).read_text() == "a:small"
     assert (out / "all.txt").read_text().splitlines() == [
         "a:small",
         "a:large",
         "b:small",
         "b:large",
     ]
+    record = Store(out).read_success("score@bench=a,model=small")
+    assert record is not None
+    assert record.stage == "score@bench=a,model=small"
+    assert record.produces == [
+        ProducedPath(
+            path=".matrix/score/bench=a/model=small/score.txt",
+            kind="file",
+        )
+    ]
+
+
+def test_matrix_callable_produces_records_the_cell_output_path(tmp_path: Path) -> None:
+    axis = Axis("item", ["one"])
+
+    class CallableProduces(Pipeline):
+        Config = Config
+
+        @matrix(axis)
+        @stage(produces=lambda ctx: ctx.cell_out / "result.txt")
+        def write(self, ctx: Ctx, *, item: str) -> None:
+            ctx.cell_out.mkdir(parents=True, exist_ok=True)
+            (ctx.cell_out / "result.txt").write_text(item)
+
+    run(CallableProduces, Config(), cli_out=tmp_path)
+    record = Store(tmp_path / "main").read_success("write@item=one")
+
+    assert record is not None
+    assert record.produces == [ProducedPath(path=".matrix/write/item=one/result.txt", kind="file")]
+
+
+def test_matrix_artifact_existence_and_clean_use_recorded_paths(tmp_path: Path) -> None:
+    run(MatrixPipeline, Config(), cli_out=tmp_path)
+    out = tmp_path / "main"
+    missing = out / ".matrix" / "score" / "bench=a" / "model=small" / "score.txt"
+    missing.unlink()
+
+    outcomes = run(MatrixPipeline, Config(), cli_out=tmp_path, only="score")
+
+    assert next(item for item in outcomes if item.stage == "score@bench=a,model=small").status == (
+        "artifact-missing"
+    )
+    assert missing.exists()
+    clean(MatrixPipeline, Config(), cli_out=tmp_path, target="score", yes=True)
+    assert not missing.exists()
+    assert (out / ".matrix" / "source" / "bench=a" / "source.txt").exists()
 
 
 def test_matrix_absolute_output_must_stay_in_cell_directory(tmp_path: Path) -> None:
@@ -116,6 +175,22 @@ def test_matrix_static_output_escape_is_rejected_before_body(tmp_path: Path) -> 
     with pytest.raises(ValueError, match="inside the output root"):
         run(Bad, Config(), cli_out=tmp_path)
     assert not (tmp_path / "main" / "body-ran.txt").exists()
+
+
+def test_matrix_batch_output_must_stay_in_cell_directory(tmp_path: Path) -> None:
+    class Bad(Pipeline):
+        Config = Config
+
+        @matrix(BENCH)
+        @batch_stage()
+        async def write(self, ctx: Ctx, *, bench: str):
+            async for _, _ in ctx.resume([bench], progress=False):
+                path = ctx.out / f"shared-{bench}.txt"
+                path.write_text(bench)
+                yield path
+
+    with pytest.raises(ValueError, match="inside the output root"):
+        run(Bad, Config(), cli_out=tmp_path)
 
 
 def test_slice_selects_matching_cells_and_their_aligned_upstreams() -> None:
@@ -407,8 +482,120 @@ def test_matrix_batch_outputs_are_cell_isolated(tmp_path: Path) -> None:
                 ctx.cell_out.mkdir(parents=True, exist_ok=True)
                 path = ctx.cell_out / f"{index}.txt"
                 path.write_text(value)
-                yield path
+                yield Path(f"{index}.txt")
 
     run(Batched, Config(), cli_out=tmp_path)
-    assert (tmp_path / "main" / "parts@bench=a" / "0.txt").read_text() == "a"
-    assert (tmp_path / "main" / "parts@bench=b" / "0.txt").read_text() == "b"
+    out = tmp_path / "main"
+    assert (out / ".matrix" / "parts" / "bench=a" / "0.txt").read_text() == "a"
+    assert (out / ".matrix" / "parts" / "bench=b" / "0.txt").read_text() == "b"
+    record = Store(out).read_success("parts@bench=a")
+    assert record is not None
+    assert record.outputs is not None
+    assert [item.path for item in record.outputs] == [".matrix/parts/bench=a/0.txt"]
+
+
+def _without_matrix_layout(components):
+    values = dict(components.values)
+    assert values.pop("__varve_matrix_layout__") == 2
+    return components.model_copy(update={"values": values})
+
+
+def test_legacy_flat_single_record_is_stale_and_rebuilt_in_new_layout(tmp_path: Path) -> None:
+    axis = Axis("item", ["one"])
+
+    class LegacySingle(Pipeline):
+        Config = Config
+
+        @matrix(axis)
+        @stage(produces="result.txt")
+        def write(self, ctx: Ctx, *, item: str) -> None:
+            ctx.cell_out.mkdir(parents=True, exist_ok=True)
+            (ctx.cell_out / "result.txt").write_text(f"new-{item}")
+
+    out = tmp_path / "main"
+    graph = build_graph(LegacySingle)
+    stage_name = "write@item=one"
+    probe = probe_pipeline(
+        LegacySingle,
+        Config(),
+        args=LegacySingle.Args(),
+        out=out,
+        graph=graph,
+    )[0]
+    assert probe.components is not None
+    legacy_components = _without_matrix_layout(probe.components)
+    legacy_path = out / stage_name / "result.txt"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text("legacy")
+    Store(out).write_success(
+        SuccessRecord(
+            pipeline=LegacySingle.__name__,
+            stage=stage_name,
+            kind="single",
+            content_key=content_key(legacy_components),
+            key_components=legacy_components,
+            produces=[ProducedPath(path=f"{stage_name}/result.txt", kind="file")],
+            committed_at="legacy",
+        )
+    )
+
+    outcomes = run(LegacySingle, Config(), cli_out=tmp_path, graph=graph)
+    record = Store(out).read_success(stage_name)
+
+    assert outcomes[0].status == "stale"
+    assert legacy_path.read_text() == "legacy"
+    assert (out / ".matrix" / "write" / "item=one" / "result.txt").read_text() == "new-one"
+    assert record is not None
+    assert record.produces == [ProducedPath(path=".matrix/write/item=one/result.txt", kind="file")]
+
+
+def test_legacy_flat_batch_partial_does_not_resume_or_mix_outputs(tmp_path: Path) -> None:
+    axis = Axis("item", ["one"])
+    executed: list[int] = []
+
+    class LegacyBatch(Pipeline):
+        Config = Config
+
+        @matrix(axis)
+        @batch_stage()
+        async def write(self, ctx: Ctx, *, item: str):
+            async for index, value in ctx.resume([f"{item}-0", f"{item}-1"], progress=False):
+                executed.append(index)
+                ctx.cell_out.mkdir(parents=True, exist_ok=True)
+                path = ctx.cell_out / f"{index}.txt"
+                path.write_text(value)
+                yield path
+
+    out = tmp_path / "main"
+    graph = build_graph(LegacyBatch)
+    stage_name = "write@item=one"
+    probe = probe_pipeline(
+        LegacyBatch,
+        Config(),
+        args=LegacyBatch.Args(),
+        out=out,
+        graph=graph,
+    )[0]
+    assert probe.components is not None
+    legacy_key = content_key(_without_matrix_layout(probe.components))
+    legacy_path = out / stage_name / "0.txt"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text("legacy")
+    Store(out).write_batch(
+        stage_name,
+        legacy_key,
+        BatchRecord(index=0, yielded=[f"{stage_name}/0.txt"], committed_at="legacy"),
+    )
+
+    outcomes = run(LegacyBatch, Config(), cli_out=tmp_path, graph=graph)
+    record = Store(out).read_success(stage_name)
+
+    assert outcomes[0].status == "no-cache"
+    assert executed == [0, 1]
+    assert legacy_path.read_text() == "legacy"
+    assert record is not None
+    assert record.outputs is not None
+    assert [item.path for item in record.outputs] == [
+        ".matrix/write/item=one/0.txt",
+        ".matrix/write/item=one/1.txt",
+    ]

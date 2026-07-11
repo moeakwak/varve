@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from graphlib import TopologicalSorter
 from itertools import product
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -157,6 +158,19 @@ class PipelineGraph:
             ):
                 seeds.append(name)
         return closure(seeds, ancestors)
+
+
+def cell_output_path(output_root: Path, spec: StageSpec) -> Path:
+    """Return the managed artifact root for a concrete stage."""
+
+    if not spec.cell:
+        return output_root
+    if spec.base_name is None:
+        raise ValueError(f"Matrix cell {spec.name!r} has no base stage metadata")
+    path = output_root / ".matrix" / spec.base_name
+    for axis, value in spec.cell:
+        path /= f"{axis.name}={axis.id_of(value)}"
+    return path
 
 
 def pipeline_axes(pipeline: type[Any]) -> dict[str, Axis]:
