@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import pytest
+from pydantic import BaseModel
+from rich.text import Text
+
+from varve import Axis, Ctx, Pipeline, matrix, stage
+from varve.cli import app as cli_app
+from varve.cli.app import _print_outcomes
+from varve.engine.run_display import (
+    AUTO_COMPACT_MIN_CELLS,
+    AUTO_EXPAND_SLOW_SECONDS,
+    RunReporter,
+    StageOutcome,
+    build_run_display_plan,
+    outcome_rows,
+)
+from varve.engine.runner import run
+from varve.matrix import build_graph
+from varve.models import KeyComponents, ProducedPath, SuccessRecord
+from varve.store.store import Store
+
+
+class Config(BaseModel):
+    pass
+
+
+ITEM = Axis("item", [str(index) for index in range(AUTO_COMPACT_MIN_CELLS)])
+
+
+class LargeMatrix(Pipeline):
+    Config = Config
+
+    @matrix(ITEM)
+    @stage()
+    def work(self, ctx: Ctx, *, item: str) -> None:
+        pass
+
+
+def _record(stage: str, *, elapsed: float) -> SuccessRecord:
+    return SuccessRecord(
+        pipeline="LargeMatrix",
+        stage=stage,
+        kind="single",
+        content_key="key",
+        key_components=KeyComponents(source={}, config={}, files={}, values={}, upstreams={}),
+        produces=[ProducedPath(path="artifact", kind="file")],
+        committed_at="now",
+        elapsed=elapsed,
+    )
+
+
+def test_auto_display_policy_threshold_flags_and_selected_subset(tmp_path: Path) -> None:
+    graph = build_graph(LargeMatrix)
+    store = Store(tmp_path)
+    all_cells = set(graph.stages)
+
+    assert build_run_display_plan(graph, all_cells, store, mode="auto").groups[0].compact
+    assert not build_run_display_plan(graph, all_cells, store, mode="expand").groups[0].compact
+    assert (
+        build_run_display_plan(graph, {next(iter(all_cells))}, store, mode="compact")
+        .groups[0]
+        .compact
+    )
+    assert (
+        not build_run_display_plan(
+            graph,
+            set(tuple(graph.stages)[: AUTO_COMPACT_MIN_CELLS - 1]),
+            store,
+            mode="auto",
+        )
+        .groups[0]
+        .compact
+    )
+
+    sliced = graph.selected(slices=["item=0"])
+    assert len(sliced) == 1
+    assert not build_run_display_plan(graph, sliced, store, mode="auto").groups[0].compact
+
+
+def test_direct_run_rejects_invalid_display_mode(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Invalid run display mode"):
+        run(LargeMatrix, Config(), cli_out=tmp_path, display_mode="bad")  # type: ignore[arg-type]
+
+
+def test_auto_display_expands_group_with_known_slow_cell(tmp_path: Path) -> None:
+    graph = build_graph(LargeMatrix)
+    store = Store(tmp_path)
+    store.write_success(_record(graph.base_cells["work"][3], elapsed=AUTO_EXPAND_SLOW_SECONDS))
+
+    plan = build_run_display_plan(graph, set(graph.stages), store, mode="auto")
+
+    assert not plan.groups[0].compact
+
+
+def test_compact_reporter_finishes_non_contiguous_group_by_count(caplog) -> None:
+    graph = build_graph(LargeMatrix)
+    plan = build_run_display_plan(
+        graph,
+        set(graph.stages),
+        Store(Path("unused")),
+        mode="compact",
+    )
+    reporter = RunReporter(plan, logging.getLogger("varve"))
+    caplog.set_level(logging.INFO, logger="varve")
+    stages = graph.base_cells["work"]
+
+    reporter.start(stages[0])
+    for stage_name in stages[:-1]:
+        reporter.record(plan.outcome(stage_name, "hit", "hit", None))
+    assert not any("ran 0" in record.getMessage() for record in caplog.records)
+
+    # Completion depends on the selected-cell count, not adjacency in the
+    # caller's event stream.
+    reporter.record(plan.outcome(stages[-1], "stale", "source changed", 0.25))
+    messages = [record.getMessage() for record in caplog.records]
+    assert "[work] start · 8 cells" in messages
+    assert "[work] done · 8 cells · 7 hit, 1 stale · ran 1 · 0.25s" in messages
+
+
+def test_compact_reporter_surfaces_new_slow_cell_by_concrete_name(caplog) -> None:
+    graph = build_graph(LargeMatrix)
+    plan = build_run_display_plan(
+        graph,
+        set(graph.stages),
+        Store(Path("unused")),
+        mode="compact",
+    )
+    reporter = RunReporter(plan, logging.getLogger("varve"))
+    caplog.set_level(logging.INFO, logger="varve")
+    stage_name = graph.base_cells["work"][0]
+
+    reporter.record(plan.outcome(stage_name, "no-cache", "no cache", AUTO_EXPAND_SLOW_SECONDS))
+
+    assert f"[{stage_name}] slow · {AUTO_EXPAND_SLOW_SECONDS:.2f}s" in [
+        record.getMessage() for record in caplog.records
+    ]
+
+
+def test_compact_runner_aggregates_live_hits_runs_and_outcomes(tmp_path: Path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="varve")
+    first = run(LargeMatrix, Config(), cli_out=tmp_path)
+    first_messages = [record.getMessage() for record in caplog.records]
+
+    assert "plan: work (8 cells)" in first_messages
+    assert "[work] start · 8 cells" in first_messages
+    assert any("8 no-cache · ran 8" in message for message in first_messages)
+    assert not any("[work@item=" in message for message in first_messages)
+    first_rows = outcome_rows(first)
+    assert [(row.stage, row.cells, row.ran) for row in first_rows] == [("work", 8, 8)]
+
+    caplog.clear()
+    second = run(LargeMatrix, Config(), cli_out=tmp_path)
+    second_messages = [record.getMessage() for record in caplog.records]
+    assert any("8 hit · ran 0" in message for message in second_messages)
+    second_row = outcome_rows(second)[0]
+    assert second_row.status == "8 hit"
+    assert second_row.status_counts == (("hit", 8),)
+    assert second_row.elapsed is None
+
+
+def test_compact_cli_outcome_table_has_one_group_row(tmp_path: Path, capsys) -> None:
+    outcomes = run(LargeMatrix, Config(), cli_out=tmp_path)
+
+    _print_outcomes(outcomes, elapsed=True)
+
+    output = capsys.readouterr().out
+    assert "STAGE" in output
+    assert "CELLS" in output
+    assert "RAN" in output
+    assert "work" in output
+    assert "8 no-cache" in output
+    assert "work@item=" not in output
+
+
+def test_compact_cli_outcome_table_styles_each_status_token(
+    capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called: list[str] = []
+
+    def tracked_status_text(status: str) -> Text:
+        called.append(status)
+        return Text(status)
+
+    monkeypatch.setattr(cli_app, "status_text", tracked_status_text)
+    outcomes = [
+        StageOutcome(
+            "work@item=0",
+            "hit",
+            "hit",
+            None,
+            display_base="work",
+            display_compact=True,
+            display_cells=2,
+        ),
+        StageOutcome(
+            "work@item=1",
+            "stale",
+            "source changed",
+            0.5,
+            display_base="work",
+            display_compact=True,
+            display_cells=2,
+        ),
+    ]
+
+    _print_outcomes(outcomes, elapsed=True)
+
+    assert called == ["hit", "stale"]
+    assert "1 hit, 1 stale" in capsys.readouterr().out
+
+
+def test_expand_runner_keeps_concrete_matrix_lifecycle(tmp_path: Path, caplog) -> None:
+    caplog.set_level(logging.INFO, logger="varve")
+
+    run(LargeMatrix, Config(), cli_out=tmp_path, display_mode="expand")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("[work@item=0] run" in message for message in messages)
+    assert any("[work@item=7] done" in message for message in messages)
+    assert not any("[work] start" in message for message in messages)
+
+
+def test_compact_runner_keeps_concrete_lifecycle_and_keys_at_debug(tmp_path: Path, caplog) -> None:
+    caplog.set_level(logging.DEBUG, logger="varve")
+
+    run(LargeMatrix, Config(), cli_out=tmp_path, display_mode="compact")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("[work@item=0] run" in message for message in messages)
+    assert any("[work@item=0] content_key" in message for message in messages)
+
+
+def test_compact_failure_always_logs_concrete_cell(tmp_path: Path, caplog) -> None:
+    class Failing(Pipeline):
+        Config = Config
+
+        @matrix(ITEM)
+        @stage()
+        def work(self, ctx: Ctx, *, item: str) -> None:
+            if item == "3":
+                raise RuntimeError("planned failure")
+
+    caplog.set_level(logging.INFO, logger="varve")
+
+    with pytest.raises(RuntimeError, match="planned failure"):
+        run(Failing, Config(), cli_out=tmp_path, display_mode="compact")
+
+    assert any(
+        "[work@item=3] error · planned failure" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_non_matrix_outcome_rows_remain_one_row_per_stage() -> None:
+    outcomes = [
+        StageOutcome("prepare", "hit", "hit", None),
+        StageOutcome("finish", "no-cache", "no cache", 0.5),
+    ]
+
+    rows = outcome_rows(outcomes)
+
+    assert [(row.stage, row.status, row.grouped) for row in rows] == [
+        ("prepare", "hit", False),
+        ("finish", "no-cache", False),
+    ]

@@ -292,6 +292,31 @@ def test_cli_passes_out_as_builtin_runner_argument(
     assert not hasattr(config, "out")
     assert kwargs["cli_out"] == tmp_path
     assert kwargs["branch"] == "main"
+    assert kwargs["display_mode"] == "auto"
+
+
+@pytest.mark.parametrize(("flag", "expected"), [("--expand", "expand"), ("--compact", "compact")])
+def test_cli_run_passes_matrix_display_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    expected: str,
+) -> None:
+    captured: list[dict] = []
+
+    def fake_run(pipeline, config, **kwargs):
+        captured.append(kwargs)
+        return []
+
+    monkeypatch.setattr("varve.cli.app.run", fake_run)
+
+    assert CliPipeline.cli(["run", f"--out={tmp_path}", flag]) == 0
+    assert captured[0]["display_mode"] == expected
+
+
+def test_cli_run_rejects_expand_and_compact_together(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        CliPipeline.cli(["run", f"--out={tmp_path}", "--expand", "--compact"])
 
 
 def test_cli_command_option_wins_when_config_field_has_same_name(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, TypeVar, cast
 
@@ -11,6 +12,14 @@ from varve.store.store import Store
 
 ConfigT = TypeVar("ConfigT")
 ArgsT = TypeVar("ArgsT")
+
+
+@dataclass(frozen=True)
+class StageDisplay:
+    """Structured stage metadata used only for runtime labels."""
+
+    base_name: str
+    cell_values: tuple[str, ...] = ()
 
 
 def _len_or_none(iterable: Iterable[Any]) -> int | None:
@@ -70,6 +79,7 @@ class Ctx(Generic[ConfigT, ArgsT]):
         store: Store,
         resume_skip: frozenset[int] | None = None,
         stage_name: str | None = None,
+        stage_display: StageDisplay | None = None,
         declared_needs: frozenset[str] | None = None,
         cell: Cell | None = None,
         cell_out: Path | None = None,
@@ -83,6 +93,7 @@ class Ctx(Generic[ConfigT, ArgsT]):
         self._store = store
         self._resume_skip = resume_skip or frozenset()
         self._stage_name = stage_name
+        self._stage_display = stage_display
         self._declared_needs = declared_needs
         self._need_cells = need_cells
         self._current_batch_index: int | None = None
@@ -159,7 +170,12 @@ class Ctx(Generic[ConfigT, ArgsT]):
         self._used_resume = True
         progress_handle: _ResumeProgress | None = None
         if progress:
-            label = desc or self._stage_name or "batch"
+            if desc is not None:
+                label = desc
+            elif self._stage_display is not None and self._stage_display.cell_values:
+                label = " / ".join(self._stage_display.cell_values)
+            else:
+                label = self._stage_name or "batch"
             inferred_total = total if total is not None else _len_or_none(iterable)
             initial = (
                 sum(1 for index in self._resume_skip if index < inferred_total)

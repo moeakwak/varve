@@ -10,12 +10,14 @@ from types import SimpleNamespace
 
 from pydantic import BaseModel
 from rich.table import Table
+from rich.text import Text
 
 from varve.branch_config import resolve_branch
 from varve.cli import argmap
 from varve.cli.clean import clean
 from varve.cli.status import render_status
-from varve.engine.runner import StageOutcome, run, selected_stages
+from varve.engine.run_display import StageOutcome, outcome_rows
+from varve.engine.runner import run, selected_stages
 from varve.log import configure_cli_logging
 from varve.matrix import build_graph
 from varve.pipeline import Pipeline
@@ -34,6 +36,8 @@ _COMMAND_OPTION_ARITIES = {
         "--slice": 1,
         "--force": 0,
         "-f": 0,
+        "--expand": 0,
+        "--compact": 0,
         "--out": 1,
     },
     "status": {
@@ -79,14 +83,34 @@ def _print_list(pipeline: type[Pipeline]) -> None:
 
 
 def _print_outcomes(outcomes: list[StageOutcome], *, elapsed: bool) -> None:
+    rows = outcome_rows(outcomes)
+    has_groups = any(row.grouped for row in rows)
     table = Table(box=None)
     table.add_column("STAGE")
     table.add_column("STATUS")
     table.add_column("REASON")
+    if has_groups:
+        table.add_column("CELLS", justify="right")
+        table.add_column("RAN", justify="right")
     if elapsed:
         table.add_column("ELAPSED", justify="right")
-    for outcome in outcomes:
-        row = [outcome.stage, status_text(outcome.status), outcome.reason]
+    for outcome in rows:
+        if outcome.grouped:
+            status = Text()
+            for index, (status_name, count) in enumerate(outcome.status_counts):
+                if index:
+                    status.append(", ")
+                status.append(f"{count} ")
+                status.append_text(status_text(status_name))
+        else:
+            status = status_text(outcome.status)
+        row = [outcome.stage, status, outcome.reason]
+        if has_groups:
+            row.extend(
+                [str(outcome.cells), str(outcome.ran)]
+                if outcome.grouped
+                else ["-", str(outcome.ran)]
+            )
         if elapsed:
             row.append(format_elapsed(outcome.elapsed, missing="-"))
         table.add_row(*row)
@@ -203,6 +227,13 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     )
     run_parser.add_argument(
         "--force", "-f", action="store_true", help="Ignore cache for selected stages."
+    )
+    run_view = run_parser.add_mutually_exclusive_group()
+    run_view.add_argument(
+        "--expand", action="store_true", help="Show every selected concrete matrix cell."
+    )
+    run_view.add_argument(
+        "--compact", action="store_true", help="Fold selected cells by matrix stage."
     )
     run_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
 
@@ -370,6 +401,7 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             graph=graph,
         )
     elif namespace.command == "run":
+        display_mode = "expand" if namespace.expand else "compact" if namespace.compact else "auto"
         outcomes = run(
             pipeline,
             config,
@@ -386,6 +418,7 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             only=namespace.only,
             slices=tuple(namespace.slice),
             graph=graph,
+            display_mode=display_mode,
         )
         _print_outcomes(outcomes, elapsed=True)
     return 0

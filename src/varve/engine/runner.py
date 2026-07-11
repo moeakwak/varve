@@ -12,9 +12,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from varve.context import Ctx
+from varve.context import Ctx, StageDisplay
 from varve.decorators import ProducesItem, ProducesSpec
-from varve.engine.state import Decision, Status, decide_batch, decide_single
+from varve.engine.run_display import (
+    RunDisplayMode,
+    RunReporter,
+    StageOutcome,
+    build_run_display_plan,
+)
+from varve.engine.state import Decision, decide_batch, decide_single
 from varve.keying.config_access import ConfigAccess, RecordingConfig, project_config
 from varve.keying.dependencies import SourceDependencies
 from varve.keying.fingerprint import FingerprintSession
@@ -36,14 +42,6 @@ from varve.models import (
 from varve.pipeline import Pipeline
 from varve.store.lock import OutputLock
 from varve.store.store import Store
-
-
-@dataclass(frozen=True)
-class StageOutcome:
-    stage: str
-    status: Status
-    reason: str
-    elapsed: float | None
 
 
 @dataclass(frozen=True)
@@ -100,6 +98,13 @@ class _KeyingSession:
 
 def _now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _stage_display(stage_spec) -> StageDisplay:
+    return StageDisplay(
+        base_name=stage_spec.base_name or stage_spec.name,
+        cell_values=tuple(axis.id_of(value) for axis, value in stage_spec.cell),
+    )
 
 
 def _relative_to_out(
@@ -405,6 +410,7 @@ def _probe_stage(
         out=out,
         store=store,
         stage_name=stage_name,
+        stage_display=_stage_display(stage_spec),
         declared_needs=frozenset(stage_spec.logical_needs),
         cell=Cell(stage_spec.cell),
         cell_out=cell_output_path(out, stage_spec),
@@ -548,6 +554,8 @@ async def _drive(
     only: str | None,
     force: bool,
     execute: bool,
+    display_mode: RunDisplayMode,
+    reporter: RunReporter | None = None,
     slices: tuple[str, ...] = (),
 ) -> list[StageOutcome]:
     store = Store(out)
@@ -559,6 +567,11 @@ async def _drive(
         only=only,
         slices=slices,
     )
+    if reporter is None:
+        display_plan = build_run_display_plan(graph, selected, store, mode=display_mode)
+        reporter = RunReporter(display_plan, logging.getLogger("varve"))
+    else:
+        display_plan = reporter.plan
     if execute:
         _validate_external_upstreams(
             pipeline_type,
@@ -574,17 +587,19 @@ async def _drive(
     instance = pipeline_type()
     outcomes: list[StageOutcome] = []
     known_content_keys: dict[str, str] = {}
-    logger = logging.getLogger("varve")
-    logger.info("plan: %s", " -> ".join(name for name in graph.topo_order() if name in selected))
+    reporter.log_plan(graph.topo_order())
 
     for stage_name in graph.topo_order():
         if stage_name not in selected:
             continue
         stage_spec = graph.stages[stage_name]
+        reporter.start(stage_name)
         if not execute:
             missing_upstream = any(store.read_success(name) is None for name in stage_spec.needs)
             if missing_upstream:
-                outcomes.append(StageOutcome(stage_name, "no-cache", "no cache", None))
+                outcome = display_plan.outcome(stage_name, "no-cache", "no cache", None)
+                outcomes.append(outcome)
+                reporter.record(outcome)
                 continue
             source_dependencies = keying_session.source_dependencies(
                 stage_spec,
@@ -604,20 +619,13 @@ async def _drive(
             )
             assert probe.decision_key is not None
             known_content_keys[stage_name] = probe.decision_key
-            logger.info(
-                "[%s] %s%s",
-                stage_name,
-                probe.decision.status,
-                (
-                    f" · {probe.decision.reason}"
-                    if probe.decision.reason != probe.decision.status
-                    else ""
-                ),
+            reporter.lifecycle(stage_name, probe.decision.status, probe.decision.reason)
+            reporter.content_key(stage_name, probe.decision_key)
+            outcome = display_plan.outcome(
+                stage_name, probe.decision.status, probe.decision.reason, None
             )
-            logger.debug("[%s] content_key %s", stage_name, probe.decision_key)
-            outcomes.append(
-                StageOutcome(stage_name, probe.decision.status, probe.decision.reason, None)
-            )
+            outcomes.append(outcome)
+            reporter.record(outcome)
             continue
         source_dependencies = keying_session.source_dependencies(
             stage_spec,
@@ -634,6 +642,7 @@ async def _drive(
             out=out,
             store=store,
             stage_name=stage_name,
+            stage_display=_stage_display(stage_spec),
             declared_needs=declared_needs,
             cell=Cell(stage_spec.cell),
             cell_out=cell_output_path(out, stage_spec),
@@ -691,19 +700,16 @@ async def _drive(
                 components=components,
             )
         if decision.status == "hit":
-            logger.info(
-                "[%s] %s%s",
-                stage_name,
-                decision.status,
-                f" · {decision.reason}" if decision.reason != decision.status else "",
-            )
-            logger.debug("[%s] content_key %s", stage_name, current_key)
-            outcomes.append(StageOutcome(stage_name, decision.status, decision.reason, None))
+            reporter.lifecycle(stage_name, decision.status, decision.reason)
+            reporter.content_key(stage_name, current_key)
+            outcome = display_plan.outcome(stage_name, decision.status, decision.reason, None)
+            outcomes.append(outcome)
+            reporter.record(outcome)
             continue
         _validate_static_produces_location(stage_spec.produces, ctx_for_key)
         started = time.monotonic()
-        logger.info("[%s] run · %s", stage_name, decision.reason)
-        logger.debug("[%s] content_key %s", stage_name, current_key)
+        reporter.lifecycle(stage_name, "run", decision.reason)
+        reporter.content_key(stage_name, current_key)
         store.write_attempt(
             stage_name,
             AttemptMarker(
@@ -720,6 +726,7 @@ async def _drive(
             store=store,
             resume_skip=decision.resume_skip,
             stage_name=stage_name,
+            stage_display=_stage_display(stage_spec),
             declared_needs=declared_needs,
             cell=Cell(stage_spec.cell),
             cell_out=cell_output_path(out, stage_spec),
@@ -820,8 +827,10 @@ async def _drive(
             )
         store.clear_attempt(stage_name)
         keying_session.refresh_fingerprints()
-        logger.info("[%s] done · %.2fs", stage_name, elapsed)
-        outcomes.append(StageOutcome(stage_name, decision.status, decision.reason, elapsed))
+        reporter.lifecycle(stage_name, "done", f"{elapsed:.2f}s")
+        outcome = display_plan.outcome(stage_name, decision.status, decision.reason, elapsed)
+        outcomes.append(outcome)
+        reporter.record(outcome)
     return outcomes
 
 
@@ -842,6 +851,7 @@ def run(
     slices: tuple[str, ...] = (),
     temporary_axes: dict[str, tuple[str, ...]] | None = None,
     graph: PipelineGraph | None = None,
+    display_mode: RunDisplayMode = "auto",
 ) -> list[StageOutcome]:
     if args is None:
         args = pipeline.Args()
@@ -863,21 +873,38 @@ def run(
             temporary_config=temporary_config,
             temporary_axes=temporary_axes,
         )
-        return asyncio.run(
-            _drive(
-                pipeline,
-                graph,
-                config,
-                args=args,
-                out=out,
-                upto=upto,
-                downstream=downstream,
-                only=only,
-                force=force,
-                execute=True,
-                slices=slices,
-            )
+        selected = selected_stages(
+            graph,
+            upto=upto,
+            downstream=downstream,
+            only=only,
+            slices=slices,
         )
+        reporter = RunReporter(
+            build_run_display_plan(graph, selected, store, mode=display_mode),
+            logging.getLogger("varve"),
+        )
+        try:
+            return asyncio.run(
+                _drive(
+                    pipeline,
+                    graph,
+                    config,
+                    args=args,
+                    out=out,
+                    upto=upto,
+                    downstream=downstream,
+                    only=only,
+                    force=force,
+                    execute=True,
+                    display_mode=display_mode,
+                    reporter=reporter,
+                    slices=slices,
+                )
+            )
+        except Exception as error:
+            reporter.failure_current(error)
+            raise
 
 
 def evaluate_state(
@@ -915,5 +942,6 @@ def evaluate_state(
             only=only,
             force=False,
             execute=False,
+            display_mode="expand",
         )
     )

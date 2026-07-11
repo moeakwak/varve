@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import varve.context
-from varve.context import Ctx
+from varve.context import Ctx, StageDisplay
 from varve.models import (
     KeyComponents,
     OutputHandle,
@@ -171,6 +171,39 @@ def test_resume_progress_desc_and_unit_overrides(
     assert bar.unit == "row"
     assert bar.total == 2
     assert bar.initial == 0
+
+
+def test_resume_progress_matrix_default_uses_canonical_values(
+    tmp_path: Path,
+    captured_bars: list[FakeBar],
+) -> None:
+    ctx = _ctx(
+        tmp_path,
+        stage_name="score@bench=ocrbench-v2-formula,model=qwen3-vl-8b-instruct",
+        stage_display=StageDisplay(
+            base_name="score",
+            cell_values=("ocrbench-v2-formula", "qwen3-vl-8b-instruct"),
+        ),
+    )
+
+    _collect(ctx, ["item"])
+
+    assert captured_bars[0].desc == "ocrbench-v2-formula / qwen3-vl-8b-instruct"
+
+
+def test_resume_progress_explicit_desc_is_unchanged_for_matrix_cell(
+    tmp_path: Path,
+    captured_bars: list[FakeBar],
+) -> None:
+    ctx = _ctx(
+        tmp_path,
+        stage_name="score@bench=a,model=b",
+        stage_display=StageDisplay(base_name="score", cell_values=("a", "b")),
+    )
+
+    _collect(ctx, ["item"], desc="custom axis-aware description")
+
+    assert captured_bars[0].desc == "custom axis-aware description"
 
 
 def test_resume_progress_disabled_creates_no_bar(

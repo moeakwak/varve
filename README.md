@@ -129,6 +129,10 @@ Each cell is a concrete stage such as `score@bench=unimer,model=qwen3-vl-8b`. It
 
 Use `--only score` to select every active cell of one base stage. `--slice model=qwen3-vl-8b` selects matching cells plus their aligned upstream closure and is accepted only for temporary branches. Matrix cells remain serial at the varve scheduler level.
 
+`run` uses an `auto` matrix display policy for its plan, live log, and outcome table. A selected matrix group with at least 8 cells is folded into one base-stage summary unless any selected cell has a previous successful duration of at least 30 seconds; groups with 7 or fewer selected cells and groups with known slow cells stay expanded. A folded group prints a bounded start line and a completion summary with status counts, executed-cell count, and total execution time. Cache hits and short successful cells do not print individual info lines, while `-v` retains concrete lifecycle and content-key diagnostics. Slow cells and failures always identify the full concrete cell. Use `run --expand` to force every concrete cell or `run --compact` to force matrix-group summaries; the flags are mutually exclusive and do not affect execution, selection, cache keys, or artifact identities.
+
+For a matrix batch stage, the default `ctx.resume()` progress description uses only canonical coordinate values in axis declaration order, such as `ocrbench-v2-formula / qwen3-vl-8b-instruct`, instead of repeating the full concrete stage name. An explicit `desc=` is used unchanged, and ordinary stages retain their stage name as the default.
+
 `status` folds matrix cells by base stage by default. Each matrix row reports the most severe cell status, a stable status-count distribution, the sum of recorded cell durations (with the recorded fraction when any duration is missing), and logical `needs`. `status score` shows the same one-row group summary; add `--expand` to render one table per base stage with a separate column for every axis. Select a concrete name such as `status score@bench=unimer,model=qwen3-vl-8b` for the full single-cell view, where `--expand` and `--all` retain their source-dependency meanings.
 
 ## Why varve
@@ -150,7 +154,7 @@ The core design choices are:
 
 - Public API: `Pipeline`, `@stage`, `@batch_stage`, `Axis`, `@matrix`, `KeySpec`, `Ctx`, `JSON`, and `StageSpec`.
 - Generated pipeline commands:
-  - `run [--branch NAME] [--override JSON] [--only STAGE | --upto STAGE | --downstream STAGE] [--slice AXIS=ID] [--force] [--out PATH]`
+  - `run [--branch NAME] [--override JSON] [--only STAGE | --upto STAGE | --downstream STAGE] [--slice AXIS=ID] [--force] [--expand | --compact] [--out PATH]`
   - `status [STAGE] [--branch NAME] [--expand | --all | --deps | --deps-all] [--out PATH]`
   - `plan [--branch NAME] [--only STAGE | --upto STAGE | --downstream STAGE]`
   - `list`
