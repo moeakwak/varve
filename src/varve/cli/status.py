@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 from rich.console import Console, Group, RenderableType
 from rich.panel import Panel
@@ -11,7 +12,7 @@ from rich.text import Text
 from rich.tree import Tree
 
 from varve.keying.dependencies import DependencyNode, SourceDependencies
-from varve.status import PipelineStatus, SourceChange, StageStatus
+from varve.status import PipelineStatus, SourceChange, StageStatus, StageStatusGroup
 from varve.style import format_elapsed, status_text
 
 _COMPACT_REASON_PREFIXES = (
@@ -85,7 +86,7 @@ def relative_qualified_name(
     return ".".join(child_parts[common:])
 
 
-def render_pipeline_summary(console: Console, status: PipelineStatus) -> None:
+def _render_pipeline_heading(console: Console, status: PipelineStatus) -> None:
     console.print(
         Text.assemble(
             ("Pipeline status", "varve.dependency.stage"),
@@ -93,47 +94,244 @@ def render_pipeline_summary(console: Console, status: PipelineStatus) -> None:
         )
     )
     console.print()
+
+
+def format_group_cells(group: StageStatusGroup) -> Text:
+    total = len(group.cells)
+    if len(group.status_counts) == 1:
+        status, count = group.status_counts[0]
+        result = Text(f"{count}/{total} ")
+        token = status_text(status)
+        result.append(token.plain, style=token.style)
+        return result
+    result = Text()
+    for index, (status, count) in enumerate(group.status_counts):
+        if index:
+            result.append(" · ", style="dim")
+        result.append(f"{count} ")
+        token = status_text(status)
+        result.append(token.plain, style=token.style)
+    return result
+
+
+def format_group_duration(group: StageStatusGroup) -> str:
+    if not group.is_matrix:
+        return format_elapsed(group.duration)
+    recorded = group.recorded_duration_count
+    total = len(group.cells)
+    duration = format_elapsed(group.duration, missing="-")
+    return duration if recorded == total else f"{duration} · {recorded}/{total}"
+
+
+def _dependency_summary(stage: StageStatus) -> Text:
+    summary = Text()
+    summary.append(f"{stage.direct_count} direct", style="varve.dependency.function")
+    summary.append(f" · {stage.total_count} total", style="dim")
+    if stage.broad_count:
+        summary.append(f" · {stage.broad_count} broad", style="varve.dependency.broad")
+    return summary
+
+
+def _summary_table(console: Console, groups: tuple[StageStatusGroup, ...]) -> Table:
+    has_matrix = any(group.is_matrix for group in groups)
     fold_core = console.width < 80
     core_overflow = "fold" if fold_core else "ignore"
     table = Table(box=None, padding=(0, 1), header_style="bold")
+    stage_width = max((len(group.base_name) for group in groups), default=5) if has_matrix else None
+    stage_width = max(stage_width or 0, len("STAGE")) if has_matrix else None
     table.add_column(
         "STAGE",
         style="bold",
-        no_wrap=not fold_core,
-        overflow=core_overflow,
+        width=stage_width,
+        min_width=stage_width,
+        no_wrap=has_matrix or not fold_core,
+        overflow="ellipsis" if has_matrix else core_overflow,
     )
-    table.add_column("STATUS", no_wrap=not fold_core, overflow=core_overflow)
+    status_width = max((len(group.status) for group in groups), default=6) if has_matrix else None
+    status_width = max(status_width or 0, len("STATUS")) if has_matrix else None
+    table.add_column(
+        "STATUS",
+        width=status_width,
+        min_width=status_width,
+        no_wrap=has_matrix or not fold_core,
+        overflow="ellipsis" if has_matrix else core_overflow,
+    )
+    if has_matrix:
+        cells_width = max(
+            len(format_group_cells(group).plain) if group.is_matrix else 1 for group in groups
+        )
+        table.add_column(
+            "CELLS",
+            width=max(cells_width, len("CELLS")),
+            min_width=max(cells_width, len("CELLS")),
+            no_wrap=True,
+            overflow="ellipsis",
+        )
+    duration_width = (
+        max(len(format_group_duration(group)) for group in groups) if has_matrix else None
+    )
+    duration_width = max(duration_width or 0, len("DURATION")) if has_matrix else None
     table.add_column(
         "DURATION",
         justify="right",
-        no_wrap=not fold_core,
-        overflow=core_overflow,
+        width=duration_width,
+        min_width=duration_width,
+        no_wrap=has_matrix or not fold_core,
+        overflow="ellipsis" if has_matrix else core_overflow,
     )
-    table.add_column("NEEDS", style="dim", overflow="fold")
-    table.add_column("SOURCE DEPENDENCIES", overflow="fold")
-    table.add_column("REASON", overflow="fold")
-    for stage in status.stages:
-        dependency_summary = Text()
-        dependency_summary.append(f"{stage.direct_count} direct", style="varve.dependency.function")
-        dependency_summary.append(f" · {stage.total_count} total", style="dim")
-        if stage.broad_count:
-            dependency_summary.append(
-                f" · {stage.broad_count} broad", style="varve.dependency.broad"
-            )
-        table.add_row(
-            stage.name,
-            status_text(stage.status),
-            format_elapsed(stage.duration),
-            format_needs(stage.needs),
-            dependency_summary,
-            reason_text(stage.reason),
+    table.add_column(
+        "NEEDS",
+        style="dim",
+        min_width=5 if has_matrix else None,
+        no_wrap=has_matrix,
+        overflow="ellipsis" if has_matrix else "fold",
+    )
+    if not has_matrix:
+        table.add_column("SOURCE DEPENDENCIES", overflow="fold")
+    table.add_column(
+        "REASON",
+        min_width=6 if has_matrix else None,
+        no_wrap=has_matrix,
+        overflow="ellipsis" if has_matrix else "fold",
+    )
+    for group in groups:
+        stage = group.cells[0]
+        row: list[RenderableType] = [
+            group.base_name,
+            status_text(group.status),
+        ]
+        if has_matrix:
+            row.append(format_group_cells(group) if group.is_matrix else "-")
+        row.extend(
+            [
+                format_group_duration(group),
+                format_needs(group.logical_needs),
+            ]
         )
-    console.print(table)
-    console.print()
+        if not has_matrix:
+            row.append(_dependency_summary(stage))
+        row.append(reason_text(group.reason))
+        table.add_row(*row)
+    return table
+
+
+def _fit_text(value: str | Text, width: int, *, style: str | None = None) -> Text:
+    if isinstance(value, str):
+        result = Text(value) if style is None else Text(value, style=style)
+    else:
+        result = value.copy()
+    if result.style:
+        result.stylize(result.style, 0, len(result))
+    result.truncate(width, overflow="ellipsis", pad=True)
+    return result
+
+
+def _compact_row(parts: tuple[tuple[str | Text, int, str | None], ...]) -> Text:
+    row = Text()
+    for index, (value, width, style) in enumerate(parts):
+        if index:
+            row.append("  ")
+        row.append_text(_fit_text(value, width, style=style))
+    return row
+
+
+def _compact_matrix_summary(console: Console, groups: tuple[StageStatusGroup, ...]) -> None:
+    stage_width = max(len("STAGE"), *(len(group.base_name) for group in groups))
+    status_width = max(len("STATUS"), *(len(group.status) for group in groups))
+    cells_width = min(
+        20,
+        max(
+            len("CELLS"),
+            *(len(format_group_cells(group).plain) if group.is_matrix else 1 for group in groups),
+        ),
+    )
+    duration_width = max(len("DURATION"), *(len(format_group_duration(group)) for group in groups))
+    fixed_width = stage_width + status_width + cells_width + duration_width + 10
+    flexible_width = max(console.width - fixed_width, 10)
+    needs_width = max(5, flexible_width * 3 // 5)
+    reason_width = max(5, flexible_width - needs_width)
     console.print(
-        "[dim]Dependencies are folded. Run[/] [bold]status STAGE[/] "
-        "[dim]for one stage, then add[/] [bold]--expand[/] [dim]or[/] "
-        "[bold]--all[/][dim].[/]"
+        _compact_row(
+            (
+                ("STAGE", stage_width, "bold"),
+                ("STATUS", status_width, "bold"),
+                ("CELLS", cells_width, "bold"),
+                ("DURATION", duration_width, "bold"),
+                ("NEEDS", needs_width, "bold"),
+                ("REASON", reason_width, "bold"),
+            )
+        )
+    )
+    for group in groups:
+        console.print(
+            _compact_row(
+                (
+                    (group.base_name, stage_width, "bold"),
+                    (status_text(group.status), status_width, None),
+                    (
+                        format_group_cells(group) if group.is_matrix else "-",
+                        cells_width,
+                        None,
+                    ),
+                    (format_group_duration(group), duration_width, None),
+                    (format_needs(group.logical_needs), needs_width, "dim"),
+                    (reason_text(group.reason), reason_width, None),
+                )
+            )
+        )
+
+
+def render_pipeline_summary(console: Console, status: PipelineStatus) -> None:
+    _render_pipeline_heading(console, status)
+    if any(group.is_matrix for group in status.groups) and console.width < 120:
+        _compact_matrix_summary(console, status.groups)
+    else:
+        console.print(_summary_table(console, status.groups))
+    console.print()
+    hints = []
+    if any(group.is_matrix for group in status.groups):
+        hints.append("add --expand to show matrix cells")
+    if any(not group.is_matrix for group in status.groups):
+        hints.append("select a stage and add --expand/--all for source dependencies")
+    if hints:
+        console.print(Text("Status is folded; " + "; ".join(hints) + ".", style="dim"))
+
+
+def render_expanded_groups(console: Console, status: PipelineStatus) -> None:
+    _render_pipeline_heading(console, status)
+    ordinary = tuple(group for group in status.groups if not group.is_matrix)
+    for group in status.groups:
+        if not group.is_matrix:
+            continue
+        heading = Text(group.base_name, style="varve.dependency.stage")
+        heading.append(
+            f"  {len(group.cells)} cells · needs {format_needs(group.logical_needs)}",
+            style="dim",
+        )
+        console.print(heading)
+        table = Table(box=None, padding=(0, 1), header_style="bold")
+        for axis in group.axes:
+            table.add_column(axis.upper(), style="bold")
+        table.add_column("STATUS")
+        table.add_column("DURATION", justify="right")
+        table.add_column("REASON", overflow="fold")
+        for cell in group.cells:
+            table.add_row(
+                *(coordinate.value_id for coordinate in cell.cell),
+                status_text(cell.status),
+                format_elapsed(cell.duration, missing="-"),
+                reason_text(cell.summary_reason),
+            )
+        console.print(table)
+        console.print()
+    if ordinary:
+        console.print(Text("Ordinary stages", style="bold"))
+        console.print(_summary_table(console, ordinary))
+        console.print()
+    console.print(
+        "[dim]Select a concrete cell or ordinary stage, then add[/] [bold]--expand[/] "
+        "[dim]or[/] [bold]--all[/] [dim]to inspect source dependencies;[/] "
+        "[bold]--deps[/] [dim]and[/] [bold]--deps-all[/] [dim]are explicit equivalents.[/]"
     )
 
 
@@ -384,7 +582,7 @@ def render_stage_status(
         if hidden_removed:
             removed_tree.add(
                 Text(
-                    f"… {hidden_removed} more removed dependencies; run with --all",
+                    f"… {hidden_removed} more removed dependencies; run with --all or --deps-all",
                     style="dim italic",
                 )
             )
@@ -392,11 +590,15 @@ def render_stage_status(
     console.print(Panel(dependency_content, title=title, title_align="left", border_style="dim"))
     if depth == 0:
         console.print(
-            "[dim]Run with[/] [bold]--expand[/] [dim]to show one dependency level, "
-            "or[/] [bold]--all[/] [dim]for the full tree.[/]"
+            "[dim]Run with[/] [bold]--expand[/] [dim]or[/] [bold]--deps[/] "
+            "[dim]to show one dependency level, or[/] [bold]--all[/] [dim]or[/] "
+            "[bold]--deps-all[/] [dim]for the full tree.[/]"
         )
     elif depth == 1:
-        console.print("[dim]Run with[/] [bold]--all[/] [dim]for the full dependency tree.[/]")
+        console.print(
+            "[dim]Run with[/] [bold]--all[/] [dim]or[/] [bold]--deps-all[/] "
+            "[dim]for the full dependency tree.[/]"
+        )
     console.print(
         "[dim]Auto dependencies are best effort. "
         "Dynamic calls and runtime dispatch are not inferred.[/]"
@@ -407,14 +609,21 @@ def render_status(
     console: Console,
     status: PipelineStatus,
     *,
-    stage: str | None,
-    depth: int | None,
+    view: Literal["summary", "cells", "detail"],
+    dependency_depth: int | None = 0,
 ) -> None:
-    if stage is None and depth == 0:
+    if view == "summary":
         render_pipeline_summary(console, status)
         return
-    selected = status.stages
-    for index, item in enumerate(selected):
+    if view == "cells":
+        render_expanded_groups(console, status)
+        return
+    for index, stage in enumerate(status.stages):
         if index:
             console.print()
-        render_stage_status(console, item, depth=depth, show_keys=depth != 0)
+        render_stage_status(
+            console,
+            stage,
+            depth=dependency_depth,
+            show_keys=dependency_depth != 0,
+        )

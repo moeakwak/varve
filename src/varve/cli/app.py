@@ -41,6 +41,8 @@ _COMMAND_OPTION_ARITIES = {
         "--out": 1,
         "--expand": 0,
         "--all": 0,
+        "--deps": 0,
+        "--deps-all": 0,
     },
     "clean": {
         "--branch": 1,
@@ -208,9 +210,21 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     status_parser.add_argument("stage", nargs="?", metavar="STAGE")
     status_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
     status_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
-    status_depth = status_parser.add_mutually_exclusive_group()
-    status_depth.add_argument("--expand", action="store_true", help="Show one dependency level.")
-    status_depth.add_argument("--all", action="store_true", help="Show the full dependency tree.")
+    status_view = status_parser.add_mutually_exclusive_group()
+    status_view.add_argument(
+        "--expand",
+        action="store_true",
+        help="Show matrix cells for a matrix group, or one source dependency level otherwise.",
+    )
+    status_view.add_argument(
+        "--all", action="store_true", help="Show the full source dependency tree."
+    )
+    status_view.add_argument(
+        "--deps", action="store_true", help="Show one source dependency level."
+    )
+    status_view.add_argument(
+        "--deps-all", action="store_true", help="Show the full source dependency tree."
+    )
 
     clean_parser = subparsers.add_parser("clean", help="delete selected store records and outputs")
     clean_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
@@ -277,11 +291,30 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     )
     config = resolved.config
     graph = build_graph(pipeline, resolved.axes)
+    has_matrix = any(spec.cell for spec in graph.stages.values())
+    status_names: tuple[str, ...] | None = None
+    is_matrix_base = False
     if namespace.command == "status" and namespace.stage is not None:
         try:
-            graph.names_for(namespace.stage)
+            status_names = graph.names_for(namespace.stage)
         except ValueError as error:
             parser.error(str(error))
+        is_matrix_base = namespace.stage in graph.base_cells and any(
+            graph.stages[name].cell for name in status_names
+        )
+        if (namespace.all or namespace.deps or namespace.deps_all) and is_matrix_base:
+            parser.error(
+                "Source dependency expansion requires one concrete stage; "
+                f"choose a cell such as {status_names[0]!r}."
+            )
+    if namespace.command == "status" and namespace.stage is None:
+        if namespace.deps or namespace.deps_all:
+            parser.error("--deps and --deps-all require one concrete or ordinary stage")
+        if namespace.all and has_matrix:
+            parser.error(
+                "--all requires one concrete or ordinary stage in a matrix pipeline; "
+                "choose a concrete cell first"
+            )
     if namespace.command == "run" and namespace.slice and not resolved.is_temporary:
         raise ValueError("--slice is only allowed on temporary branches")
     args = _args_from_namespace(pipeline, namespace)
@@ -300,8 +333,25 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             stage=namespace.stage,
             graph=graph,
         )
-        depth = None if namespace.all else 1 if namespace.expand else 0
-        render_status(make_console(), status, stage=namespace.stage, depth=depth)
+        if namespace.expand and (is_matrix_base or (namespace.stage is None and has_matrix)):
+            view = "cells"
+        elif namespace.stage is None or is_matrix_base:
+            view = "detail" if namespace.expand or namespace.all else "summary"
+        else:
+            view = "detail"
+        dependency_depth = (
+            None
+            if namespace.all or namespace.deps_all
+            else 1
+            if namespace.expand or namespace.deps
+            else 0
+        )
+        render_status(
+            make_console(),
+            status,
+            view=view,
+            dependency_depth=dependency_depth,
+        )
     elif namespace.command == "clean":
         allowed_roots = (
             None if isinstance(config, SimpleNamespace) else pipeline.clean_roots(config)

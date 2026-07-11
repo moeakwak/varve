@@ -16,21 +16,11 @@ from varve.dashboard.models import (
     StateError,
 )
 from varve.engine.runner import evaluate_state
-from varve.engine.state import Status
+from varve.engine.state import Status, aggregate_status
 from varve.matrix import build_graph
 from varve.models import SuccessRecord
 from varve.pipeline import Pipeline
 from varve.store.store import Store
-
-STATUS_PRIORITY: tuple[Status, ...] = (
-    "hit",
-    "artifact-missing",
-    "resume",
-    "no-cache",
-    "stale",
-    "dirty",
-)
-_STATUS_PRIORITY = {status: index for index, status in enumerate(STATUS_PRIORITY)}
 
 
 def load_state(entry: PipelineEntry) -> PipelineState:
@@ -147,9 +137,7 @@ def _parse_datetime(value: str) -> datetime | None:
 
 
 def _aggregate_status(stages: list[StageState]) -> Status:
-    if not stages:
-        return "hit"
-    return max(stages, key=lambda stage: _STATUS_PRIORITY[stage.status]).status
+    return aggregate_status([stage.status for stage in stages])
 
 
 def _error(

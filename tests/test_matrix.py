@@ -14,6 +14,7 @@ from varve.engine.runner import probe_pipeline, run, selected_stages
 from varve.keying.keys import content_key
 from varve.matrix import build_graph, cell_output_path
 from varve.models import BatchRecord, ProducedPath, SuccessRecord
+from varve.status import collect_pipeline_status
 from varve.store.store import Store
 
 
@@ -303,14 +304,149 @@ def test_yaml_temporary_branch_snapshots_and_recovers_config(
     assert recovered.config.token == "first"
 
 
-def test_status_base_name_renders_all_cells(tmp_path: Path, capsys) -> None:
+def test_status_base_name_renders_folded_group(tmp_path: Path, capsys) -> None:
     run(MatrixPipeline, Config(), cli_out=tmp_path)
 
     assert MatrixPipeline.cli(["status", "score", "--out", str(tmp_path)]) == 0
 
     output = capsys.readouterr().out
-    assert "score@bench=a,model=small" in output
-    assert "score@bench=b,model=large" in output
+    assert "score" in output
+    assert "4/4 hit" in output
+    assert "source" in output
+    assert "score@" not in output
+    assert " direct" not in output
+
+
+def test_default_status_folds_every_matrix_template(tmp_path: Path, capsys) -> None:
+    run(MatrixPipeline, Config(), cli_out=tmp_path)
+
+    assert MatrixPipeline.cli(["status", "--out", str(tmp_path)]) == 0
+
+    output = capsys.readouterr().out
+    assert "source" in output
+    assert "score" in output
+    assert "finish" in output
+    assert "2/2 hit" in output
+    assert "4/4 hit" in output
+    assert "@bench=" not in output
+    score_rows = [line for line in output.splitlines() if line.startswith("score ")]
+    assert len(score_rows) == 1
+    assert "hit" in score_rows[0]
+    assert "4/4 hit" in score_rows[0]
+
+
+def test_structured_status_groups_cells_without_skipping_exact_probes(tmp_path: Path) -> None:
+    graph = build_graph(MatrixPipeline)
+    status = collect_pipeline_status(
+        MatrixPipeline,
+        Config(),
+        args=MatrixPipeline.Args(),
+        out=tmp_path / "main",
+        branch="main",
+        graph=graph,
+    )
+
+    assert len(status.stages) == len(graph.stages) == 7
+    assert [group.base_name for group in status.groups] == ["source", "score", "finish"]
+    score = status.groups[1]
+    assert score.axes == ("bench", "model")
+    assert score.logical_needs == ("source",)
+    assert [(item.axis, item.value_id) for item in score.cells[0].cell] == [
+        ("bench", "a"),
+        ("model", "small"),
+    ]
+
+
+def test_status_matrix_duration_reports_when_no_cells_have_records(tmp_path: Path, capsys) -> None:
+    assert MatrixPipeline.cli(["status", "score", "--out", str(tmp_path)]) == 0
+
+    assert "- · 0/4" in capsys.readouterr().out
+
+
+def test_status_expand_renders_each_axis_in_its_own_column(tmp_path: Path, capsys) -> None:
+    run(MatrixPipeline, Config(), cli_out=tmp_path)
+
+    assert MatrixPipeline.cli(["status", "score", "--out", str(tmp_path), "--expand"]) == 0
+
+    output = capsys.readouterr().out
+    assert "BENCH" in output
+    assert "MODEL" in output
+    assert "a" in output
+    assert "small" in output
+    assert "bench=" not in output
+    assert "score@" not in output
+
+
+def test_status_untargeted_expand_renders_matrix_groups(tmp_path: Path, capsys) -> None:
+    assert MatrixPipeline.cli(["status", "--out", str(tmp_path), "--expand"]) == 0
+
+    output = capsys.readouterr().out
+    assert "source  2 cells" in output
+    assert "score  4 cells" in output
+    assert "BENCH" in output
+    assert "MODEL" in output
+
+
+@pytest.mark.parametrize(
+    ("flag", "title"), [("--expand", "direct + one level"), ("--all", "full tree")]
+)
+def test_status_concrete_cell_retains_dependency_expansion_flags(
+    tmp_path: Path, capsys, flag: str, title: str
+) -> None:
+    cell = "score@bench=a,model=small"
+
+    assert MatrixPipeline.cli(["status", cell, "--out", str(tmp_path), flag]) == 0
+
+    assert f"Source dependencies · {title}" in capsys.readouterr().out
+
+
+def test_status_ordinary_stage_in_matrix_pipeline_retains_expand(tmp_path: Path, capsys) -> None:
+    assert MatrixPipeline.cli(["status", "finish", "--out", str(tmp_path), "--expand"]) == 0
+
+    assert "Source dependencies · direct + one level" in capsys.readouterr().out
+
+
+def test_status_concrete_cell_keeps_detailed_stage_view(tmp_path: Path, capsys) -> None:
+    run(MatrixPipeline, Config(), cli_out=tmp_path)
+    cell = "score@bench=a,model=small"
+
+    assert MatrixPipeline.cli(["status", cell, "--out", str(tmp_path)]) == 0
+
+    output = capsys.readouterr().out
+    assert cell in output
+    assert "Key inputs" in output
+    assert "Source dependencies · folded" in output
+
+
+def test_status_dependency_flags_require_concrete_matrix_cell(tmp_path: Path, capsys) -> None:
+    with pytest.raises(SystemExit):
+        MatrixPipeline.cli(["status", "score", "--out", str(tmp_path), "--deps"])
+    error = capsys.readouterr().err
+    assert "requires one concrete stage" in error
+    assert "score@bench=a,model=small" in error
+
+    assert (
+        MatrixPipeline.cli(
+            [
+                "status",
+                "score@bench=a,model=small",
+                "--out",
+                str(tmp_path),
+                "--deps",
+            ]
+        )
+        == 0
+    )
+    assert "Source dependencies · direct + one level" in capsys.readouterr().out
+
+
+def test_status_all_rejects_matrix_base_with_concrete_hint(tmp_path: Path, capsys) -> None:
+    with pytest.raises(SystemExit):
+        MatrixPipeline.cli(["status", "score", "--out", str(tmp_path), "--all"])
+
+    error = capsys.readouterr().err
+    assert "requires one concrete stage" in error
+    assert "score@bench=a,model=small" in error
 
 
 def test_same_axis_name_on_distinct_objects_is_rejected() -> None:

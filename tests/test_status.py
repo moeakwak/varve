@@ -20,7 +20,12 @@ from varve.keying.dependencies import (
     DependencyOrigin,
     SourceDependencies,
 )
-from varve.status import PipelineStatus, collect_pipeline_status, source_component_changes
+from varve.status import (
+    CellCoordinate,
+    PipelineStatus,
+    collect_pipeline_status,
+    source_component_changes,
+)
 from varve.store.store import Store
 
 
@@ -188,7 +193,8 @@ def render_to_text(
 ) -> str:
     buffer = StringIO()
     console = Console(file=buffer, width=width, color_system=None)
-    render_status(console, status, stage=stage, depth=depth)
+    view = "summary" if stage is None and depth == 0 else "detail"
+    render_status(console, status, view=view, dependency_depth=depth)
     return buffer.getvalue()
 
 
@@ -330,15 +336,95 @@ def test_summary_shows_duration_folds_needs_and_omits_key(pipeline_status) -> No
             "render_oracle_batches",
             "prepare_pairs",
         ),
+        logical_needs=(
+            "extract",
+            "text_arm",
+            "texform_arm_batches",
+            "official_replay",
+            "render_oracle_batches",
+            "prepare_pairs",
+        ),
     )
     status = replace(pipeline_status, stages=(stage,))
-    output = render_to_text(status, stage=None, depth=0)
+    output = render_to_text(status, stage=None, depth=0, width=160)
     assert "DURATION" in output
     assert "1.25s" in output
     assert "extract, text_arm · +4 more" in output
     assert "2 direct · 4 total · 1 broad" in output
     assert "test_status.shared_helper" not in output
     assert "KEY" not in output
+
+
+def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
+    pipeline_status,
+) -> None:
+    original = pipeline_status.stages[0]
+
+    def coordinate(value: str) -> tuple[CellCoordinate, ...]:
+        return (CellCoordinate(axis="model", value_id=value),)
+
+    cells = (
+        replace(
+            original,
+            name="score@model=a",
+            base_name="score",
+            cell=coordinate("a"),
+            logical_needs=("prepare",),
+            status="hit",
+            reason="hit",
+            summary_reason="hit",
+            duration=1.0,
+        ),
+        replace(
+            original,
+            name="score@model=b",
+            base_name="score",
+            cell=coordinate("b"),
+            logical_needs=("prepare",),
+            status="stale",
+            reason="config: profile changed",
+            summary_reason="config: profile changed",
+            duration=2.0,
+        ),
+        replace(
+            original,
+            name="score@model=c",
+            base_name="score",
+            cell=coordinate("c"),
+            logical_needs=("prepare",),
+            status="dirty",
+            reason="dirty",
+            summary_reason="dirty",
+            duration=None,
+        ),
+    )
+    status = replace(pipeline_status, stages=cells)
+
+    group = status.groups[0]
+    assert group.status == "dirty"
+    assert group.status_counts == (("hit", 1), ("stale", 1), ("dirty", 1))
+    assert group.duration == 3.0
+    assert group.recorded_duration_count == 2
+
+    output = render_to_text(status, stage=None, depth=0, width=160)
+    assert "1 hit · 1 stale · 1 dirty" in output
+    assert "3.00s · 2/3" in output
+    assert "prepare" in output
+
+    buffer = StringIO()
+    console = Console(
+        file=buffer,
+        width=80,
+        color_system="standard",
+        force_terminal=True,
+        no_color=False,
+    )
+    render_status(console, status, view="summary")
+    colored = buffer.getvalue()
+    assert "\x1b[31" in colored
+    assert "\x1b[32" in colored
+    assert "dirty" in colored
+    assert "hit" in colored
 
 
 @pytest.mark.parametrize("width", [40, 60, 80])
@@ -349,6 +435,7 @@ def test_summary_does_not_ellipsize_core_fields_on_narrow_terminals(
     stage = replace(
         pipeline_status.stages[0],
         name="render_oracle_batches_Ω",
+        base_name="render_oracle_batches_Ω",
         status="artifact-missing",
         duration=1.25,
         needs=(
@@ -357,7 +444,14 @@ def test_summary_does_not_ellipsize_core_fields_on_narrow_terminals(
             "text_arm",
             "texform_arm_batches",
         ),
+        logical_needs=(
+            "prepare_pairs",
+            "official_replay",
+            "text_arm",
+            "texform_arm_batches",
+        ),
         reason="file: render_sources changed (+ source) §",
+        summary_reason="file: render_sources changed (+ source) §",
     )
     output = render_to_text(
         replace(pipeline_status, stages=(stage,)),
@@ -449,7 +543,7 @@ def test_expanded_tree_counts_changed_folded_dependencies(pipeline_status) -> No
     )
 
     assert "… 1 transitive dependencies folded  [1 changed]" in output
-    assert "… 2 more removed dependencies; run with --all" in output
+    assert "… 2 more removed dependencies; run with --all or --deps-all" in output
 
 
 def test_stage_with_missing_upstream_explains_unavailable_inputs(tmp_path: Path) -> None:

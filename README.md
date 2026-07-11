@@ -129,6 +129,8 @@ Each cell is a concrete stage such as `score@bench=unimer,model=qwen3-vl-8b`. It
 
 Use `--only score` to select every active cell of one base stage. `--slice model=qwen3-vl-8b` selects matching cells plus their aligned upstream closure and is accepted only for temporary branches. Matrix cells remain serial at the varve scheduler level.
 
+`status` folds matrix cells by base stage by default. Each matrix row reports the most severe cell status, a stable status-count distribution, the sum of recorded cell durations (with the recorded fraction when any duration is missing), and logical `needs`. `status score` shows the same one-row group summary; add `--expand` to render one table per base stage with a separate column for every axis. Select a concrete name such as `status score@bench=unimer,model=qwen3-vl-8b` for the full single-cell view, where `--expand` and `--all` retain their source-dependency meanings.
+
 ## Why varve
 
 Varve is for pipelines where Python code is already the best source of truth. It is intentionally closer to a small library such as redun, Hamilton, or pydoit than to a workflow platform.
@@ -149,7 +151,7 @@ The core design choices are:
 - Public API: `Pipeline`, `@stage`, `@batch_stage`, `Axis`, `@matrix`, `KeySpec`, `Ctx`, `JSON`, and `StageSpec`.
 - Generated pipeline commands:
   - `run [--branch NAME] [--override JSON] [--only STAGE | --upto STAGE | --downstream STAGE] [--slice AXIS=ID] [--force] [--out PATH]`
-  - `status [STAGE] [--branch NAME] [--expand | --all] [--out PATH]`
+  - `status [STAGE] [--branch NAME] [--expand | --all | --deps | --deps-all] [--out PATH]`
   - `plan [--branch NAME] [--only STAGE | --upto STAGE | --downstream STAGE]`
   - `list`
   - `clean [--branch NAME] [--downstream STAGE] [--out PATH] [--yes]`
@@ -177,13 +179,14 @@ Automatic discovery follows references that can be resolved directly from Python
 
 Discovery is always non-blocking and never claims to find a complete call graph. Dynamic calls, registries, `getattr`, factories, parameter type propagation, runtime dispatch, and sibling Pipeline methods reached through `self` are not inferred. Use `uses` or `KeySpec` whenever those inputs need a strict cache guarantee. Stage source, explicit `uses`, and explicit `KeySpec` inputs remain strict even when automatic discovery is enabled.
 
-Use `status` to inspect cache state and the source dependencies included in each decision key. The default all-stage summary folds source dependencies, limits long NEEDS lists, and shows DURATION from the most recent successful stage execution for usable cache states. A single stage shows folded dependencies, `--expand` adds one level, and `--all` renders the complete discovered DAG; expanded views also show the decision and stored keys. For stale stages, expanded views mark changed and added source dependencies inline and list dependencies removed since the stored run. Automatically inferred dependencies are left unmarked, while dependencies declared through `uses` retain an `[explicit]` label.
+Use `status` to inspect cache state and the source dependencies included in each decision key. The default summary folds matrix cells and source dependencies, limits long NEEDS lists, and shows DURATION from the most recent successful stage execution for usable cache states. For an ordinary stage or concrete matrix cell, `--expand` adds one source dependency level and `--all` renders the complete discovered DAG, preserving the behavior of non-matrix pipelines. `--deps` and `--deps-all` are explicit equivalents that require exactly one ordinary stage or concrete cell. For a matrix base, `--expand` instead renders its cells and `--all` asks you to select a concrete cell first; an untargeted `--expand` renders all matrix groups when the pipeline contains a matrix, while a non-matrix pipeline continues to expand source dependencies for all stages. Dependency-expanded views also show the decision and stored keys. For stale stages, they mark changed and added source dependencies inline and list dependencies removed since the stored run. Automatically inferred dependencies are left unmarked, while dependencies declared through `uses` retain an `[explicit]` label.
 
 ```bash
 python demo.py status
 python demo.py status normalize
 python demo.py status normalize --expand
 python demo.py status normalize --all
+python demo.py status normalize --deps  # explicit equivalent to --expand
 ```
 
 ## Branches

@@ -18,6 +18,26 @@ Status = Literal[
     "resume",
 ]
 
+# Least to most severe. Every aggregate status view must use this order so a
+# folded group and the dashboard cannot disagree about the state to surface.
+STATUS_SEVERITY: tuple[Status, ...] = (
+    "hit",
+    "artifact-missing",
+    "resume",
+    "no-cache",
+    "stale",
+    "dirty",
+)
+_STATUS_SEVERITY = {status: index for index, status in enumerate(STATUS_SEVERITY)}
+
+
+def aggregate_status(statuses: list[Status] | tuple[Status, ...]) -> Status:
+    """Return the most severe status, treating an empty aggregate as a hit."""
+
+    if not statuses:
+        return "hit"
+    return max(statuses, key=_STATUS_SEVERITY.__getitem__)
+
 
 @dataclass(frozen=True)
 class Decision:
