@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.4.0](https://github.com/moeakwak/varve/compare/varve-v0.3.0...varve-v0.4.0) (2026-07-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* **matrix:** Branch entries now use config, axes, and is_temporary facets instead of flat config keys.
+
+### Features
+
+* **matrix:** add branch-scoped matrix stages ([31fee23](https://github.com/moeakwak/varve/commit/31fee236162b89b8a76518b73f0b20ee51b2221a))
+* **matrix:** nest cell artifacts under a matrix root ([c188528](https://github.com/moeakwak/varve/commit/c188528da6c76c641cb9addc511d36f3fb47c159))
+* **run:** fold high-cardinality matrix output ([9883321](https://github.com/moeakwak/varve/commit/988332138e5b17d3c8c6f58dc011b510f89de293))
+* **status:** fold matrix cells in summaries ([a874a85](https://github.com/moeakwak/varve/commit/a874a855d269de5eb6f7ec1bf6a3734b2009efa2))
+
+
+### Performance Improvements
+
+* **evaluation:** reuse exact command observations ([ed06a79](https://github.com/moeakwak/varve/commit/ed06a7985af9577690528a485359386acaa114e6))
+* **matrix:** reuse scoped probe keying work ([50b7956](https://github.com/moeakwak/varve/commit/50b7956b4ffaf7aaabdaf06938be29608843f0a6))
+
+
+### Documentation
+
+* **contributing:** define release-relative breaking changes ([bf46315](https://github.com/moeakwak/varve/commit/bf46315b0dfc7c07a0dbe4049f201af3ceb2c03e))
+* restructure and rewrite varve docs ([a7f28ce](https://github.com/moeakwak/varve/commit/a7f28ce8aadeb59683867a7315f57bdd63146cf2))
+
 ## [0.3.0](https://github.com/moeakwak/varve/compare/varve-v0.2.0...varve-v0.3.0) (2026-07-11)
 
 
