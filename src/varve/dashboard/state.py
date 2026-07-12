@@ -15,7 +15,7 @@ from varve.dashboard.models import (
     StageState,
     StateError,
 )
-from varve.engine.runner import _KeyingSession, evaluate_state
+from varve.engine.runner import _KeyingSession, probe_pipeline
 from varve.engine.state import Status, aggregate_status
 from varve.matrix import build_graph
 from varve.models import SuccessRecord
@@ -44,47 +44,41 @@ def load_state(entry: PipelineEntry, session: _KeyingSession | None = None) -> P
 
     try:
         graph = build_graph(pipeline, resolved.axes)
-        record_views: dict[
-            str,
-            tuple[list[ArtifactState], datetime | None, float | None],
-        ] = {}
-
-        def consume_record(name: str, success: SuccessRecord | None) -> None:
-            record_views[name] = (
-                _artifacts(entry, success) if success is not None else [],
-                _parse_datetime(success.committed_at) if success is not None else None,
-                success.elapsed if success is not None else None,
-            )
-
-        outcomes = evaluate_state(
+        probes = probe_pipeline(
             pipeline,
             resolved.config,
             args=pipeline.Args(),
-            cli_out=resolved.output_base,
-            branch=resolved.branch,
-            is_temporary=resolved.is_temporary,
+            out=entry.output_root,
             axes=resolved.axes,
             graph=graph,
             _keying_session=session,
-            _record_callback=consume_record,
         )
     except Exception as error:  # noqa: BLE001 - dashboard reports evaluator diagnostics.
         return _error(entry, "evaluate", str(error))
 
-    outcomes_by_stage = {outcome.stage: outcome for outcome in outcomes}
+    probes_by_stage = {probe.stage: probe for probe in probes}
     stages: list[StageState] = []
     for name in graph.topo_order():
-        outcome = outcomes_by_stage[name]
-        artifacts, committed_at, elapsed = record_views[name]
+        probe = probes_by_stage[name]
+        success = probe.previous
+        artifacts = _artifacts(entry, success) if success is not None else []
+        committed_at = _parse_datetime(success.committed_at) if success is not None else None
+        elapsed = success.elapsed if success is not None else None
         stages.append(
             StageState(
                 name=name,
-                status=outcome.status,
-                reason=outcome.reason,
+                status=probe.decision.status,
+                reason=probe.decision.display_reason,
                 artifacts=artifacts,
                 committed_at=committed_at,
                 elapsed=elapsed,
+                failure=(
+                    None
+                    if probe.failure is None
+                    else f"{probe.failure.exception_type}: {probe.failure.message}"
+                ),
                 upstreams=list(graph.stages[name].needs),
+                source_review=probe.source_review,
             )
         )
 

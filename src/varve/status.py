@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +9,6 @@ from typing import Any, Literal
 
 from varve.engine.runner import probe_pipeline
 from varve.engine.state import STATUS_SEVERITY, Status, aggregate_status
-from varve.keying.dependencies import SourceDependencies
 from varve.matrix import PipelineGraph, build_graph
 from varve.models import FileFingerprint
 from varve.pipeline import Pipeline
@@ -21,7 +19,7 @@ SourceChange = Literal["changed", "added", "removed"]
 @dataclass(frozen=True)
 class KeyInputs:
     config: dict[str, Any]
-    files: dict[str, list[FileFingerprint]]
+    inputs: dict[str, list[FileFingerprint]]
     values: dict[str, Any]
     upstreams: dict[str, dict[str, str]]
 
@@ -47,24 +45,10 @@ class StageStatus:
     decision_key: str | None
     stored_key: str | None
     key_inputs: KeyInputs | None
-    source_dependencies: SourceDependencies
     source_changes: dict[str, SourceChange]
     unavailable_reason: str | None
-
-    @property
-    def direct_count(self) -> int:
-        return len(set(self.source_dependencies.direct))
-
-    @property
-    def total_count(self) -> int:
-        return len(reachable_identities(self.source_dependencies))
-
-    @property
-    def broad_count(self) -> int:
-        reachable = reachable_identities(self.source_dependencies)
-        return sum(
-            self.source_dependencies.nodes[identity].scope is not None for identity in reachable
-        )
+    failure: str | None = None
+    source_review: str = "confirmed"
 
 
 @dataclass(frozen=True)
@@ -100,6 +84,14 @@ class StageStatusGroup:
         return sum(cell.duration is not None for cell in self.cells)
 
     @property
+    def review(self) -> str:
+        pending = sum(cell.source_review == "pending" for cell in self.cells)
+        if pending:
+            return f"{pending} source-changed"
+        states = {cell.source_review for cell in self.cells}
+        return next(iter(states)) if len(states) == 1 else "mixed"
+
+    @property
     def reason(self) -> str:
         reasons = sorted({cell.summary_reason for cell in self.cells if cell.status == self.status})
         if not reasons:
@@ -130,21 +122,6 @@ class PipelineStatus:
             )
             for base_name, cells in grouped.items()
         )
-
-
-def reachable_identities(source: SourceDependencies) -> frozenset[str]:
-    children: dict[str, list[str]] = defaultdict(list)
-    for edge in source.edges:
-        children[edge.parent].append(edge.child)
-    seen: set[str] = set()
-    stack = list(source.direct)
-    while stack:
-        identity = stack.pop()
-        if identity in seen:
-            continue
-        seen.add(identity)
-        stack.extend(children.get(identity, ()))
-    return frozenset(seen)
 
 
 def source_component_changes(
@@ -182,12 +159,20 @@ def collect_pipeline_status(
     branch: str,
     stage: str | None = None,
     graph: PipelineGraph | None = None,
+    rehash: bool = False,
 ) -> PipelineStatus:
     """Collect decision keys and dependency descriptions without executing stages."""
 
     graph = graph or build_graph(pipeline)
     selected_names = None if stage is None else set(graph.names_for(stage))
-    probes = probe_pipeline(pipeline, config, args=args, out=out, graph=graph)
+    probes = probe_pipeline(
+        pipeline,
+        config,
+        args=args,
+        out=out,
+        graph=graph,
+        force_rehash=rehash,
+    )
     selected_probes = (
         probes
         if selected_names is None
@@ -202,17 +187,19 @@ def collect_pipeline_status(
             if components is None
             else KeyInputs(
                 config=components.config,
-                files=components.files,
+                inputs=components.inputs,
                 values=components.values,
                 upstreams=components.upstreams,
             )
         )
         previous = probe.previous
-        source_changes = (
-            source_component_changes(previous.key_components.source, components.source)
-            if probe.decision.status == "stale" and previous is not None and components is not None
-            else {}
-        )
+        source_changes: dict[str, SourceChange] = {}
+        if probe.source_review == "pending" and previous is not None:
+            old_files = {
+                item.path: item.digest for item in previous.executed_source_fingerprint.files
+            }
+            new_files = {item.path: item.digest for item in probe.source_fingerprint.files}
+            source_changes = source_component_changes(old_files, new_files)
         stages.append(
             StageStatus(
                 name=probe.stage,
@@ -225,19 +212,20 @@ def collect_pipeline_status(
                 needs=spec.needs,
                 logical_needs=spec.logical_needs,
                 status=probe.decision.status,
-                reason=probe.decision.reason,
-                summary_reason=_summary_reason(probe.decision.reason, spec.need_cells),
-                duration=(
-                    None
-                    if probe.decision.status == "no-cache" or previous is None
-                    else previous.elapsed
-                ),
+                reason=probe.decision.display_reason,
+                summary_reason=_summary_reason(probe.decision.display_reason, spec.need_cells),
+                duration=(None if previous is None else previous.elapsed),
                 decision_key=probe.decision_key,
-                stored_key=previous.content_key if previous is not None else None,
+                stored_key=previous.input_key if previous is not None else None,
                 key_inputs=key_inputs,
-                source_dependencies=probe.source_dependencies,
                 source_changes=source_changes,
                 unavailable_reason=probe.unavailable_reason,
+                failure=(
+                    None
+                    if probe.failure is None
+                    else f"{probe.failure.exception_type}: {probe.failure.message}"
+                ),
+                source_review=probe.source_review,
             )
         )
     return PipelineStatus(

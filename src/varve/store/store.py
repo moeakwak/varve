@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -11,9 +12,12 @@ from typing import Any, TypeVar
 from pydantic import ValidationError
 
 from varve.models import (
+    SCHEMA_VERSION,
     AttemptMarker,
     BatchRecord,
+    FailureRecord,
     Manifest,
+    ReviewRecord,
     SuccessRecord,
     VarveModel,
 )
@@ -42,7 +46,7 @@ def _read_model(path: Path, model_type: type[ModelT]) -> ModelT | None:
         data = json.loads(path.read_text(encoding="utf-8"))
         return model_type.model_validate(data)
     except (json.JSONDecodeError, OSError, ValidationError) as error:
-        raise CorruptStore(f"Corrupt varve store file: {path}") from error
+        raise CorruptStore(f"Cannot read varve store file {path}: {error}") from error
 
 
 class Store:
@@ -92,6 +96,26 @@ class Store:
             raise ValueError(f"Varve store has a different temporary config: {manifest_path}")
         if normalized_axes is not None and manifest.temporary_axes != normalized_axes:
             raise ValueError(f"Varve store has different temporary axes: {manifest_path}")
+        if manifest.schema_version != SCHEMA_VERSION:
+            logging.getLogger("varve").warning(
+                "rebuilding varve store schema %s as schema %s: %s",
+                manifest.schema_version,
+                SCHEMA_VERSION,
+                manifest_path,
+            )
+            _atomic_write_json(
+                manifest_path,
+                Manifest(
+                    pipeline=manifest.pipeline,
+                    module=module if module is not None else manifest.module,
+                    temporary_config=manifest.temporary_config,
+                    temporary_axes=manifest.temporary_axes,
+                ),
+            )
+            for directory in ("reviews", "failures", "attempts", "partial"):
+                shutil.rmtree(self.root / directory, ignore_errors=True)
+            manifest = self.read_manifest()
+            assert manifest is not None
         if module is not None and manifest.module != module:
             _atomic_write_json(
                 manifest_path,
@@ -104,7 +128,19 @@ class Store:
             )
 
     def read_success(self, stage: str) -> SuccessRecord | None:
-        return _read_model(self.root / "stages" / f"{stage}.json", SuccessRecord)
+        path = self.root / "stages" / f"{stage}.json"
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as error:
+                raise CorruptStore(f"Cannot read varve store file {path}: {error}") from error
+            if data.get("schema_version") != SCHEMA_VERSION:
+                return None
+            try:
+                return SuccessRecord.model_validate(data)
+            except ValidationError as error:
+                raise CorruptStore(f"Cannot read varve store file {path}: {error}") from error
+        return None
 
     def write_success(self, record: SuccessRecord) -> None:
         _atomic_write_json(self.root / "stages" / f"{record.stage}.json", record)
@@ -118,31 +154,56 @@ class Store:
     def clear_attempt(self, stage: str) -> None:
         (self.root / "attempts" / f"{stage}.json").unlink(missing_ok=True)
 
+    def read_review(self, stage: str) -> ReviewRecord | None:
+        return _read_model(self.root / "reviews" / f"{stage}.json", ReviewRecord)
+
+    def write_review(self, stage: str, record: ReviewRecord) -> None:
+        _atomic_write_json(self.root / "reviews" / f"{stage}.json", record)
+
+    def clear_review(self, stage: str) -> None:
+        (self.root / "reviews" / f"{stage}.json").unlink(missing_ok=True)
+
+    def read_failure(self, stage: str) -> FailureRecord | None:
+        return _read_model(self.root / "failures" / f"{stage}.json", FailureRecord)
+
+    def write_failure(self, stage: str, record: FailureRecord) -> None:
+        _atomic_write_json(self.root / "failures" / f"{stage}.json", record)
+
+    def clear_failure(self, stage: str) -> None:
+        (self.root / "failures" / f"{stage}.json").unlink(missing_ok=True)
+
     def read_partial(
         self,
         stage: str,
-        content_key: str,
+        input_key: str,
     ) -> dict[int, BatchRecord] | None:
-        partial_root = self.root / "partial" / stage / content_key
+        partial_root = self.root / "partial" / stage / input_key
         if not partial_root.exists():
             return None
         batches_root = partial_root / "batches"
         batches: dict[int, BatchRecord] = {}
         for path in sorted(batches_root.glob("*.json")):
-            batch = _read_model(path, BatchRecord)
-            if batch is None:
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as error:
+                raise CorruptStore(f"Cannot read varve store file {path}: {error}") from error
+            if "artifacts" not in raw:
                 continue
+            try:
+                batch = BatchRecord.model_validate(raw)
+            except ValidationError as error:
+                raise CorruptStore(f"Cannot read varve store file {path}: {error}") from error
             batches[batch.index] = batch
         return batches
 
-    def write_batch(self, stage: str, content_key: str, record: BatchRecord) -> None:
+    def write_batch(self, stage: str, input_key: str, record: BatchRecord) -> None:
         _atomic_write_json(
-            self.root / "partial" / stage / content_key / "batches" / f"{record.index}.json",
+            self.root / "partial" / stage / input_key / "batches" / f"{record.index}.json",
             record,
         )
 
-    def clear_partial(self, stage: str, content_key: str | None = None) -> None:
+    def clear_partial(self, stage: str, input_key: str | None = None) -> None:
         path = self.root / "partial" / stage
-        if content_key is not None:
-            path /= content_key
+        if input_key is not None:
+            path /= input_key
         shutil.rmtree(path, ignore_errors=True)

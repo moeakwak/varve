@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from enum import Enum
 from pathlib import Path
 
@@ -11,9 +12,8 @@ from varve.branch_config import resolve_branch
 from varve.cli.clean import clean
 from varve.engine import runner as runner_module
 from varve.engine.runner import probe_pipeline, run, selected_stages
-from varve.keying.keys import content_key
+from varve.keying.keys import input_key
 from varve.matrix import build_graph, cell_output_path
-from varve.models import BatchRecord, ProducedPath, SuccessRecord
 from varve.status import collect_pipeline_status
 from varve.store.store import Store
 
@@ -107,11 +107,8 @@ def test_matrix_run_injects_coordinates_fans_in_and_isolates_outputs(tmp_path: P
     record = Store(out).read_success("score@bench=a,model=small")
     assert record is not None
     assert record.stage == "score@bench=a,model=small"
-    assert record.produces == [
-        ProducedPath(
-            path=".matrix/score/bench=a/model=small/score.txt",
-            kind="file",
-        )
+    assert [(item.path, item.kind) for item in record.produces] == [
+        (".matrix/score/bench=a/model=small/score.txt", "file")
     ]
 
 
@@ -131,7 +128,9 @@ def test_matrix_callable_produces_records_the_cell_output_path(tmp_path: Path) -
     record = Store(tmp_path / "main").read_success("write@item=one")
 
     assert record is not None
-    assert record.produces == [ProducedPath(path=".matrix/write/item=one/result.txt", kind="file")]
+    assert [(item.path, item.kind) for item in record.produces] == [
+        (".matrix/write/item=one/result.txt", "file")
+    ]
 
 
 def test_matrix_artifact_existence_and_clean_use_recorded_paths(tmp_path: Path) -> None:
@@ -142,9 +141,9 @@ def test_matrix_artifact_existence_and_clean_use_recorded_paths(tmp_path: Path) 
 
     outcomes = run(MatrixPipeline, Config(), cli_out=tmp_path, only="score")
 
-    assert next(item for item in outcomes if item.stage == "score@bench=a,model=small").status == (
-        "artifact-missing"
-    )
+    repaired = next(item for item in outcomes if item.stage == "score@bench=a,model=small")
+    assert repaired.status == "needs-run"
+    assert repaired.reason == "artifact-missing"
     assert missing.exists()
     clean(MatrixPipeline, Config(), cli_out=tmp_path, target="score", yes=True)
     assert not missing.exists()
@@ -387,23 +386,18 @@ def test_status_untargeted_expand_renders_matrix_groups(tmp_path: Path, capsys) 
     assert "MODEL" in output
 
 
-@pytest.mark.parametrize(
-    ("flag", "title"), [("--expand", "direct + one level"), ("--all", "full tree")]
-)
-def test_status_concrete_cell_retains_dependency_expansion_flags(
-    tmp_path: Path, capsys, flag: str, title: str
-) -> None:
+def test_status_concrete_cell_expands_details(tmp_path: Path, capsys) -> None:
     cell = "score@bench=a,model=small"
 
-    assert MatrixPipeline.cli(["status", cell, "--out", str(tmp_path), flag]) == 0
+    assert MatrixPipeline.cli(["status", cell, "--out", str(tmp_path), "--expand"]) == 0
 
-    assert f"Source dependencies · {title}" in capsys.readouterr().out
+    assert "Source review" in capsys.readouterr().out
 
 
 def test_status_ordinary_stage_in_matrix_pipeline_retains_expand(tmp_path: Path, capsys) -> None:
     assert MatrixPipeline.cli(["status", "finish", "--out", str(tmp_path), "--expand"]) == 0
 
-    assert "Source dependencies · direct + one level" in capsys.readouterr().out
+    assert "Source review" in capsys.readouterr().out
 
 
 def test_status_concrete_cell_keeps_detailed_stage_view(tmp_path: Path, capsys) -> None:
@@ -415,38 +409,7 @@ def test_status_concrete_cell_keeps_detailed_stage_view(tmp_path: Path, capsys) 
     output = capsys.readouterr().out
     assert cell in output
     assert "Key inputs" in output
-    assert "Source dependencies · folded" in output
-
-
-def test_status_dependency_flags_require_concrete_matrix_cell(tmp_path: Path, capsys) -> None:
-    with pytest.raises(SystemExit):
-        MatrixPipeline.cli(["status", "score", "--out", str(tmp_path), "--deps"])
-    error = capsys.readouterr().err
-    assert "requires one concrete stage" in error
-    assert "score@bench=a,model=small" in error
-
-    assert (
-        MatrixPipeline.cli(
-            [
-                "status",
-                "score@bench=a,model=small",
-                "--out",
-                str(tmp_path),
-                "--deps",
-            ]
-        )
-        == 0
-    )
-    assert "Source dependencies · direct + one level" in capsys.readouterr().out
-
-
-def test_status_all_rejects_matrix_base_with_concrete_hint(tmp_path: Path, capsys) -> None:
-    with pytest.raises(SystemExit):
-        MatrixPipeline.cli(["status", "score", "--out", str(tmp_path), "--all"])
-
-    error = capsys.readouterr().err
-    assert "requires one concrete stage" in error
-    assert "score@bench=a,model=small" in error
+    assert "Source review" in output
 
 
 def test_same_axis_name_on_distinct_objects_is_rejected() -> None:
@@ -511,7 +474,7 @@ def test_fan_in_order_change_invalidates_aggregate(tmp_path: Path) -> None:
         MODEL.ids = original_ids
         MODEL._by_id = original_by_id
     assert outcomes[-1].stage == "finish"
-    assert outcomes[-1].status == "stale"
+    assert outcomes[-1].status == "needs-run"
 
 
 def test_only_rejects_stale_external_upstream(tmp_path: Path) -> None:
@@ -541,7 +504,16 @@ def test_only_rejects_stale_external_upstream(tmp_path: Path) -> None:
             "score",
             None,
             (),
-            ["source@bench=a", "source@bench=b"],
+            [
+                "source@bench=a",
+                "source@bench=b",
+                "source@bench=a",
+                "source@bench=b",
+                "score@bench=a,model=small",
+                "score@bench=a,model=large",
+                "score@bench=b,model=small",
+                "score@bench=b,model=large",
+            ],
         ),
         (
             "finish",
@@ -554,25 +526,52 @@ def test_only_rejects_stale_external_upstream(tmp_path: Path) -> None:
                 "score@bench=a,model=large",
                 "score@bench=b,model=small",
                 "score@bench=b,model=large",
+                "source@bench=a",
+                "source@bench=b",
+                "score@bench=a,model=small",
+                "score@bench=a,model=large",
+                "score@bench=b,model=small",
+                "score@bench=b,model=large",
+                "finish",
             ],
         ),
         (
             None,
             "score",
             (),
-            ["source@bench=a", "source@bench=b"],
+            [
+                "source@bench=a",
+                "source@bench=b",
+                "source@bench=a",
+                "source@bench=b",
+                "score@bench=a,model=small",
+                "score@bench=a,model=large",
+                "score@bench=b,model=small",
+                "score@bench=b,model=large",
+                "finish",
+            ],
         ),
         (
             "score",
             None,
             ("model=small",),
-            [],
+            [
+                "source@bench=a",
+                "source@bench=b",
+                "score@bench=a,model=small",
+                "score@bench=b,model=small",
+            ],
         ),
         (
             None,
             "score",
             ("model=small",),
-            [],
+            [
+                "source@bench=a",
+                "source@bench=b",
+                "score@bench=a,model=small",
+                "score@bench=b,model=small",
+            ],
         ),
     ],
 )
@@ -663,26 +662,34 @@ def test_legacy_flat_single_record_is_stale_and_rebuilt_in_new_layout(tmp_path: 
     legacy_path = out / stage_name / "result.txt"
     legacy_path.parent.mkdir(parents=True)
     legacy_path.write_text("legacy")
-    Store(out).write_success(
-        SuccessRecord(
-            pipeline=LegacySingle.__name__,
-            stage=stage_name,
-            kind="single",
-            content_key=content_key(legacy_components),
-            key_components=legacy_components,
-            produces=[ProducedPath(path=f"{stage_name}/result.txt", kind="file")],
-            committed_at="legacy",
+    legacy_record = out / ".varve" / "stages" / f"{stage_name}.json"
+    legacy_record.parent.mkdir(parents=True)
+    legacy_record.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "pipeline": LegacySingle.__name__,
+                "stage": stage_name,
+                "kind": "single",
+                "input_key": input_key(legacy_components),
+                "key_components": legacy_components.model_dump(),
+                "produces": [{"path": f"{stage_name}/result.txt", "kind": "file"}],
+                "committed_at": "legacy",
+            }
         )
     )
 
     outcomes = run(LegacySingle, Config(), cli_out=tmp_path, graph=graph)
     record = Store(out).read_success(stage_name)
 
-    assert outcomes[0].status == "stale"
+    assert outcomes[0].status == "needs-run"
     assert legacy_path.read_text() == "legacy"
     assert (out / ".matrix" / "write" / "item=one" / "result.txt").read_text() == "new-one"
     assert record is not None
-    assert record.produces == [ProducedPath(path=".matrix/write/item=one/result.txt", kind="file")]
+    assert record.produces is not None
+    assert [(item.path, item.kind) for item in record.produces] == [
+        (".matrix/write/item=one/result.txt", "file")
+    ]
 
 
 def test_legacy_flat_batch_partial_does_not_resume_or_mix_outputs(tmp_path: Path) -> None:
@@ -713,20 +720,20 @@ def test_legacy_flat_batch_partial_does_not_resume_or_mix_outputs(tmp_path: Path
         graph=graph,
     )[0]
     assert probe.components is not None
-    legacy_key = content_key(_without_matrix_layout(probe.components))
+    legacy_key = input_key(_without_matrix_layout(probe.components))
     legacy_path = out / stage_name / "0.txt"
     legacy_path.parent.mkdir(parents=True)
     legacy_path.write_text("legacy")
-    Store(out).write_batch(
-        stage_name,
-        legacy_key,
-        BatchRecord(index=0, yielded=[f"{stage_name}/0.txt"], committed_at="legacy"),
+    legacy_batch = out / ".varve" / "partial" / stage_name / legacy_key / "batches" / "0.json"
+    legacy_batch.parent.mkdir(parents=True)
+    legacy_batch.write_text(
+        json.dumps({"index": 0, "yielded": [f"{stage_name}/0.txt"], "committed_at": "legacy"})
     )
 
     outcomes = run(LegacyBatch, Config(), cli_out=tmp_path, graph=graph)
     record = Store(out).read_success(stage_name)
 
-    assert outcomes[0].status == "no-cache"
+    assert outcomes[0].status == "needs-run"
     assert executed == [0, 1]
     assert legacy_path.read_text() == "legacy"
     assert record is not None

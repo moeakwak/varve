@@ -20,7 +20,13 @@ from varve.engine.run_display import (
 )
 from varve.engine.runner import run
 from varve.matrix import build_graph
-from varve.models import KeyComponents, ProducedPath, SuccessRecord
+from varve.models import (
+    ArtifactFingerprint,
+    KeyComponents,
+    ProducedPath,
+    SourceFingerprint,
+    SuccessRecord,
+)
 from varve.store.store import Store
 
 
@@ -41,13 +47,18 @@ class LargeMatrix(Pipeline):
 
 
 def _record(stage: str, *, elapsed: float) -> SuccessRecord:
+    artifact = ArtifactFingerprint(
+        root="artifact", kind="file", manifest=[], fingerprint="artifact"
+    )
     return SuccessRecord(
         pipeline="LargeMatrix",
         stage=stage,
         kind="single",
-        content_key="key",
-        key_components=KeyComponents(source={}, config={}, files={}, values={}, upstreams={}),
-        produces=[ProducedPath(path="artifact", kind="file")],
+        input_key="key",
+        key_components=KeyComponents(config={}, inputs={}, values={}, upstreams={}),
+        executed_source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
+        artifact_fingerprint="artifacts",
+        produces=[ProducedPath(path="artifact", kind="file", artifact=artifact)],
         committed_at="now",
         elapsed=elapsed,
     )
@@ -115,10 +126,10 @@ def test_compact_reporter_finishes_non_contiguous_group_by_count(caplog) -> None
 
     # Completion depends on the selected-cell count, not adjacency in the
     # caller's event stream.
-    reporter.record(plan.outcome(stages[-1], "stale", "source changed", 0.25))
+    reporter.record(plan.outcome(stages[-1], "needs-run", "source-change", 0.25))
     messages = [record.getMessage() for record in caplog.records]
     assert "[work] start · 8 cells" in messages
-    assert "[work] done · 8 cells · 7 hit, 1 stale · ran 1 · 0.25s" in messages
+    assert "[work] done · 8 cells · 7 hit, 1 needs-run · ran 1 · 0.25s" in messages
 
 
 def test_compact_reporter_surfaces_new_slow_cell_by_concrete_name(caplog) -> None:
@@ -147,7 +158,7 @@ def test_compact_runner_aggregates_live_hits_runs_and_outcomes(tmp_path: Path, c
 
     assert "plan: work (8 cells)" in first_messages
     assert "[work] start · 8 cells" in first_messages
-    assert any("8 no-cache · ran 8" in message for message in first_messages)
+    assert any("8 needs-run · ran 8" in message for message in first_messages)
     assert not any("[work@item=" in message for message in first_messages)
     first_rows = outcome_rows(first)
     assert [(row.stage, row.cells, row.ran) for row in first_rows] == [("work", 8, 8)]
@@ -172,7 +183,7 @@ def test_compact_cli_outcome_table_has_one_group_row(tmp_path: Path, capsys) -> 
     assert "CELLS" in output
     assert "RAN" in output
     assert "work" in output
-    assert "8 no-cache" in output
+    assert "8 needs-run" in output
     assert "work@item=" not in output
 
 
@@ -198,8 +209,8 @@ def test_compact_cli_outcome_table_styles_each_status_token(
         ),
         StageOutcome(
             "work@item=1",
-            "stale",
-            "source changed",
+            "needs-run",
+            "source-change",
             0.5,
             display_base="work",
             display_compact=True,
@@ -209,8 +220,8 @@ def test_compact_cli_outcome_table_styles_each_status_token(
 
     _print_outcomes(outcomes, elapsed=True)
 
-    assert called == ["hit", "stale"]
-    assert "1 hit, 1 stale" in capsys.readouterr().out
+    assert called == ["hit", "needs-run"]
+    assert "1 hit, 1 needs-run" in capsys.readouterr().out
 
 
 def test_expand_runner_keeps_concrete_matrix_lifecycle(tmp_path: Path, caplog) -> None:
@@ -231,7 +242,7 @@ def test_compact_runner_keeps_concrete_lifecycle_and_keys_at_debug(tmp_path: Pat
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("[work@item=0] run" in message for message in messages)
-    assert any("[work@item=0] content_key" in message for message in messages)
+    assert any("[work@item=0] input_key" in message for message in messages)
 
 
 def test_compact_failure_always_logs_concrete_cell(tmp_path: Path, caplog) -> None:

@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from varve import KeySpec, Pipeline, batch_stage, stage
-from varve.engine.runner import evaluate_state, run, selected_stages
+from varve import Dependencies, Pipeline, batch_stage, stage
+from varve.engine.runner import evaluate_state, probe_pipeline, run, selected_stages
 from varve.store.store import Store
 
 
@@ -150,21 +150,22 @@ def test_selected_stages() -> None:
 def test_runner_hit_stale_and_artifact_missing(tmp_path: Path) -> None:
     config = Config()
     first = run(ToyPipeline, config, cli_out=tmp_path)
-    assert [outcome.status for outcome in first] == ["no-cache", "no-cache", "no-cache"]
+    assert [outcome.status for outcome in first] == ["needs-run"] * 3
     second = run(ToyPipeline, config, cli_out=tmp_path)
     assert [outcome.status for outcome in second] == ["hit", "hit", "hit"]
 
     changed = run(ToyPipeline, Config(token="b"), cli_out=tmp_path)
-    assert [outcome.status for outcome in changed] == ["stale", "stale", "stale"]
+    assert [outcome.status for outcome in changed] == ["needs-run"] * 3
 
     (_out(tmp_path) / "summary.txt").unlink()
     repaired = run(ToyPipeline, Config(token="b"), cli_out=tmp_path)
-    assert repaired[-1].status == "artifact-missing"
+    assert repaired[-1].status == "needs-run"
+    assert repaired[-1].reason == "artifact-missing"
 
 
 def test_evaluate_state_does_not_initialize_store(tmp_path: Path) -> None:
     outcomes = evaluate_state(ToyPipeline, Config(), cli_out=tmp_path)
-    assert [outcome.status for outcome in outcomes] == ["no-cache", "no-cache", "no-cache"]
+    assert [outcome.status for outcome in outcomes] == ["needs-run"] * 3
     assert not (_out(tmp_path) / ".varve").exists()
 
 
@@ -181,6 +182,14 @@ def test_run_writes_importable_main_module_to_manifest(
     module = type("Module", (), {"__spec__": Spec()})()
     MainPipeline.__module__ = "__main__"
     monkeypatch.setitem(sys.modules, "__main__", module)
+    from varve.keying import source as source_module
+
+    original_getsourcefile = source_module.inspect.getsourcefile
+    monkeypatch.setattr(
+        source_module.inspect,
+        "getsourcefile",
+        lambda value: __file__ if value is MainPipeline else original_getsourcefile(value),
+    )
 
     run(MainPipeline, Config(), cli_out=tmp_path, upto="sample")
 
@@ -205,7 +214,8 @@ def test_evaluate_state_propagates_current_upstream_keys(tmp_path: Path) -> None
     run(ToyPipeline, Config(token="a"), cli_out=tmp_path)
     dry = evaluate_state(ToyPipeline, Config(token="b"), cli_out=tmp_path)
     actual = run(ToyPipeline, Config(token="b"), cli_out=tmp_path)
-    assert [outcome.status for outcome in dry] == [outcome.status for outcome in actual]
+    assert [outcome.status for outcome in dry] == ["needs-run", "hit", "hit"]
+    assert [outcome.status for outcome in actual] == ["needs-run"] * 3
 
 
 def test_batch_resume_after_failure(tmp_path: Path) -> None:
@@ -217,6 +227,18 @@ def test_batch_resume_after_failure(tmp_path: Path) -> None:
             cli_out=tmp_path,
             upto="transform",
         )
+    failed = next(
+        probe
+        for probe in probe_pipeline(
+            ToyPipeline,
+            Config(),
+            args=Args(),
+            out=_out(tmp_path),
+        )
+        if probe.stage == "transform"
+    )
+    assert failed.decision.status == "failed"
+    assert failed.decision.display_reason == "stage-failed · resume 2/4"
     resumed = run(ToyPipeline, Config(), cli_out=tmp_path, upto="transform")
     assert resumed[-1].status == "resume"
     assert len(list((_out(tmp_path) / "transform").glob("part-*.txt"))) == 4
@@ -227,7 +249,8 @@ def test_batch_resume_after_failure(tmp_path: Path) -> None:
     assert [output.index for output in record.outputs] == [0, 1, 2, 3]
 
     summary = run(ToyPipeline, Config(), cli_out=tmp_path, downstream="summarize")
-    assert summary[-1].status == "no-cache"
+    assert summary[-1].status == "needs-run"
+    assert summary[-1].reason == "no-cache"
     assert (_out(tmp_path) / "summary.txt").read_text(encoding="utf-8") == "0:a,1:a,2:a,3:a"
 
 
@@ -237,18 +260,18 @@ def test_completed_batch_artifact_missing_then_unread_config_change_repairs(
     run(ToyPipeline, Config(), cli_out=tmp_path, upto="transform")
     (_out(tmp_path) / "transform" / "part-1.txt").unlink()
     repaired = run(ToyPipeline, Config(), cli_out=tmp_path, upto="transform")
-    assert repaired[-1].status == "artifact-missing"
+    assert repaired[-1].status == "needs-run"
     record = Store(_out(tmp_path)).read_success("transform")
     assert record is not None
     assert record.outputs is not None
     assert [output.index for output in record.outputs] == [0, 1, 2, 3]
 
     # transform never reads any config field (it iterates a fixed range), so its
-    # content key does not depend on batch_size. Changing batch_size therefore
+    # input key does not depend on batch_size. Changing batch_size therefore
     # leaves it cached and only repairs the missing artifact.
     (_out(tmp_path) / "transform" / "part-1.txt").unlink()
     unread_change = run(ToyPipeline, Config(batch_size=3), cli_out=tmp_path, upto="transform")
-    assert unread_change[-1].status == "artifact-missing"
+    assert unread_change[-1].status == "needs-run"
     assert (_out(tmp_path) / "transform" / "part-1.txt").exists()
 
 
@@ -256,12 +279,12 @@ def test_config_change_invalidates_only_stages_that_read_the_field(tmp_path: Pat
     run(ToyPipeline, Config(), cli_out=tmp_path, upto="sample")
 
     # sample reads config.token but not config.batch_size, so a batch_size change
-    # is a hit while a token change is stale.
+    # is a hit while a token change needs a run.
     unread = run(ToyPipeline, Config(batch_size=99), cli_out=tmp_path, upto="sample")
     assert unread[-1].status == "hit"
 
     read = run(ToyPipeline, Config(token="changed"), cli_out=tmp_path, upto="sample")
-    assert read[-1].status == "stale"
+    assert read[-1].status == "needs-run"
 
 
 def test_batch_stage_warns_when_yielding_without_ctx_resume(tmp_path: Path) -> None:
@@ -307,12 +330,12 @@ def test_failed_naked_batch_yield_does_not_resume_partial(tmp_path: Path) -> Non
     with pytest.warns(UserWarning, match="yielded without iterating ctx.resume"):
         result = run(NakedYieldBatchPipeline, Config(), cli_out=tmp_path)
 
-    assert result[-1].status == "dirty"
+    assert result[-1].status == "needs-run"
     record = Store(_out(tmp_path)).read_success("transform")
     assert record is not None
     assert record.outputs is not None
     assert [(output.index, output.path) for output in record.outputs] == [(0, "part.txt")]
-    assert Store(_out(tmp_path)).read_partial("transform", record.content_key) is None
+    assert Store(_out(tmp_path)).read_partial("transform", record.input_key) is None
 
 
 def test_force_reruns_all_batch_items_after_partial(tmp_path: Path) -> None:
@@ -335,13 +358,13 @@ def test_force_reruns_all_batch_items_after_partial(tmp_path: Path) -> None:
 
 def test_batch_multi_output_index_requires_all_paths(tmp_path: Path) -> None:
     first = run(MultiOutputBatchPipeline, Config(), cli_out=tmp_path)
-    assert first[-1].status == "no-cache"
+    assert first[-1].status == "needs-run"
     second = run(MultiOutputBatchPipeline, Config(), cli_out=tmp_path)
     assert second[-1].status == "hit"
 
     (_out(tmp_path) / "1-right.txt").unlink()
     repaired = run(MultiOutputBatchPipeline, Config(), cli_out=tmp_path)
-    assert repaired[-1].status == "artifact-missing"
+    assert repaired[-1].status == "needs-run"
     assert (_out(tmp_path) / "1-right.txt").exists()
 
     record = Store(_out(tmp_path)).read_success("split")
@@ -375,16 +398,11 @@ def test_ctx_input_requires_declared_need_during_run(tmp_path: Path) -> None:
 
 
 class FileKeyConfig(BaseModel):
-    pass
-
-
-class FileKeyArgs(BaseModel):
     src: Path
 
 
 class FileKeyPipeline(Pipeline):
     Config = FileKeyConfig
-    Args = FileKeyArgs
 
     @classmethod
     def default_output_root(cls, config: FileKeyConfig) -> Path:
@@ -392,31 +410,39 @@ class FileKeyPipeline(Pipeline):
 
     @stage(
         produces="copy.txt",
-        key=KeySpec(files={"src": lambda ctx: ctx.args.src}),
+        depends=Dependencies(inputs={"src": lambda ctx: ctx.config.src}),
     )
     def copy(self, ctx):
         (ctx.out / "copy.txt").write_text(
-            ctx.args.src.read_text(encoding="utf-8"), encoding="utf-8"
+            ctx.config.src.read_text(encoding="utf-8"), encoding="utf-8"
         )
+
+
+class InvalidArgsDependencyPipeline(Pipeline):
+    Config = Config
+    Args = Args
+
+    @stage(depends=Dependencies(values={"fail_after": lambda ctx: ctx.args.fail_after}))
+    def build(self, ctx):
+        pass
 
 
 def test_hit_refreshes_touched_but_unchanged_file_fingerprint(tmp_path: Path) -> None:
     src = tmp_path / "input.txt"
     src.write_text("payload", encoding="utf-8")
     out = tmp_path / "work"
-    config = FileKeyConfig()
-    args = FileKeyArgs(src=src)
+    config = FileKeyConfig(src=src)
 
-    first = run(FileKeyPipeline, config, args=args, cli_out=out)
-    assert [outcome.status for outcome in first] == ["no-cache"]
+    first = run(FileKeyPipeline, config, cli_out=out)
+    assert [outcome.status for outcome in first] == ["needs-run"]
 
     cached_mtime = _cached_src_mtime(_out(out))
 
     # Touch the file without changing its content: bump mtime, same bytes.
-    new_mtime = cached_mtime + 100.0
-    os.utime(src, (new_mtime, new_mtime))
+    new_mtime = cached_mtime + 100_000_000
+    os.utime(src, ns=(src.stat().st_atime_ns, new_mtime))
 
-    second = run(FileKeyPipeline, config, args=args, cli_out=out)
+    second = run(FileKeyPipeline, config, cli_out=out)
     assert [outcome.status for outcome in second] == ["hit"]
 
     refreshed_mtime = _cached_src_mtime(_out(out))
@@ -424,10 +450,64 @@ def test_hit_refreshes_touched_but_unchanged_file_fingerprint(tmp_path: Path) ->
     assert refreshed_mtime != cached_mtime
 
 
-def _cached_src_mtime(out: Path) -> float:
+def test_dependency_resolvers_cannot_read_runtime_args(tmp_path: Path) -> None:
+    probe = probe_pipeline(
+        InvalidArgsDependencyPipeline,
+        Config(),
+        args=Args(fail_after=1),
+        out=_out(tmp_path),
+    )[0]
+
+    assert probe.decision.status == "error"
+    assert "cannot read Args" in probe.decision.reason
+
+
+def test_missing_batch_artifact_restarts_instead_of_reusing_success_outputs(
+    tmp_path: Path,
+) -> None:
+    run(ToyPipeline, Config(), cli_out=tmp_path)
+    output_root = _out(tmp_path)
+    first = output_root / "transform" / "part-0.txt"
+    missing = output_root / "transform" / "part-1.txt"
+    first.write_text("tampered", encoding="utf-8")
+    missing.unlink()
+
+    outcomes = run(ToyPipeline, Config(), cli_out=tmp_path)
+
+    assert outcomes[1].reason == "artifact-missing"
+    assert first.read_text(encoding="utf-8") == "0:a"
+    assert missing.read_text(encoding="utf-8") == "1:a"
+
+
+def test_interrupted_batch_with_valid_partial_resumes_over_older_success(
+    tmp_path: Path,
+) -> None:
+    run(ToyPipeline, Config(token="old"), cli_out=tmp_path)
+    with pytest.raises(RuntimeError, match="planned failure"):
+        run(
+            ToyPipeline,
+            Config(token="new"),
+            args=Args(fail_after=1),
+            cli_out=tmp_path,
+        )
+    store = Store(_out(tmp_path))
+    store.clear_failure("transform")
+
+    probe = probe_pipeline(
+        ToyPipeline,
+        Config(token="new"),
+        args=Args(),
+        out=_out(tmp_path),
+    )[1]
+
+    assert probe.decision.status == "resume"
+    assert probe.decision.display_reason == "2/4"
+
+
+def _cached_src_mtime(out: Path) -> int:
     record = Store(out).read_success("copy")
     assert record is not None
-    return record.key_components.files["src"][0].mtime
+    return record.key_components.inputs["src"][0].mtime_ns
 
 
 def test_batch_stage_rejects_produces() -> None:

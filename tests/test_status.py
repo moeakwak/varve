@@ -13,16 +13,8 @@ from rich.console import Console
 from varve import Pipeline, stage
 from varve.cli.status import reason_text, render_status
 from varve.engine.runner import run
-from varve.keying.dependencies import (
-    DependencyEdge,
-    DependencyKind,
-    DependencyNode,
-    DependencyOrigin,
-    SourceDependencies,
-)
 from varve.status import (
     CellCoordinate,
-    PipelineStatus,
     collect_pipeline_status,
     source_component_changes,
 )
@@ -95,7 +87,7 @@ def test_collect_status_reads_previous_record(tmp_path: Path) -> None:
     assert stage_status.source_changes == {}
 
 
-def test_collect_status_hides_duration_for_no_cache_with_previous(
+def test_collect_status_keeps_previous_duration_when_upstream_record_is_missing(
     tmp_path: Path,
 ) -> None:
     run(DownstreamPipeline, Config(), cli_out=tmp_path)
@@ -111,9 +103,9 @@ def test_collect_status_hides_duration_for_no_cache_with_previous(
         stage="finish",
     ).stages[0]
 
-    assert downstream.status == "no-cache"
+    assert downstream.status == "needs-run"
     assert downstream.stored_key is not None
-    assert downstream.duration is None
+    assert downstream.duration is not None
     assert downstream.source_changes == {}
 
 
@@ -213,117 +205,6 @@ def test_reason_highlights_upstream_stage_and_change_keyword() -> None:
     assert source_spans["changed"] == "yellow"
 
 
-def _dependency_node(
-    identity: str,
-    kind: DependencyKind,
-    qualified_name: str,
-    *,
-    origin: DependencyOrigin = "inferred",
-) -> DependencyNode:
-    return DependencyNode(
-        identity=identity,
-        kind=kind,
-        qualified_name=qualified_name,
-        digest=f"sha256:{identity}",
-        origin=origin,
-        scope=None,
-        source_path=None,
-        source_line=None,
-    )
-
-
-def dependency_tree_status(pipeline_status: PipelineStatus) -> PipelineStatus:
-    root = _dependency_node(
-        "function:render_compare_pairs",
-        "function",
-        "studies.shared.render.render_compare.render_compare_pairs",
-    )
-    same_module = _dependency_node(
-        "function:worker_count",
-        "function",
-        "studies.shared.render.render_compare._svg_layout_worker_count",
-    )
-    cross_module = _dependency_node(
-        "class:pixel_cache",
-        "class",
-        "studies.shared.render.pixel_verdict_cache.PixelVerdictCache",
-        origin="explicit",
-    )
-    equal_name = _dependency_node(
-        "value:equal_pixel_cache",
-        "value",
-        cross_module.qualified_name,
-    )
-    deep = _dependency_node(
-        "function:deep_helper",
-        "function",
-        "studies.shared.render.render_compare._deep_helper",
-    )
-    source = SourceDependencies(
-        components={
-            node.component_name: node.digest
-            for node in (root, same_module, cross_module, equal_name, deep)
-        },
-        nodes={node.identity: node for node in (root, same_module, cross_module, equal_name, deep)},
-        edges=(
-            DependencyEdge("stage", root.identity, "global referenced by test.Pipeline.sample"),
-            DependencyEdge("stage", cross_module.identity, "declared by uses"),
-            DependencyEdge("stage", equal_name.identity, "custom direct reason"),
-            DependencyEdge(
-                root.identity,
-                same_module.identity,
-                f"global referenced by {root.qualified_name}",
-            ),
-            DependencyEdge(root.identity, cross_module.identity, "custom test reason"),
-            DependencyEdge(
-                same_module.identity,
-                cross_module.identity,
-                f"global referenced by {same_module.qualified_name}",
-            ),
-            DependencyEdge(same_module.identity, deep.identity, "custom deep reason"),
-            DependencyEdge(
-                equal_name.identity,
-                cross_module.identity,
-                "second references first",
-            ),
-        ),
-        direct=(root.identity, cross_module.identity, equal_name.identity),
-    )
-    stage = replace(
-        pipeline_status.stages[0],
-        name="sample",
-        source_dependencies=source,
-    )
-    return replace(pipeline_status, stages=(stage,))
-
-
-def dependency_tree_status_with_changes(pipeline_status: PipelineStatus) -> PipelineStatus:
-    status = dependency_tree_status(pipeline_status)
-    stage = status.stages[0]
-    graph = stage.source_dependencies
-    return replace(
-        status,
-        stages=(
-            replace(
-                stage,
-                status="stale",
-                reason="source changed",
-                source_changes={
-                    "stage": "changed",
-                    graph.nodes["function:render_compare_pairs"].component_name: "added",
-                    graph.nodes["class:pixel_cache"].component_name: "changed",
-                    graph.nodes["function:deep_helper"].component_name: "changed",
-                    "uses.function.studies.shared.render.old_renderer": "removed",
-                    **{
-                        f"uses.studies.shared.render.legacy_{index}": "removed"
-                        for index in range(6)
-                    },
-                },
-            ),
-        ),
-    )
-
-
 def test_summary_shows_duration_folds_needs_and_omits_key(pipeline_status) -> None:
     stage = replace(
         pipeline_status.stages[0],
@@ -350,7 +231,7 @@ def test_summary_shows_duration_folds_needs_and_omits_key(pipeline_status) -> No
     assert "DURATION" in output
     assert "1.25s" in output
     assert "extract, text_arm · +4 more" in output
-    assert "2 direct · 4 total · 1 broad" in output
+    assert "confirmed" in output
     assert "test_status.shared_helper" not in output
     assert "KEY" not in output
 
@@ -381,9 +262,9 @@ def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
             base_name="score",
             cell=coordinate("b"),
             logical_needs=("prepare",),
-            status="stale",
-            reason="config: profile changed",
-            summary_reason="config: profile changed",
+            status="needs-run",
+            reason="inputs-changed",
+            summary_reason="inputs-changed",
             duration=2.0,
         ),
         replace(
@@ -392,22 +273,22 @@ def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
             base_name="score",
             cell=coordinate("c"),
             logical_needs=("prepare",),
-            status="dirty",
-            reason="dirty",
-            summary_reason="dirty",
+            status="failed",
+            reason="stage-failed",
+            summary_reason="stage-failed",
             duration=None,
         ),
     )
     status = replace(pipeline_status, stages=cells)
 
     group = status.groups[0]
-    assert group.status == "dirty"
-    assert group.status_counts == (("hit", 1), ("stale", 1), ("dirty", 1))
+    assert group.status == "failed"
+    assert group.status_counts == (("hit", 1), ("needs-run", 1), ("failed", 1))
     assert group.duration == 3.0
     assert group.recorded_duration_count == 2
 
     output = render_to_text(status, stage=None, depth=0, width=160)
-    assert "1 hit · 1 stale · 1 dirty" in output
+    assert "1 hit · 1 needs-run · 1 failed" in output
     assert "3.00s · 2/3" in output
     assert "prepare" in output
 
@@ -423,7 +304,7 @@ def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
     colored = buffer.getvalue()
     assert "\x1b[31" in colored
     assert "\x1b[32" in colored
-    assert "dirty" in colored
+    assert "failed" in colored
     assert "hit" in colored
 
 
@@ -436,7 +317,7 @@ def test_summary_does_not_ellipsize_core_fields_on_narrow_terminals(
         pipeline_status.stages[0],
         name="render_oracle_batches_Ω",
         base_name="render_oracle_batches_Ω",
-        status="artifact-missing",
+        status="needs-run",
         duration=1.25,
         needs=(
             "prepare_pairs",
@@ -450,8 +331,8 @@ def test_summary_does_not_ellipsize_core_fields_on_narrow_terminals(
             "text_arm",
             "texform_arm_batches",
         ),
-        reason="file: render_sources changed (+ source) §",
-        summary_reason="file: render_sources changed (+ source) §",
+        reason="artifact-missing §",
+        summary_reason="artifact-missing §",
     )
     output = render_to_text(
         replace(pipeline_status, stages=(stage,)),
@@ -465,24 +346,31 @@ def test_summary_does_not_ellipsize_core_fields_on_narrow_terminals(
     assert "…" not in output
 
 
-def test_stage_depth_controls_keys_and_dependencies(pipeline_status) -> None:
+def test_stage_detail_shows_keys_and_source_review(pipeline_status) -> None:
     folded = render_to_text(pipeline_status, stage="normalize", depth=0)
     expanded = render_to_text(pipeline_status, stage="normalize", depth=1)
     full = render_to_text(pipeline_status, stage="normalize", depth=None)
 
-    assert "Decision key" not in folded
-    assert "Stored key" not in folded
-    assert "… 2 transitive dependencies folded" in folded
+    assert "Decision key" in folded
+    assert "Stored key" in folded
+    assert "Source review" in folded
     assert "Decision key" in expanded
     assert "Stored key" in expanded
     assert "Decision key" in full
     assert "Stored key" in full
-    assert len(folded) < len(expanded) < len(full)
-    assert "↳ shared_helper already shown" in full
-    repeated = full.index("↳ shared_helper already shown")
-    direct_reason = full.index("global reference", repeated)
-    assert repeated < direct_reason
-    assert "[inferred]" not in full
+    assert folded == expanded == full
+
+
+def test_pending_review_renders_as_source_changed(pipeline_status) -> None:
+    stage = replace(pipeline_status.stages[0], source_review="pending")
+    status = replace(pipeline_status, stages=(stage,))
+
+    summary = render_to_text(status, stage=None, depth=0)
+    detail = render_to_text(status, stage="normalize", depth=0)
+
+    assert "1 source-changed" in summary
+    assert "Source review" in detail
+    assert "source-changed" in detail
 
 
 def test_expanded_stage_preserves_complete_keys_on_narrow_terminals(
@@ -507,45 +395,6 @@ def test_expanded_stage_preserves_complete_keys_on_narrow_terminals(
     assert stored_key in compact_output
 
 
-def test_full_tree_uses_parent_relative_names_and_compact_reasons(
-    pipeline_status,
-) -> None:
-    output = render_to_text(
-        dependency_tree_status_with_changes(pipeline_status),
-        stage="sample",
-        depth=None,
-    )
-
-    assert "function  studies.shared.render.render_compare.render_compare_pairs" in output
-    assert "function  _svg_layout_worker_count" in output
-    assert "class  pixel_verdict_cache.PixelVerdictCache" in output
-    assert "global reference" in output
-    assert (
-        "global referenced by studies.shared.render.render_compare.render_compare_pairs"
-        not in output
-    )
-    assert "custom test reason" in output
-    assert "↳ studies.shared.render.pixel_verdict_cache.PixelVerdictCache already shown" in output
-    assert "stage  sample  [3 direct · 5 total]  [changed]" in output
-    assert "render_compare_pairs  [added]" in output
-    assert "pixel_verdict_cache.PixelVerdictCache  [explicit]  [changed]" in output
-    assert "Removed source dependencies" in output
-    assert "studies.shared.render.old_renderer  [explicit]  [removed]" in output
-    assert "studies.shared.render.legacy_0  [explicit]  [removed]" in output
-    assert "[inferred]" not in output
-
-
-def test_expanded_tree_counts_changed_folded_dependencies(pipeline_status) -> None:
-    output = render_to_text(
-        dependency_tree_status_with_changes(pipeline_status),
-        stage="sample",
-        depth=1,
-    )
-
-    assert "… 1 transitive dependencies folded  [1 changed]" in output
-    assert "… 2 more removed dependencies; run with --all or --deps-all" in output
-
-
 def test_stage_with_missing_upstream_explains_unavailable_inputs(tmp_path: Path) -> None:
     status = collect_pipeline_status(
         DownstreamPipeline,
@@ -557,19 +406,4 @@ def test_stage_with_missing_upstream_explains_unavailable_inputs(tmp_path: Path)
     )
     folded = render_to_text(status, stage="finish", depth=0)
     assert "Key inputs unavailable: upstream prepare has no success record" in folded
-    assert "Auto dependencies are best effort." in folded
-
-
-def test_folded_tree_uses_reference_instead_of_zero_hidden_count(
-    pipeline_status,
-) -> None:
-    output = render_to_text(
-        dependency_tree_status(pipeline_status),
-        stage="sample",
-        depth=0,
-    )
-
-    assert "… 0 transitive dependencies folded" not in output
-    assert "↳ studies.shared.render.pixel_verdict_cache.PixelVerdictCache already shown" in output
-    assert "second references first" in output
-    assert "[explicit]" in output
+    assert "Source review" in folded

@@ -540,53 +540,24 @@ def test_cli_status_accepts_optional_stage_and_expansion(tmp_path: Path, capsys)
         == 0
     )
     output = capsys.readouterr().out
-    assert "Source dependencies · direct + one level" in output
+    assert "Source review" in output
+    assert "Decision key" in output
 
 
-def test_cli_status_accepts_deps_all_for_one_stage(tmp_path: Path, capsys) -> None:
-    assert CliPipeline.cli(["status", "sample", "--out", str(tmp_path), "--deps-all"]) == 0
-    assert "Source dependencies · full tree" in capsys.readouterr().out
-
-
-def test_cli_status_all_retains_full_dependencies_for_ordinary_stage(
-    tmp_path: Path, capsys
-) -> None:
-    assert CliPipeline.cli(["status", "sample", "--out", str(tmp_path), "--all"]) == 0
-    assert "Source dependencies · full tree" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize(
-    ("flag", "title"), [("--expand", "direct + one level"), ("--all", "full tree")]
-)
-def test_cli_status_expands_dependencies_for_all_stages_in_non_matrix_pipeline(
-    tmp_path: Path, capsys, flag: str, title: str
-) -> None:
-    assert ConflictingCliPipeline.cli(["status", "--out", str(tmp_path), flag]) == 0
+def test_cli_status_expands_all_stages_in_non_matrix_pipeline(tmp_path: Path, capsys) -> None:
+    assert ConflictingCliPipeline.cli(["status", "--out", str(tmp_path), "--expand"]) == 0
     output = capsys.readouterr().out
     assert "first" in output
     assert "sample" in output
-    assert f"Source dependencies · {title}" in output
 
 
-def test_cli_status_rejects_matrix_and_dependency_expansion_together(tmp_path: Path) -> None:
-    with pytest.raises(SystemExit):
-        CliPipeline.cli(["status", "sample", "--out", str(tmp_path), "--expand", "--deps"])
-
-
-def test_cli_status_rejects_dependency_expansion_without_stage(tmp_path: Path) -> None:
-    with pytest.raises(SystemExit):
-        CliPipeline.cli(["status", "--out", str(tmp_path), "--deps"])
-
-
-def test_cli_status_help_describes_separate_expansion_modes(capsys) -> None:
+def test_cli_status_help_describes_expansion(capsys) -> None:
     with pytest.raises(SystemExit) as exc_info:
         CliPipeline.cli(["status", "--help"])
     assert exc_info.value.code == 0
     help_text = capsys.readouterr().out
     assert "--expand" in help_text
-    assert "--all" in help_text
-    assert "--deps" in help_text
-    assert "--deps-all" in help_text
+    assert "--deps" not in help_text
 
 
 def test_cli_status_unknown_stage_is_nonzero(tmp_path: Path) -> None:

@@ -2,11 +2,11 @@
 
 [![PyPI](https://img.shields.io/pypi/v/varve.svg)](https://pypi.org/project/varve/) [![License](https://img.shields.io/pypi/l/varve.svg)](LICENSE)
 
-Varve runs Python pipelines and caches their outputs, so re-running only re-executes the stages whose code, config, or inputs actually changed.
+Varve runs Python pipelines and caches their outputs, so re-running only re-executes stages whose deterministic inputs or managed artifacts require it. Python source changes open an explicit review gate instead of silently choosing whether to rerun.
 
-A varve is an annual layer of lake sediment — thin, ordered, and datable. Varve treats pipeline outputs the same way: each stage writes a materialized layer whose key records the code, config, inputs, and upstream layers that produced it. When nothing changes, nothing re-runs; when something does, `status` tells you exactly what and why.
+A varve is an annual layer of lake sediment — thin, ordered, and datable. Varve treats pipeline outputs the same way: each stage writes a materialized layer whose input key records config, external inputs, explicit values, and upstream artifact contents. When nothing changes, nothing re-runs; when something does, `status` tells you exactly what and why.
 
-It runs on a single machine — no daemon, no database, no pipeline DSL. Stages are ordinary Python methods, and the `run` / `status` / `plan` / `list` / `clean` CLI is generated from your pipeline class. Varve is built for local experiments, evaluations, dataset preparation, render/compare jobs, and report generation, where Python is already the source of truth. It is not a distributed scheduler, a deployment platform, a data-version-control system, or a remote artifact store.
+It runs on a single machine — no daemon, no database, no pipeline DSL. Stages are ordinary Python methods, and the `run` / `status` / `accept` / `reject` / `plan` / `list` / `clean` CLI is generated from your pipeline class. Varve is built for local experiments, evaluations, dataset preparation, render/compare jobs, and report generation, where Python is already the source of truth. It is not a distributed scheduler, a deployment platform, a data-version-control system, or a remote artifact store.
 
 ## Install
 
@@ -57,21 +57,21 @@ python demo.py status
 python demo.py plan
 ```
 
-The first run executes both stages and records their keys and artifacts under `out/main/`. The second run is a straight cache hit. Edit `render`, change `prefix`, change a declared external input, or delete `result.txt`, and the affected stage becomes non-current — for a reason `status` will name.
+The first run executes both stages and records their keys and artifacts under `out/main/`. The second run is a straight cache hit. Changing `prefix`, changing a declared external input, or deleting `result.txt` makes the affected stage non-current for a reason `status` will name. Editing Python source opens a review gate that must be resolved with `accept` or `reject` before execution.
 
 ## How it works
 
-Each stage declares its upstreams with `needs=` and its outputs with `produces=`. From those, varve builds a content key out of the stage's source, the project code it calls, the Config fields it reads, any pinned files or values, and its upstreams' keys.
+Each stage declares upstream stages with `needs=`, non-stage dependencies with `depends=`, and outputs with `produces=`. Varve builds an input key from Config, declared inputs and values, and the actual fingerprints of upstream artifacts.
 
 Running a stage writes a record into `<output-root>/.varve/`: the committed key plus the output paths, relative to the branch root. The next command recomputes the key and checks that the recorded artifacts still exist — a matching key is not a hit if the file it points to is gone. The store is latest-wins and guarded by an output-root lock.
 
-Inside a stage, `ctx.input("prepare")` returns the single artifact of an upstream and `ctx.inputs("prepare")` returns all of them in deterministic order. Both require the name to appear in `needs=`, which is exactly what folds the upstream's key into yours.
+Inside a stage, `ctx.input("prepare")` returns the single artifact of an upstream and `ctx.inputs("prepare")` returns all of them in deterministic order. Both require the name to appear in `needs=`.
 
 ## Core capabilities
 
-### Code-aware keys
+### Source review and deterministic inputs
 
-Varve fingerprints your stage source and follows the project functions and classes it calls, so editing a helper invalidates the stages that depend on it. What it can't see statically — dynamic dispatch, input files, external values — you pin explicitly with `uses=`, `KeySpec.files`, or `KeySpec.values`. `status --expand` shows the dependency evidence behind a decision.
+Varve observes the Python files that define the pipeline and stage, plus paths declared with `Dependencies.sources`. A source change opens a review gate: use `accept` when existing artifacts remain valid or `reject` when the stage must rerun. Varve does not infer call graphs. External data and explicit values belong in `Dependencies.inputs` and `Dependencies.values`.
 
 ### Resumable batch stages
 
@@ -106,17 +106,19 @@ An optional `varve.yaml` splits a branch's semantic `config` from its active mat
 
 ### Generated CLI and store dashboard
 
-Every `Pipeline` gets five commands:
+Every `Pipeline` gets seven commands:
 
 | Command | Purpose |
 | --- | --- |
 | `run` | Evaluate cache decisions and execute the selected stages. |
-| `status` | Explain each stage's current, key, dependency, and artifact state. |
+| `status` | Explain each stage's input key, materialization, artifact, and source-review state. |
 | `plan` | Print the selected concrete topology without executing it. |
 | `list` | Show branch-independent stage templates and matrix axes. |
 | `clean` | Safely remove a whole output root or a recorded downstream closure. |
+| `accept` | Mark current source changes as not requiring a rerun. |
+| `reject` | Mark current source changes as requiring a rerun. |
 
-The top-level `varve` command finds existing stores without wiring up an entrypoint. `varve ls`, `varve show`, and `varve refresh` import the stored pipeline module and evaluate its exact graph, keys, and artifacts.
+The top-level `varve` command finds existing stores without wiring up an entrypoint. `varve ls`, `varve show`, and `varve refresh` import the stored pipeline module and evaluate its exact graph, keys, artifacts, and source reviews. `varve accept` and `varve reject` record review decisions for a discovered pipeline branch without executing it.
 
 ## Documentation
 

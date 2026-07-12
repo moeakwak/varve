@@ -4,21 +4,17 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from varve import KeySpec, Pipeline, stage
+from varve import Dependencies, Pipeline, stage
 from varve.engine.runner import run
 
 
 class Config(BaseModel):
     token: str = "main"
-
-
-class Args(BaseModel):
     src: Path
 
 
 class BranchPipeline(Pipeline):
     Config = Config
-    Args = Args
 
     @classmethod
     def default_output_root(cls, config: Config) -> Path:
@@ -26,11 +22,11 @@ class BranchPipeline(Pipeline):
 
     @stage(
         produces="copy.txt",
-        key=KeySpec(files={"src": lambda ctx: ctx.args.src}),
+        depends=Dependencies(inputs={"src": lambda ctx: ctx.config.src}),
     )
     def copy(self, ctx):
         (ctx.out / "copy.txt").write_text(
-            f"{ctx.config.token}:{ctx.args.src.read_text(encoding='utf-8')}",
+            f"{ctx.config.token}:{ctx.config.src.read_text(encoding='utf-8')}",
             encoding="utf-8",
         )
 
@@ -44,8 +40,7 @@ def test_runner_uses_branch_output_root_and_passes_args_to_stage_and_keying(
 
     run(
         BranchPipeline,
-        Config(token="branch"),
-        args=Args(src=src),
+        Config(token="branch", src=src),
         cli_out=out_base,
         branch="exp1",
     )
@@ -60,8 +55,7 @@ def test_runner_uses_temporary_branch_output_root(tmp_path: Path) -> None:
 
     run(
         BranchPipeline,
-        Config(),
-        args=Args(src=src),
+        Config(src=src),
         cli_out=out_base,
         branch="quick",
         is_temporary=True,

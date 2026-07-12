@@ -8,9 +8,11 @@ import pytest
 import varve.context
 from varve.context import Ctx, StageDisplay
 from varve.models import (
+    ArtifactFingerprint,
     KeyComponents,
     OutputHandle,
     ProducedPath,
+    SourceFingerprint,
     SuccessRecord,
 )
 from varve.store.store import Store
@@ -54,7 +56,11 @@ def _ctx(tmp_path: Path, **kwargs) -> Ctx:
 
 
 def _key_components() -> KeyComponents:
-    return KeyComponents(source={}, config={}, files={}, values={}, upstreams={})
+    return KeyComponents(config={}, inputs={}, values={}, upstreams={})
+
+
+def _artifact(path: str) -> ArtifactFingerprint:
+    return ArtifactFingerprint(root=path, kind="file", manifest=[], fingerprint=f"hash:{path}")
 
 
 def _single_record(stage: str, paths: list[str]) -> SuccessRecord:
@@ -62,9 +68,11 @@ def _single_record(stage: str, paths: list[str]) -> SuccessRecord:
         pipeline="Demo",
         stage=stage,
         kind="single",
-        content_key=f"{stage}-key",
+        input_key=f"{stage}-key",
         key_components=_key_components(),
-        produces=[ProducedPath(path=path, kind="file") for path in paths],
+        executed_source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
+        artifact_fingerprint="artifacts",
+        produces=[ProducedPath(path=path, kind="file", artifact=_artifact(path)) for path in paths],
         committed_at="now",
     )
 
@@ -74,9 +82,14 @@ def _batch_record(stage: str, paths: list[str]) -> SuccessRecord:
         pipeline="Demo",
         stage=stage,
         kind="batch",
-        content_key=f"{stage}-key",
+        input_key=f"{stage}-key",
         key_components=_key_components(),
-        outputs=[OutputHandle(index=index, path=path) for index, path in enumerate(paths)],
+        executed_source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
+        artifact_fingerprint="artifacts",
+        outputs=[
+            OutputHandle(index=index, path=path, artifact=_artifact(path))
+            for index, path in enumerate(paths)
+        ],
         committed_at="now",
     )
 

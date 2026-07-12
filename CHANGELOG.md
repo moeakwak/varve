@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+* Replace `KeySpec`, callable `uses`, and `auto_uses` with `Dependencies(inputs=..., values=..., sources=...)`.
+* Split deterministic input keys, source review fingerprints, and managed artifact fingerprints; older stores must be rebuilt as schema 5.
+* Replace the legacy cache status set with `hit`, `needs-run`, `resume`, `failed`, and `error`.
+
+### Features
+
+* Add generated `accept` and `reject` commands and an execution preflight that blocks pending source reviews.
+* Validate file and directory artifact contents, batch partial contents, and downstream dependencies by artifact fingerprint.
+* Persist caught stage failures separately from interrupted attempt markers.
+* Make dashboard refresh re-evaluate every attempted pipeline and report review, failure, evaluation error, and remaining work together.
+* Add `--rehash` diagnostics for generated run/status and dashboard ls/show/refresh commands.
+
 ## [0.4.0](https://github.com/moeakwak/varve/compare/varve-v0.3.0...varve-v0.4.0) (2026-07-11)
 
 

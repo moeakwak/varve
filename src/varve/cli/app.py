@@ -18,14 +18,14 @@ from varve.cli import argmap
 from varve.cli.clean import clean
 from varve.cli.status import render_status
 from varve.engine.run_display import StageOutcome, outcome_rows
-from varve.engine.runner import run, selected_stages
+from varve.engine.runner import ReviewRequiredError, record_source_review, run, selected_stages
 from varve.log import configure_cli_logging
 from varve.matrix import build_graph
 from varve.pipeline import Pipeline
 from varve.status import collect_pipeline_status
 from varve.style import format_elapsed, make_console, status_text
 
-_CONFIG_COMMANDS = {"run", "status", "clean"}
+_CONFIG_COMMANDS = {"run", "status", "clean", "accept", "reject"}
 _NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
 _COMMAND_OPTION_ARITIES = {
     "run": {
@@ -36,6 +36,7 @@ _COMMAND_OPTION_ARITIES = {
         "--only": 1,
         "--slice": 1,
         "--force": 0,
+        "--rehash": 0,
         "-f": 0,
         "--expand": 0,
         "--compact": 0,
@@ -45,9 +46,7 @@ _COMMAND_OPTION_ARITIES = {
         "--branch": 1,
         "--out": 1,
         "--expand": 0,
-        "--all": 0,
-        "--deps": 0,
-        "--deps-all": 0,
+        "--rehash": 0,
     },
     "clean": {
         "--branch": 1,
@@ -56,6 +55,8 @@ _COMMAND_OPTION_ARITIES = {
         "--yes": 0,
         "-y": 0,
     },
+    "accept": {"--branch": 1, "--out": 1},
+    "reject": {"--branch": 1, "--out": 1},
     "plan": {"--upto": 1, "--downstream": 1, "--only": 1, "--branch": 1, "--out": 1},
 }
 
@@ -229,6 +230,9 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     run_parser.add_argument(
         "--force", "-f", action="store_true", help="Ignore cache for selected stages."
     )
+    run_parser.add_argument(
+        "--rehash", action="store_true", help="Ignore persisted stat shortcuts while keying."
+    )
     run_view = run_parser.add_mutually_exclusive_group()
     run_view.add_argument(
         "--expand", action="store_true", help="Show every selected concrete matrix cell."
@@ -242,20 +246,14 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     status_parser.add_argument("stage", nargs="?", metavar="STAGE")
     status_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
     status_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
+    status_parser.add_argument(
+        "--rehash", action="store_true", help="Ignore persisted stat shortcuts while keying."
+    )
     status_view = status_parser.add_mutually_exclusive_group()
     status_view.add_argument(
         "--expand",
         action="store_true",
-        help="Show matrix cells for a matrix group, or one source dependency level otherwise.",
-    )
-    status_view.add_argument(
-        "--all", action="store_true", help="Show the full source dependency tree."
-    )
-    status_view.add_argument(
-        "--deps", action="store_true", help="Show one source dependency level."
-    )
-    status_view.add_argument(
-        "--deps-all", action="store_true", help="Show the full source dependency tree."
+        help="Show concrete matrix cells or detailed stage state.",
     )
 
     clean_parser = subparsers.add_parser("clean", help="delete selected store records and outputs")
@@ -267,6 +265,17 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     )
     clean_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
     clean_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation.")
+
+    review_parsers = {}
+    for command, help_text in (
+        ("accept", "Mark source changes as not requiring a rerun."),
+        ("reject", "Mark source changes as requiring a rerun."),
+    ):
+        review_parser = subparsers.add_parser(command, help=help_text)
+        review_parser.add_argument("stages", nargs="*", metavar="STAGE")
+        review_parser.add_argument("--branch", default="main", metavar="NAME")
+        review_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
+        review_parsers[command] = review_parser
 
     plan_parser = subparsers.add_parser("plan", help="print selected stage order")
     plan_stage = plan_parser.add_mutually_exclusive_group()
@@ -295,6 +304,8 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         argmap.register_args(status_parser, pipeline.Args)
     if selected_command == "clean":
         argmap.register_args(clean_parser, pipeline.Args)
+    if selected_command in review_parsers:
+        argmap.register_args(review_parsers[selected_command], pipeline.Args)
 
     namespace = parser.parse_args(raw_argv)
     configure_cli_logging(namespace.verbose, quiet=namespace.command != "run")
@@ -334,23 +345,24 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         is_matrix_base = namespace.stage in graph.base_cells and any(
             graph.stages[name].cell for name in status_names
         )
-        if (namespace.all or namespace.deps or namespace.deps_all) and is_matrix_base:
-            parser.error(
-                "Source dependency expansion requires one concrete stage; "
-                f"choose a cell such as {status_names[0]!r}."
-            )
-    if namespace.command == "status" and namespace.stage is None:
-        if namespace.deps or namespace.deps_all:
-            parser.error("--deps and --deps-all require one concrete or ordinary stage")
-        if namespace.all and has_matrix:
-            parser.error(
-                "--all requires one concrete or ordinary stage in a matrix pipeline; "
-                "choose a concrete cell first"
-            )
     if namespace.command == "run" and namespace.slice and not resolved.is_temporary:
         raise ValueError("--slice is only allowed on temporary branches")
     args = _args_from_namespace(pipeline, namespace)
-    if namespace.command == "status":
+    if namespace.command in {"accept", "reject"}:
+        changed = record_source_review(
+            pipeline,
+            config,
+            decision=namespace.command,
+            args=args,
+            targets=tuple(namespace.stages),
+            cli_out=resolved.output_base,
+            branch=resolved.branch,
+            is_temporary=resolved.is_temporary,
+            axes=resolved.axes,
+            graph=graph,
+        )
+        print(f"{namespace.command.title()}ed source changes for {len(changed)} stage(s).")
+    elif namespace.command == "status":
         console = make_console()
         loading = (
             console.status("Evaluating pipeline status…", spinner="dots")
@@ -371,20 +383,15 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
                 branch=resolved.branch,
                 stage=namespace.stage,
                 graph=graph,
+                rehash=namespace.rehash,
             )
         if namespace.expand and (is_matrix_base or (namespace.stage is None and has_matrix)):
             view = "cells"
         elif namespace.stage is None or is_matrix_base:
-            view = "detail" if namespace.expand or namespace.all else "summary"
+            view = "detail" if namespace.expand else "summary"
         else:
             view = "detail"
-        dependency_depth = (
-            None
-            if namespace.all or namespace.deps_all
-            else 1
-            if namespace.expand or namespace.deps
-            else 0
-        )
+        dependency_depth = 0
         render_status(
             console,
             status,
@@ -410,23 +417,28 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         )
     elif namespace.command == "run":
         display_mode = "expand" if namespace.expand else "compact" if namespace.compact else "auto"
-        outcomes = run(
-            pipeline,
-            config,
-            args=args,
-            upto=namespace.upto,
-            downstream=namespace.downstream,
-            force=namespace.force,
-            cli_out=resolved.output_base,
-            branch=resolved.branch,
-            is_temporary=resolved.is_temporary,
-            temporary_config=resolved.temporary_config,
-            axes=resolved.axes,
-            temporary_axes=resolved.temporary_axes,
-            only=namespace.only,
-            slices=tuple(namespace.slice),
-            graph=graph,
-            display_mode=display_mode,
-        )
+        try:
+            outcomes = run(
+                pipeline,
+                config,
+                args=args,
+                upto=namespace.upto,
+                downstream=namespace.downstream,
+                force=namespace.force,
+                cli_out=resolved.output_base,
+                branch=resolved.branch,
+                is_temporary=resolved.is_temporary,
+                temporary_config=resolved.temporary_config,
+                axes=resolved.axes,
+                temporary_axes=resolved.temporary_axes,
+                only=namespace.only,
+                slices=tuple(namespace.slice),
+                graph=graph,
+                display_mode=display_mode,
+                rehash=namespace.rehash,
+            )
+        except ReviewRequiredError as error:
+            print(str(error), file=sys.stderr)
+            return 2
         _print_outcomes(outcomes, elapsed=True)
     return 0

@@ -16,6 +16,7 @@ def render_overview(states: list[PipelineState]) -> None:
     table.add_column("PIPELINE")
     table.add_column("BRANCH")
     table.add_column("STATUS")
+    table.add_column("REVIEW")
     table.add_column("STAGES")
     table.add_column("DURATION")
     table.add_column("LAST RUN")
@@ -30,6 +31,7 @@ def render_overview(states: list[PipelineState]) -> None:
             pipeline_id,
             state.entry.branch,
             status_text(state.status),
+            str(state.pending_reviews) if state.pending_reviews else "-",
             f"{hit_count}/{len(state.stages)}",
             format_elapsed(_total_elapsed(state.stages)),
             _format_datetime(_last_run(state.stages)),
@@ -55,6 +57,7 @@ def render_detail(state: PipelineState) -> None:
     stage_table.add_column("STAGE")
     stage_table.add_column("STATUS")
     stage_table.add_column("REASON")
+    stage_table.add_column("REVIEW")
     stage_table.add_column("ARTIFACTS")
     stage_table.add_column("COMMITTED")
     stage_table.add_column("UPSTREAMS")
@@ -62,7 +65,8 @@ def render_detail(state: PipelineState) -> None:
         stage_table.add_row(
             stage.name,
             status_text(stage.status),
-            stage.reason,
+            stage.failure or stage.reason,
+            stage.source_review,
             _format_artifacts(stage),
             _format_datetime(stage.committed_at),
             ", ".join(stage.upstreams) if stage.upstreams else "-",

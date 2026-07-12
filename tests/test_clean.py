@@ -107,7 +107,15 @@ def test_clean_target_preflights_external_outputs(tmp_path: Path) -> None:
     record = Store(root).read_success("summarize")
     assert record is not None
     assert record.produces is not None
-    record.produces = [ProducedPath(path="/tmp/outside-varve.txt", kind="file")]
+    record.produces = [
+        ProducedPath(
+            path="/tmp/outside-varve.txt",
+            kind="file",
+            artifact=record.produces[0].artifact.model_copy(
+                update={"root": "/tmp/outside-varve.txt"}
+            ),
+        )
+    ]
     Store(root).write_success(record)
 
     with pytest.raises(ValueError, match="outside root"):

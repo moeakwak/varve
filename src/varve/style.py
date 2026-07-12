@@ -20,12 +20,10 @@ from rich.theme import Theme
 STATUS_STYLES: dict[str, str] = {
     "hit": "green",
     "done": "green",
-    "artifact-missing": "yellow",
+    "needs-run": "yellow",
     "resume": "yellow",
-    "no-cache": "yellow",
-    "stale": "yellow",
     "run": "cyan",
-    "dirty": "red",
+    "failed": "red",
     "error": "red",
 }
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 from io import StringIO
 from pathlib import Path
 from time import sleep
-from typing import cast
 
 import pytest
 from pydantic import BaseModel
@@ -15,7 +14,6 @@ from varve.dashboard.cli import _loading, main
 from varve.dashboard.models import (
     PipelineEntry,
     PipelineState,
-    PipelineStatus,
     StageState,
     StateError,
 )
@@ -222,8 +220,19 @@ def test_refresh_runs_executable_entries_in_discovery_order(
         assert include_temporary is True
         return entries
 
+    state_reads: dict[str, int] = {}
+
     def fake_state(entry: PipelineEntry, _session):
-        status = cast(PipelineStatus, entry.pipeline_id if entry.pipeline_id != "hit" else "hit")
+        reads = state_reads.get(entry.pipeline_id, 0)
+        state_reads[entry.pipeline_id] = reads + 1
+        if entry.pipeline_id == "hit" or reads:
+            status = "hit"
+        elif entry.pipeline_id == "resume":
+            status = "resume"
+        elif entry.pipeline_id == "dirty":
+            status = "failed"
+        else:
+            status = "needs-run"
         return PipelineState(entry=entry, stages=[], status=status, error=None)
 
     refreshed: list[tuple[str, str]] = []
@@ -284,7 +293,8 @@ def test_refresh_prefix_filters_entries_by_module(
 
     def fake_state(entry: PipelineEntry, _session):
         checked.append(entry.pipeline_id)
-        return PipelineState(entry=entry, stages=[], status="stale", error=None)
+        status = "needs-run" if checked.count(entry.pipeline_id) == 1 else "hit"
+        return PipelineState(entry=entry, stages=[], status=status, error=None)
 
     refreshed: list[str] = []
     monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
@@ -295,7 +305,7 @@ def test_refresh_prefix_filters_entries_by_module(
 
     assert main(["refresh", "--root", str(tmp_path), "--prefix", "studies.exp.analysis"]) == 0
 
-    assert checked == ["match"]
+    assert checked == ["match", "match"]
     assert refreshed == ["match"]
 
 
@@ -314,10 +324,16 @@ def test_refresh_initializes_cli_logging(
         "varve.dashboard.cli.discover_pipelines",
         lambda root, *, include_temporary=False: [entry],
     )
-    monkeypatch.setattr(
-        "varve.dashboard.cli.load_state",
-        lambda item, _session: PipelineState(entry=item, stages=[], status="stale", error=None),
-    )
+    reads = 0
+
+    def fake_state(item, _session):
+        nonlocal reads
+        reads += 1
+        return PipelineState(
+            entry=item, stages=[], status="needs-run" if reads == 1 else "hit", error=None
+        )
+
+    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
     calls: list[bool] = []
     monkeypatch.setattr(
         "varve.dashboard.cli.configure_cli_logging",
@@ -360,7 +376,134 @@ def test_refresh_noops_when_no_entries_are_executable(
     assert main(["refresh", "--root", str(tmp_path)]) == 0
 
     captured = capsys.readouterr()
-    assert captured.out == "No executable pipelines found\n"
+    assert captured.out == "All selected pipelines are complete.\n"
+
+
+def test_refresh_review_only_returns_two_and_skips_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entry = PipelineEntry(
+        output_root=tmp_path / "review" / "out" / "main",
+        pipeline_id="review",
+        pipeline_name="Review",
+        branch="main",
+        module="tests.demo",
+    )
+    state = PipelineState(
+        entry=entry,
+        stages=[
+            StageState(
+                name="build",
+                status="hit",
+                reason="hit",
+                source_review="pending",
+                artifacts=[],
+                committed_at=None,
+                upstreams=[],
+            )
+        ],
+        status="hit",
+    )
+    monkeypatch.setattr(
+        "varve.dashboard.cli.discover_pipelines",
+        lambda root, *, include_temporary=False: [entry],
+    )
+    monkeypatch.setattr("varve.dashboard.cli.load_state", lambda item, session: state)
+    monkeypatch.setattr(
+        "varve.dashboard.cli._run_entry",
+        lambda item: pytest.fail("pending review must block refresh"),
+    )
+
+    assert main(["refresh", "--root", str(tmp_path)]) == 2
+    output = capsys.readouterr().out
+    assert "REVIEW REQUIRED" in output
+    assert "review  main  build" in output
+
+
+def test_refresh_reports_review_failure_error_and_pending_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entries = [
+        PipelineEntry(
+            output_root=tmp_path / name / "out" / "main",
+            pipeline_id=name,
+            pipeline_name=name.title(),
+            branch="main",
+            module="tests.demo",
+        )
+        for name in ("review", "failed", "broken", "pending")
+    ]
+
+    def stage_state(
+        name: str,
+        status: str,
+        reason: str,
+        *,
+        review: str = "confirmed",
+        failure: str | None = None,
+    ):
+        return StageState(
+            name=name,
+            status=status,
+            reason=reason,
+            failure=failure,
+            source_review=review,
+            artifacts=[],
+            committed_at=None,
+            upstreams=[],
+        )
+
+    def fake_state(entry: PipelineEntry, _session):
+        if entry.pipeline_id == "review":
+            stages = [stage_state("build", "hit", "hit", review="pending")]
+            return PipelineState(entry=entry, stages=stages, status="hit")
+        if entry.pipeline_id == "failed":
+            stages = [
+                stage_state(
+                    "render",
+                    "failed",
+                    "stage-failed",
+                    failure="RuntimeError: Chromium exited",
+                )
+            ]
+            return PipelineState(entry=entry, stages=stages, status="failed")
+        if entry.pipeline_id == "broken":
+            return PipelineState(
+                entry=entry,
+                stages=[],
+                status="error",
+                error=StateError(phase="import", message="No module named demo"),
+            )
+        stages = [stage_state("aggregate", "resume", "81/100")]
+        return PipelineState(entry=entry, stages=stages, status="resume")
+
+    monkeypatch.setattr(
+        "varve.dashboard.cli.discover_pipelines",
+        lambda root, *, include_temporary=False: entries,
+    )
+    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
+    refreshed: list[str] = []
+    monkeypatch.setattr(
+        "varve.dashboard.cli._run_entry",
+        lambda entry: refreshed.append(entry.pipeline_id),
+    )
+
+    assert main(["refresh", "--root", str(tmp_path)]) == 1
+
+    output = capsys.readouterr().out
+    assert refreshed == ["failed", "pending"]
+    assert "REVIEW REQUIRED" in output
+    assert "review  main  build" in output
+    assert "FAILED" in output
+    assert "failed  main  render  RuntimeError: Chromium exited" in output
+    assert "ERROR" in output
+    assert "broken  main  import  No module named demo" in output
+    assert "STILL PENDING" in output
+    assert "pending  main  aggregate  resume  81/100" in output
 
 
 def test_render_detail_styles_status(
@@ -553,7 +696,7 @@ def test_refresh_discards_dashboard_observations_after_failed_run(
     def fake_load(entry, session):
         observed_record_counts.append(len(session.records))
         session.records[(entry.output_root, "stage")] = object()
-        return PipelineState(entry=entry, stages=[], status="stale", error=None)
+        return PipelineState(entry=entry, stages=[], status="needs-run", error=None)
 
     monkeypatch.setattr("varve.dashboard.cli.load_state", fake_load)
     calls = 0
@@ -567,7 +710,7 @@ def test_refresh_discards_dashboard_observations_after_failed_run(
     monkeypatch.setattr("varve.dashboard.cli._run_entry", fake_run)
 
     assert main(["refresh", "--root", str(tmp_path)]) == 1
-    assert observed_record_counts == [0, 0]
+    assert observed_record_counts == [0, 0, 0, 0]
 
 
 def test_loading_status_is_tty_only_and_transient(monkeypatch: pytest.MonkeyPatch) -> None:

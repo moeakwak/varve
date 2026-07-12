@@ -8,8 +8,15 @@ from pydantic import BaseModel
 from varve import Pipeline, stage
 from varve.dashboard.models import PipelineEntry
 from varve.dashboard.state import load_state
-from varve.engine.runner import StageOutcome, run
-from varve.models import KeyComponents, ProducedPath, SuccessRecord
+from varve.engine.runner import StageProbe, run
+from varve.engine.state import Decision
+from varve.models import (
+    ArtifactFingerprint,
+    KeyComponents,
+    ProducedPath,
+    SourceFingerprint,
+    SuccessRecord,
+)
 from varve.store.store import Store
 
 
@@ -45,7 +52,11 @@ def _entry(output_root: Path, *, module: str | None = None) -> PipelineEntry:
 
 
 def _components() -> KeyComponents:
-    return KeyComponents(source={}, config={}, files={}, values={}, upstreams={})
+    return KeyComponents(config={}, inputs={}, values={}, upstreams={})
+
+
+def _artifact(path: str) -> ArtifactFingerprint:
+    return ArtifactFingerprint(root=path, kind="file", manifest=[], fingerprint=f"hash:{path}")
 
 
 def _single(stage_name: str, *, elapsed: float | None = None) -> SuccessRecord:
@@ -53,11 +64,29 @@ def _single(stage_name: str, *, elapsed: float | None = None) -> SuccessRecord:
         pipeline="Demo",
         stage=stage_name,
         kind="single",
-        content_key=f"sha256:{stage_name}",
+        input_key=f"sha256:{stage_name}",
         key_components=_components(),
-        produces=[ProducedPath(path=f"{stage_name}.txt", kind="file")],
+        executed_source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
+        artifact_fingerprint="artifacts",
+        produces=[
+            ProducedPath(
+                path=f"{stage_name}.txt", kind="file", artifact=_artifact(f"{stage_name}.txt")
+            )
+        ],
         committed_at="2026-06-24T10:00:00+00:00",
         elapsed=elapsed,
+    )
+
+
+def _probe(stage: str, decision: Decision, previous: SuccessRecord | None) -> StageProbe:
+    return StageProbe(
+        stage=stage,
+        decision=decision,
+        decision_key=None,
+        components=None,
+        previous=previous,
+        source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
+        source_review="confirmed",
     )
 
 
@@ -72,23 +101,22 @@ def test_load_state_uses_engine_outcomes_and_topo_order(
     (output_root / "sample.txt").write_text("sample", encoding="utf-8")
     store.write_success(_single("sample"))
 
-    def fake_evaluate_state(*args, **kwargs):
-        kwargs["_record_callback"]("sample", store.read_success("sample"))
-        kwargs["_record_callback"]("summary", None)
+    def fake_probe_pipeline(*args, **kwargs):
+        del args, kwargs
         return [
-            StageOutcome("sample", "hit", "hit", None),
-            StageOutcome("summary", "stale", "source changed", None),
+            _probe("sample", Decision("hit", "hit"), store.read_success("sample")),
+            _probe("summary", Decision("needs-run", "inputs-changed"), None),
         ]
 
-    monkeypatch.setattr("varve.dashboard.state.evaluate_state", fake_evaluate_state)
+    monkeypatch.setattr("varve.dashboard.state.probe_pipeline", fake_probe_pipeline)
 
     state = load_state(_entry(output_root))
 
-    assert state.status == "stale"
+    assert state.status == "needs-run"
     assert state.error is None
     assert [stage.name for stage in state.stages] == ["sample", "summary"]
-    assert [stage.status for stage in state.stages] == ["hit", "stale"]
-    assert [stage.reason for stage in state.stages] == ["hit", "source changed"]
+    assert [stage.status for stage in state.stages] == ["hit", "needs-run"]
+    assert [stage.reason for stage in state.stages] == ["hit", "inputs-changed"]
     assert state.stages[0].artifacts[0].path == Path("sample.txt")
     assert state.stages[0].artifacts[0].exists is True
     assert state.stages[0].committed_at is not None
@@ -104,15 +132,14 @@ def test_load_state_reads_stage_elapsed(
     store.ensure_initialized("Demo", module=Demo.__module__)
     store.write_success(_single("sample", elapsed=1.25))
 
-    def fake_evaluate_state(*args, **kwargs):
-        kwargs["_record_callback"]("sample", store.read_success("sample"))
-        kwargs["_record_callback"]("summary", None)
+    def fake_probe_pipeline(*args, **kwargs):
+        del args, kwargs
         return [
-            StageOutcome("sample", "hit", "hit", None),
-            StageOutcome("summary", "no-cache", "no cache", None),
+            _probe("sample", Decision("hit", "hit"), store.read_success("sample")),
+            _probe("summary", Decision("needs-run", "no-cache"), None),
         ]
 
-    monkeypatch.setattr("varve.dashboard.state.evaluate_state", fake_evaluate_state)
+    monkeypatch.setattr("varve.dashboard.state.probe_pipeline", fake_probe_pipeline)
 
     state = load_state(_entry(output_root))
 
@@ -195,10 +222,10 @@ def test_load_state_reports_evaluate_phase(
 ) -> None:
     output_root = tmp_path / "demo" / "out" / "main"
 
-    def fail_evaluate_state(*args, **kwargs):
+    def fail_probe_pipeline(*args, **kwargs):
         raise RuntimeError("engine failed")
 
-    monkeypatch.setattr("varve.dashboard.state.evaluate_state", fail_evaluate_state)
+    monkeypatch.setattr("varve.dashboard.state.probe_pipeline", fail_probe_pipeline)
 
     state = load_state(_entry(output_root))
 

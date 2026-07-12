@@ -6,18 +6,23 @@ from pathlib import Path
 import pytest
 
 from varve.models import (
+    ArtifactFingerprint,
     AttemptMarker,
     BatchRecord,
     KeyComponents,
-    Manifest,
     OutputHandle,
+    SourceFingerprint,
     SuccessRecord,
 )
 from varve.store.store import CorruptStore, Store
 
 
 def _components() -> KeyComponents:
-    return KeyComponents(source={}, config={}, files={}, values={}, upstreams={})
+    return KeyComponents(config={}, inputs={}, values={}, upstreams={})
+
+
+def _artifact(path: str) -> ArtifactFingerprint:
+    return ArtifactFingerprint(root=path, kind="file", manifest=[], fingerprint=f"hash:{path}")
 
 
 def test_store_initializes_gitignore_and_manifest(tmp_path: Path) -> None:
@@ -31,13 +36,13 @@ def test_store_initializes_gitignore_and_manifest(tmp_path: Path) -> None:
     assert (tmp_path / ".varve" / ".gitignore").read_text(encoding="utf-8") == "*\n"
     manifest = store.read_manifest()
     assert manifest is not None
-    assert manifest.schema_version == 4
+    assert manifest.schema_version == 5
     assert manifest.pipeline == "Demo"
     assert manifest.module == "pkg.demo"
     assert manifest.temporary_config == {"token": "x"}
     assert manifest.temporary_axes == {"bench": ["a", "b"]}
     manifest_data = json.loads((store.root / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest_data["schema_version"] == 4
+    assert manifest_data["schema_version"] == 5
     assert manifest_data["temporary_axes"] == {"bench": ["a", "b"]}
     with pytest.raises(ValueError, match="belongs to Demo"):
         store.ensure_initialized("Other")
@@ -62,20 +67,22 @@ def test_success_round_trip_and_tmp_does_not_pollute(tmp_path: Path) -> None:
         pipeline="Demo",
         stage="transform",
         kind="batch",
-        content_key="sha256:a",
+        input_key="sha256:a",
         key_components=_components(),
-        outputs=[OutputHandle(index=0, path="part-0.txt")],
+        executed_source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
+        artifact_fingerprint="artifacts",
+        outputs=[OutputHandle(index=0, path="part-0.txt", artifact=_artifact("part-0.txt"))],
         committed_at="now",
     )
     store.write_success(record)
     (tmp_path / ".varve" / "stages" / "transform.json.tmp").write_text("{bad", encoding="utf-8")
     assert store.read_success("transform") == record
     record_data = json.loads((store.root / "stages" / "transform.json").read_text(encoding="utf-8"))
-    assert record_data["schema_version"] == 4
+    assert record_data["schema_version"] == 5
 
 
-@pytest.mark.parametrize("schema_version", [2, 3])
-def test_store_reads_older_manifest_and_success(
+@pytest.mark.parametrize("schema_version", [2, 3, 4])
+def test_store_rebuilds_older_schema_on_initialization(
     tmp_path: Path,
     schema_version: int,
 ) -> None:
@@ -92,39 +99,41 @@ def test_store_reads_older_manifest_and_success(
         ),
         encoding="utf-8",
     )
-    record = SuccessRecord(
-        schema_version=schema_version,
-        pipeline="Demo",
-        stage="transform",
-        kind="batch",
-        content_key="sha256:a",
-        key_components=_components(),
-        outputs=[OutputHandle(index=0, path="part-0.txt")],
-        committed_at="now",
-    )
-    store.write_success(record)
-
-    assert store.read_manifest() == Manifest(
-        schema_version=schema_version,
-        pipeline="Demo",
-        module="pkg.demo",
-        temporary_config=None,
-        temporary_axes=None,
-    )
-    assert store.read_success("transform") == record
+    old_attempt = store.root / "attempts" / "sample.json"
+    old_attempt.parent.mkdir()
+    old_attempt.write_text('{"content_key": "old"}', encoding="utf-8")
+    assert store.read_manifest() is not None
+    store.ensure_initialized("Demo", module="pkg.demo")
+    manifest = store.read_manifest()
+    assert manifest is not None
+    assert manifest.schema_version == 5
+    assert not old_attempt.exists()
 
 
 def test_attempt_and_partial_round_trip(tmp_path: Path) -> None:
     store = Store(tmp_path)
     store.ensure_initialized("Demo")
-    marker = AttemptMarker(content_key="sha256:a", started_at="now", touched_existing=False)
+    marker = AttemptMarker(
+        input_key="sha256:a",
+        source_fingerprint="source",
+        started_at="now",
+        touched_existing=False,
+    )
     store.write_attempt("sample", marker)
     assert store.read_attempt("sample") == marker
     store.clear_attempt("sample")
     assert store.read_attempt("sample") is None
 
-    store.write_batch("batch", "run", BatchRecord(index=1, yielded=["b"], committed_at="now"))
-    store.write_batch("batch", "run", BatchRecord(index=0, yielded=["a"], committed_at="now"))
+    store.write_batch(
+        "batch",
+        "run",
+        BatchRecord(index=1, yielded=["b"], artifacts=[_artifact("b")], committed_at="now"),
+    )
+    store.write_batch(
+        "batch",
+        "run",
+        BatchRecord(index=0, yielded=["a"], artifacts=[_artifact("a")], committed_at="now"),
+    )
     read = store.read_partial("batch", "run")
     assert read is not None
     assert sorted(read) == [0, 1]

@@ -19,7 +19,7 @@ uv run pyright
 The public import surface is intentionally small:
 
 ```python
-from varve import Axis, Ctx, JSON, KeySpec, Pipeline, StageSpec, batch_stage, matrix, stage
+from varve import Axis, Ctx, JSON, Dependencies, Pipeline, StageSpec, batch_stage, matrix, stage
 ```
 
 Do not re-export internal store, keying, runner, or dashboard types from `varve.__all__`. Treat public API and `.varve/` store schema changes as breaking.

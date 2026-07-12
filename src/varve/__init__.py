@@ -2,7 +2,7 @@
 
 from varve.context import Ctx
 from varve.decorators import StageSpec, batch_stage, matrix, stage
-from varve.keyspec import JSON, KeySpec
+from varve.dependencies import JSON, Dependencies
 from varve.matrix import Axis
 from varve.pipeline import Pipeline
 
@@ -11,7 +11,7 @@ __all__ = [
     "Axis",
     "Pipeline",
     "JSON",
-    "KeySpec",
+    "Dependencies",
     "StageSpec",
     "batch_stage",
     "matrix",

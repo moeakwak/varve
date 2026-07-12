@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -8,10 +9,28 @@ import pytest
 from varve.keying import fingerprint as fingerprint_module
 from varve.keying.fingerprint import (
     FingerprintSession,
+    artifact_fingerprint,
+    artifacts_root_fingerprint,
     canonical_json,
     file_fingerprint,
     files_fingerprints,
 )
+
+
+def test_materialization_fingerprint_preserves_batch_positions(tmp_path: Path) -> None:
+    first_path = tmp_path / "first.txt"
+    second_path = tmp_path / "second.txt"
+    first_path.write_text("first", encoding="utf-8")
+    second_path.write_text("second", encoding="utf-8")
+    artifacts = [
+        artifact_fingerprint(first_path, tmp_path),
+        artifact_fingerprint(second_path, tmp_path),
+    ]
+
+    ordered = artifacts_root_fingerprint(artifacts, positions=[(0, 0), (1, 0)])
+    reassigned = artifacts_root_fingerprint(artifacts, positions=[(1, 0), (0, 0)])
+
+    assert ordered != reassigned
 
 
 def test_file_fingerprint_reuses_cached_sha_when_size_and_mtime_match(tmp_path: Path) -> None:
@@ -28,7 +47,7 @@ def test_file_fingerprint_recomputes_when_mtime_changes(tmp_path: Path) -> None:
     first = file_fingerprint(path)
     path.write_text("bravo", encoding="utf-8")
     second = file_fingerprint(path, cached=first)
-    assert second.sha256 != first.sha256
+    assert second.content_hash != first.content_hash
 
 
 def test_file_fingerprint_missing_file_fails_fast(tmp_path: Path) -> None:
@@ -56,7 +75,9 @@ def test_files_fingerprints_are_order_independent(tmp_path: Path) -> None:
 
     one = files_fingerprints(Ctx(), {"datasets": lambda _ctx: [b, a]})
     two = files_fingerprints(Ctx(), {"datasets": lambda _ctx: [a, b]})
-    assert [item.sha256 for item in one["datasets"]] == [item.sha256 for item in two["datasets"]]
+    assert [item.content_hash for item in one["datasets"]] == [
+        item.content_hash for item in two["datasets"]
+    ]
 
 
 def test_fingerprint_session_shares_path_snapshot_and_keeps_files_distinct(
@@ -68,7 +89,9 @@ def test_fingerprint_session_shares_path_snapshot_and_keeps_files_distinct(
     first_path.write_text("first", encoding="utf-8")
     second_path.write_text("second", encoding="utf-8")
     cached = file_fingerprint(first_path)
-    stale = cached.model_copy(update={"mtime": cached.mtime - 1, "sha256": "sha256:stale"})
+    stale = cached.model_copy(
+        update={"mtime_ns": cached.mtime_ns - 1, "content_hash": "sha256:stale"}
+    )
     # Python 3.10 Path.resolve() calls Path.stat() internally. Resolve first so
     # this test counts only the session's explicit stat calls on every version.
     resolved_paths = {
@@ -105,10 +128,11 @@ def test_fingerprint_session_shares_path_snapshot_and_keeps_files_distinct(
     distinct = file_fingerprint(second_path, session=session)
 
     assert shared is refreshed
-    assert refreshed.sha256 == cached.sha256
-    assert distinct.sha256 != refreshed.sha256
+    assert refreshed.content_hash == cached.content_hash
+    assert distinct.content_hash != refreshed.content_hash
     assert resolve_calls == [first_path, second_path]
-    assert stat_calls == [first_path, second_path]
+    assert stat_calls.count(first_path) == 3
+    assert stat_calls.count(second_path) == 3
     assert hash_calls == [first_path, second_path]
 
 
@@ -129,3 +153,97 @@ def test_fingerprint_session_keeps_stage_cached_fingerprints_independent(
 
     assert file_fingerprint(path, cached=first, session=session) is first
     assert file_fingerprint(path, cached=second, session=session) is second
+
+
+def test_commit_artifact_force_rehash_ignores_preexecution_session(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("before", encoding="utf-8")
+    session = FingerprintSession()
+    before = artifact_fingerprint(artifact, tmp_path, session=session)
+
+    artifact.write_text("after!", encoding="utf-8")
+    committed = artifact_fingerprint(
+        artifact,
+        tmp_path,
+        cached=before,
+        session=session,
+        force_rehash=True,
+    )
+
+    assert committed.fingerprint != before.fingerprint
+
+
+def test_directory_artifact_fingerprint_tracks_tree_shape_and_empty_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    empty = artifact_fingerprint(root, tmp_path)
+
+    (root / "empty").mkdir()
+    with_empty_dir = artifact_fingerprint(root, tmp_path)
+    assert with_empty_dir.fingerprint != empty.fingerprint
+
+    (root / "value.txt").write_text("value", encoding="utf-8")
+    with_file = artifact_fingerprint(root, tmp_path)
+    assert with_file.fingerprint != with_empty_dir.fingerprint
+
+    (root / "value.txt").rename(root / "renamed.txt")
+    renamed = artifact_fingerprint(root, tmp_path)
+    assert renamed.fingerprint != with_file.fingerprint
+
+
+def test_force_rehash_detects_content_changed_with_restored_stat(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("before", encoding="utf-8")
+    before_stat = artifact.stat()
+    before = artifact_fingerprint(artifact, tmp_path)
+
+    artifact.write_text("after!", encoding="utf-8")
+    artifact.chmod(before_stat.st_mode)
+    artifact.touch()
+    os.utime(artifact, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
+    after = artifact_fingerprint(artifact, tmp_path, cached=before, force_rehash=True)
+    assert after.fingerprint != before.fingerprint
+
+
+def test_input_and_artifact_root_symlinks_are_rejected(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("value", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+
+    class Ctx:
+        pass
+
+    with pytest.raises(ValueError, match="Symlinks are not supported in input dependencies"):
+        files_fingerprints(Ctx(), {"input": lambda _ctx: link})
+    with pytest.raises(ValueError, match="Symlinks are not supported in managed artifacts"):
+        artifact_fingerprint(link, tmp_path)
+
+
+def test_file_fingerprint_retries_a_concurrent_change_and_records_final_stat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "changing.txt"
+    path.write_text("before", encoding="utf-8")
+    original_hash = fingerprint_module._sha256_file
+    calls = 0
+
+    def mutate_once(target: Path) -> str:
+        nonlocal calls
+        calls += 1
+        digest = original_hash(target)
+        if calls == 1:
+            target.write_text("after!", encoding="utf-8")
+        return digest
+
+    monkeypatch.setattr(fingerprint_module, "_sha256_file", mutate_once)
+
+    fingerprint = file_fingerprint(path)
+
+    assert calls == 2
+    assert fingerprint.content_hash == original_hash(path)
+    assert fingerprint.size == path.stat().st_size
+    assert fingerprint.mtime_ns == path.stat().st_mtime_ns

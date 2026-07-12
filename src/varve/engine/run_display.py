@@ -164,8 +164,8 @@ class RunReporter:
         level = logging.DEBUG if group.compact else logging.INFO
         self.logger.log(level, "[%s] %s%s", stage, status, suffix)
 
-    def content_key(self, stage: str, value: str) -> None:
-        self.logger.debug("[%s] content_key %s", stage, value)
+    def input_key(self, stage: str, value: str) -> None:
+        self.logger.debug("[%s] input_key %s", stage, value)
 
     def failure(self, stage: str, error: BaseException) -> None:
         # Failures are always concrete, even for compact groups.

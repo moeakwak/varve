@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
-from varve.keyspec import KeySpec
+from varve.dependencies import Dependencies
 
 StageKind = Literal["single", "batch"]
 ProducesItem = str | Path
@@ -24,9 +24,7 @@ class StageSpec:
     func: Callable[..., Any]
     needs: tuple[str, ...]
     produces: ProducesSpec
-    keyspec: KeySpec
-    auto_uses: bool = True
-    uses: tuple[Callable[..., Any], ...] = ()
+    depends: Dependencies
     matrix: tuple[Any, ...] = ()
     logical_needs: tuple[str, ...] = ()
     cell: tuple[tuple[Any, Any], ...] = ()
@@ -73,9 +71,7 @@ def stage(
     *,
     needs: NeedItem | list[NeedItem] | tuple[NeedItem, ...] | None = None,
     produces: ProducesSpec = None,
-    key: KeySpec | None = None,
-    auto_uses: bool = True,
-    uses: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
+    depends: Dependencies | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Declare a single-run stage.
 
@@ -90,9 +86,7 @@ def stage(
             func=func,
             needs=_normalize_needs(needs),
             produces=produces,
-            keyspec=key if key is not None else KeySpec(),
-            auto_uses=auto_uses,
-            uses=tuple(uses),
+            depends=depends if depends is not None else Dependencies(),
         )
         return _attach_stage_spec(func, spec)
 
@@ -103,9 +97,7 @@ def batch_stage(
     *,
     needs: NeedItem | list[NeedItem] | tuple[NeedItem, ...] | None = None,
     produces: ProducesSpec = None,
-    key: KeySpec | None = None,
-    auto_uses: bool = True,
-    uses: list[Callable[..., Any]] | tuple[Callable[..., Any], ...] = (),
+    depends: Dependencies | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Declare an async-generator batch stage.
 
@@ -126,9 +118,7 @@ def batch_stage(
             func=func,
             needs=_normalize_needs(needs),
             produces=produces,
-            keyspec=key if key is not None else KeySpec(),
-            auto_uses=auto_uses,
-            uses=tuple(uses),
+            depends=depends if depends is not None else Dependencies(),
         )
         return _attach_stage_spec(func, spec)
 

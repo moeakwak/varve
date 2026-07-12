@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from varve.branch import validate_branch_name
 from varve.decorators import StageSpec
+from varve.dependencies import Dependencies
 
 
 class _EmptyArgs(BaseModel):
@@ -29,7 +30,7 @@ class Pipeline:
 
     Args: ClassVar[type[Any]] = _EmptyArgs
     Config: ClassVar[type[Any]]
-    auto_uses_packages: ClassVar[tuple[str, ...] | None] = None
+    depends: ClassVar[Dependencies] = Dependencies()
 
     @classmethod
     @cache

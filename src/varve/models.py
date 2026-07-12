@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class VarveModel(BaseModel):
@@ -23,20 +23,52 @@ class Manifest(VarveModel):
 
 class FileFingerprint(VarveModel):
     path: str
+    kind: Literal["file", "dir"] = "file"
+    inode: int
     size: int
-    mtime: float
-    sha256: str
+    mtime_ns: int
+    algorithm: Literal["sha256"] = "sha256"
+    cache_version: int = 1
+    content_hash: str
+
+
+class ArtifactManifestEntry(VarveModel):
+    path: str
+    kind: Literal["file", "dir"]
+    fingerprint: FileFingerprint | None = None
+
+
+class ArtifactFingerprint(VarveModel):
+    root: str
+    kind: Literal["file", "dir"]
+    manifest: list[ArtifactManifestEntry]
+    fingerprint: str
+
+
+class SourceManifestEntry(VarveModel):
+    path: str
+    cache_path: str
+    digest: str
+    inode: int
+    size: int
+    mtime_ns: int
+    algorithm: Literal["ast-sha256"] = "ast-sha256"
+    cache_version: int = 1
+
+
+class SourceFingerprint(VarveModel):
+    fingerprint: str
+    files: list[SourceManifestEntry]
 
 
 class KeyComponents(VarveModel):
-    source: dict[str, str]
     config: dict[str, Any]
-    files: dict[str, list[FileFingerprint]]
+    inputs: dict[str, list[FileFingerprint]]
     values: dict[str, Any]
     upstreams: dict[str, dict[str, str]]
     # Top-level config fields this stage read at runtime; None means every field
     # matters (conservative fallback). `config` above is projected onto this set,
-    # so unread config fields never enter the content key. Older records without
+    # so unread config fields never enter the input key. Older records without
     # this field default to None and rerun once, then self-heal.
     config_access: list[str] | None = None
 
@@ -44,11 +76,13 @@ class KeyComponents(VarveModel):
 class OutputHandle(VarveModel):
     index: int
     path: str
+    artifact: ArtifactFingerprint
 
 
 class ProducedPath(VarveModel):
     path: str
     kind: Literal["file", "dir"]
+    artifact: ArtifactFingerprint
 
 
 class SuccessRecord(VarveModel):
@@ -56,8 +90,10 @@ class SuccessRecord(VarveModel):
     pipeline: str
     stage: str
     kind: Literal["single", "batch"]
-    content_key: str
+    input_key: str
     key_components: KeyComponents
+    executed_source_fingerprint: SourceFingerprint
+    artifact_fingerprint: str
     outputs: list[OutputHandle] | None = None
     produces: list[ProducedPath] | None = None
     committed_at: str
@@ -76,10 +112,30 @@ class SuccessRecord(VarveModel):
 class BatchRecord(VarveModel):
     index: int
     yielded: list[str]
+    artifacts: list[ArtifactFingerprint]
     committed_at: str
+    total: int | None = None
 
 
 class AttemptMarker(VarveModel):
-    content_key: str
+    input_key: str
+    source_fingerprint: str
     started_at: str
     touched_existing: bool
+
+
+class ReviewRecord(VarveModel):
+    source_fingerprint: str
+    source_observation: SourceFingerprint
+    decision: Literal["accept", "reject"]
+    decided_at: str
+
+
+class FailureRecord(VarveModel):
+    pipeline: str
+    stage: str
+    input_key: str
+    source_fingerprint: str
+    exception_type: str
+    message: str
+    failed_at: str

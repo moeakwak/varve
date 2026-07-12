@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from varve import KeySpec, Pipeline, batch_stage, stage
+from varve import Dependencies, Pipeline, batch_stage, stage
 
 
 def test_decorators_capture_stage_metadata() -> None:
@@ -17,7 +17,7 @@ def test_decorators_capture_stage_metadata() -> None:
     assert spec.name == "transform"
     assert spec.kind == "batch"
     assert spec.needs == ("sample",)
-    assert spec.keyspec == KeySpec()
+    assert spec.depends == Dependencies()
 
 
 class DemoConfig(BaseModel):

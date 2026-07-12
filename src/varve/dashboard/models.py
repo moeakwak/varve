@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from varve.engine.state import Status
 
-PipelineStatus = Status | Literal["error"]
+PipelineStatus = Status
 ErrorPhase = Literal["manifest", "import", "resolve", "evaluate"]
 
 
@@ -41,6 +41,8 @@ class StageState(BaseModel):
     committed_at: datetime | None
     upstreams: list[str]
     elapsed: float | None = None
+    failure: str | None = None
+    source_review: Literal["confirmed", "pending", "accepted", "rerun-required"] = "confirmed"
 
 
 class PipelineState(BaseModel):
@@ -48,3 +50,11 @@ class PipelineState(BaseModel):
     stages: list[StageState]
     status: PipelineStatus
     error: StateError | None = None
+
+    @property
+    def pending_reviews(self) -> int:
+        return sum(stage.source_review == "pending" for stage in self.stages)
+
+    @property
+    def complete(self) -> bool:
+        return self.status == "hit" and self.pending_reviews == 0

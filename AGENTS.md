@@ -14,7 +14,7 @@
 Keep the public import surface small:
 
 ```python
-from varve import Axis, Ctx, Pipeline, JSON, KeySpec, StageSpec, batch_stage, matrix, stage
+from varve import Axis, Ctx, Pipeline, JSON, Dependencies, StageSpec, batch_stage, matrix, stage
 ```
 
 Prefer compact pre-1.0 APIs over compatibility shims. If an old public name is awkward and there are no external users, update current callers and docs instead of keeping deprecated aliases.

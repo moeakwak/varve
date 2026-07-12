@@ -7,10 +7,12 @@ specific field (``model_dump``, dynamic ``getattr`` of an unknown name, whole
 object iteration or pickling) conservatively marks the whole config as
 depended-on.
 
-Combined with the source hash already folded into the content key, projecting
-the config onto the recorded field set is sound: fields that were not read
-cannot affect the output, and a code change that reads a new field changes the
-source hash and forces a rerun (after which the field set is re-recorded).
+Projecting the config onto the recorded field set is sound for unchanged
+source: fields that were not read cannot affect the output.  Source review is
+separate from the input key; accepting a source change also accepts
+responsibility for reusing the old access set when deciding whether an
+existing materialization is still valid.  Any execution under a different
+source fingerprint starts from the whole Config and records a new field set.
 """
 
 from __future__ import annotations
@@ -100,8 +102,9 @@ def project_config(config_data: dict[str, Any], access_fields: list[str] | None)
     """Project a config dump onto ``access_fields``.
 
     ``None`` means "all fields depended-on" and returns the dump unchanged.
-    Fields absent from the dump (e.g. removed from Config since the set was
-    recorded) are skipped; such a schema change also moves the source hash.
+    Fields absent from the dump (for example, removed from Config since the set
+    was recorded) are skipped. Source review remains responsible for deciding
+    whether a changed Config-reading implementation may reuse the old set.
     """
 
     if access_fields is None:

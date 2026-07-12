@@ -98,6 +98,7 @@ class Ctx(Generic[ConfigT, ArgsT]):
         self._need_cells = need_cells
         self._current_batch_index: int | None = None
         self._used_resume = False
+        self._resume_total: int | None = None
 
     def _check_declared_need(self, stage: str) -> None:
         if self._declared_needs is None or stage in self._declared_needs:
@@ -105,7 +106,7 @@ class Ctx(Generic[ConfigT, ArgsT]):
         current = f" for stage {self._stage_name!r}" if self._stage_name else ""
         raise ValueError(
             f"Cannot read upstream stage {stage!r}{current}: declare it in needs= so "
-            "the upstream content key is part of this stage's key."
+            "the upstream input key is part of this stage's key."
         )
 
     def _input_paths(self, stage: str) -> list[Path]:
@@ -168,6 +169,8 @@ class Ctx(Generic[ConfigT, ArgsT]):
         """
 
         self._used_resume = True
+        inferred_total = total if total is not None else _len_or_none(iterable)
+        self._resume_total = inferred_total
         progress_handle: _ResumeProgress | None = None
         if progress:
             if desc is not None:
@@ -176,7 +179,6 @@ class Ctx(Generic[ConfigT, ArgsT]):
                 label = " / ".join(self._stage_display.cell_values)
             else:
                 label = self._stage_name or "batch"
-            inferred_total = total if total is not None else _len_or_none(iterable)
             initial = (
                 sum(1 for index in self._resume_skip if index < inferred_total)
                 if inferred_total is not None

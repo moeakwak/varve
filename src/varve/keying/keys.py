@@ -1,30 +1,22 @@
-"""Content key assembly."""
+"""Input key assembly."""
 
 from __future__ import annotations
 
-import types
 from collections.abc import Callable, Mapping
-from pathlib import Path
-from typing import Annotated, Any, Protocol, Union, get_args, get_origin
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
+from varve.dependencies import Dependencies, DependencyContext
 from varve.keying.config_access import project_config
-from varve.keying.dependencies import (
-    SourceDependencies,
-    SourceInspectionSession,
-    discover_source_dependencies,
-)
 from varve.keying.fingerprint import (
     FingerprintSession,
     file_digest_view,
     files_fingerprints,
     json_sha256,
 )
-from varve.keyspec import KeySpec
 from varve.models import FileFingerprint, KeyComponents
 
-_UNION_ORIGINS = (Union, types.UnionType)
 _MATRIX_LAYOUT_KEY = "__varve_matrix_layout__"
 _MATRIX_LAYOUT_VERSION = 2
 
@@ -34,13 +26,7 @@ class StageSpecLike(Protocol):
     def func(self) -> Callable[..., Any]: ...
 
     @property
-    def auto_uses(self) -> bool: ...
-
-    @property
-    def uses(self) -> tuple[Callable[..., Any], ...]: ...
-
-    @property
-    def keyspec(self) -> KeySpec: ...
+    def depends(self) -> Dependencies: ...
 
     @property
     def needs(self) -> tuple[str, ...]: ...
@@ -57,83 +43,14 @@ def config_data(config: Any) -> dict[str, Any]:
     return vars(config)
 
 
-def _annotation_contains_path(annotation: Any) -> bool:
-    origin = get_origin(annotation)
-    if origin is Annotated:
-        args = get_args(annotation)
-        return bool(args) and _annotation_contains_path(args[0])
-    if origin in _UNION_ORIGINS or origin is not None:
-        return any(_annotation_contains_path(arg) for arg in get_args(annotation))
-    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-        return any(
-            _annotation_contains_path(field.annotation)
-            for field in annotation.model_fields.values()
-        )
-    return isinstance(annotation, type) and issubclass(annotation, Path)
-
-
-def _value_contains_path(value: Any) -> bool:
-    if isinstance(value, Path):
-        return True
-    if isinstance(value, BaseModel):
-        return any(_value_contains_path(getattr(value, name)) for name in type(value).model_fields)
-    if isinstance(value, Mapping):
-        return any(_value_contains_path(item) for item in value.keys()) or any(
-            _value_contains_path(item) for item in value.values()
-        )
-    if isinstance(value, list | tuple | set | frozenset):
-        return any(_value_contains_path(item) for item in value)
-    return False
-
-
-def _validate_config_has_no_paths(config: Any) -> None:
-    if isinstance(config, BaseModel):
-        bad_fields = [
-            name
-            for name, field in type(config).model_fields.items()
-            if _annotation_contains_path(field.annotation)
-            or _value_contains_path(getattr(config, name))
-        ]
-        if bad_fields:
-            fields = ", ".join(sorted(bad_fields))
-            raise TypeError(
-                f"Config fields must not contain Path values ({fields}); put input locations "
-                "in Args and fingerprint their content with KeySpec.files."
-            )
-        return
-    if _value_contains_path(config):
-        raise TypeError(
-            "Config fields must not contain Path values; put input locations in Args and "
-            "fingerprint their content with KeySpec.files."
-        )
-
-
-def compute_source_dependencies(
-    stage_spec: StageSpecLike,
-    *,
-    auto_uses_packages: tuple[str, ...] | None = None,
-    inspection: SourceInspectionSession | None = None,
-) -> SourceDependencies:
-    inspection = inspection or SourceInspectionSession()
-    discovered = discover_source_dependencies(
-        stage_spec.func,
-        explicit_uses=stage_spec.uses,
-        auto_uses=stage_spec.auto_uses,
-        packages=auto_uses_packages,
-        inspection=inspection,
-    )
-    return discovered.with_component("stage", inspection.inspect_callable(stage_spec.func).digest)
-
-
 def compute_key_components(
     stage_spec: StageSpecLike,
     ctx: Any,
     upstream_keys: Mapping[str, str],
-    cached_files: Mapping[str, list[FileFingerprint]] | None = None,
+    cached_inputs: Mapping[str, list[FileFingerprint]] | None = None,
     *,
     config_access: list[str] | None = None,
-    auto_uses_packages: tuple[str, ...] | None = None,
-    source_dependencies: SourceDependencies | None = None,
+    dependencies: Dependencies | None = None,
     fingerprint_session: FingerprintSession | None = None,
 ) -> KeyComponents:
     """Assemble a stage's key components.
@@ -144,49 +61,50 @@ def compute_key_components(
     changes.
     """
 
-    _validate_config_has_no_paths(ctx.config)
-    source_result = source_dependencies or compute_source_dependencies(
-        stage_spec,
-        auto_uses_packages=auto_uses_packages,
-    )
-
     config = project_config(config_data(ctx.config), config_access)
+    dependencies = dependencies or stage_spec.depends
+    dependency_ctx = DependencyContext(
+        config=ctx.config,
+        out=ctx.out,
+        cell=ctx.cell,
+        cell_out=ctx.cell_out,
+    )
     files = files_fingerprints(
-        ctx,
-        stage_spec.keyspec.files,
-        cached_by_name=cached_files,
+        dependency_ctx,
+        dependencies.inputs,
+        cached_by_name=cached_inputs,
         session=fingerprint_session,
     )
-    values = {name: getter(ctx) for name, getter in sorted(stage_spec.keyspec.values.items())}
+    values = {name: getter(dependency_ctx) for name, getter in sorted(dependencies.values.items())}
     if stage_spec.cell:
         if _MATRIX_LAYOUT_KEY in values:
-            raise ValueError(f"KeySpec.values name {_MATRIX_LAYOUT_KEY!r} is reserved by varve")
+            raise ValueError(
+                f"Dependencies.values name {_MATRIX_LAYOUT_KEY!r} is reserved by varve"
+            )
         values[_MATRIX_LAYOUT_KEY] = _MATRIX_LAYOUT_VERSION
     need_cells = getattr(stage_spec, "need_cells", None) or {}
     has_matrix_fan_in = any(len(names) > 1 for names in need_cells.values())
     upstreams = {
         name: {
-            "content_key": upstream_keys[name],
+            "artifact_fingerprint": upstream_keys[name],
             **({"position": str(index)} if has_matrix_fan_in else {}),
         }
         for index, name in enumerate(stage_spec.needs)
     }
 
     return KeyComponents(
-        source=source_result.components,
         config=config,
-        files=files,
+        inputs=files,
         values=values,
         upstreams=upstreams,
         config_access=config_access,
     )
 
 
-def content_key(components: KeyComponents) -> str:
+def input_key(components: KeyComponents) -> str:
     digest_view = {
-        "source": components.source,
         "config": components.config,
-        "files": file_digest_view(components.files),
+        "inputs": file_digest_view(components.inputs),
         "values": components.values,
         "upstreams": components.upstreams,
     }

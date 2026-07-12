@@ -13,7 +13,7 @@ from varve.style import VarveStatusHighlighter, format_elapsed, status_text
 
 def test_status_text_uses_semantic_style() -> None:
     assert status_text("hit").style == "green"
-    assert status_text("dirty").style == "red"
+    assert status_text("failed").style == "red"
 
 
 def test_status_text_unknown_status_is_unstyled() -> None:
@@ -46,13 +46,13 @@ def test_dependency_styles_are_available_from_shared_theme() -> None:
 
 def test_highlighter_maps_tokens_to_theme_styles() -> None:
     highlighter = VarveStatusHighlighter()
-    text = Text("run done no-cache artifact-missing")
+    text = Text("run done needs-run failed")
     highlighter.highlight(text)
     spans = {text.plain[span.start : span.end]: span.style for span in text.spans}
     assert spans["run"] == "varve.run"
     assert spans["done"] == "varve.done"
-    assert spans["no-cache"] == "varve.no_cache"
-    assert spans["artifact-missing"] == "varve.artifact_missing"
+    assert spans["needs-run"] == "varve.needs_run"
+    assert spans["failed"] == "varve.failed"
 
 
 def test_highlighter_marks_stage_name() -> None:
