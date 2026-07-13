@@ -20,6 +20,7 @@ from varve.engine.state import Status, aggregate_status
 from varve.matrix import build_graph
 from varve.models import SuccessRecord
 from varve.pipeline import Pipeline
+from varve.status import legacy_source_review
 
 
 def load_state(entry: PipelineEntry, session: _KeyingSession | None = None) -> PipelineState:
@@ -78,7 +79,7 @@ def load_state(entry: PipelineEntry, session: _KeyingSession | None = None) -> P
                     else f"{probe.failure.exception_type}: {probe.failure.message}"
                 ),
                 upstreams=list(graph.stages[name].needs),
-                source_review=probe.source_review,
+                source_review=legacy_source_review(probe.source_review),
             )
         )
 

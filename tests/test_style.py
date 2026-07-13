@@ -13,6 +13,7 @@ from varve.style import VarveStatusHighlighter, format_elapsed, status_text
 
 def test_status_text_uses_semantic_style() -> None:
     assert status_text("hit").style == "green"
+    assert status_text("needs-review").style == "bold yellow"
     assert status_text("failed").style == "red"
 
 
@@ -44,13 +45,26 @@ def test_dependency_styles_are_available_from_shared_theme() -> None:
         assert style._THEME.styles[f"varve.dependency.{kind}"]
 
 
+def test_review_styles_are_available_from_shared_theme() -> None:
+    assert style.REVIEW_STYLES["accept_action"] == "green"
+    assert style.REVIEW_STYLES["reject_action"] == "yellow"
+    assert style.REVIEW_STYLES["reject_action"] != "red"
+    assert style.REVIEW_STYLES["module"] == "blue"
+    assert style.REVIEW_STYLES["stage"] == "cyan"
+    assert style.REVIEW_STYLES["noop"] == "dim"
+    assert style.REVIEW_STYLES["error"] == "red"
+    for name in style.REVIEW_STYLES:
+        assert style._THEME.styles[f"varve.review.{name}"]
+
+
 def test_highlighter_maps_tokens_to_theme_styles() -> None:
     highlighter = VarveStatusHighlighter()
-    text = Text("run done needs-run failed")
+    text = Text("run done needs-review needs-run failed")
     highlighter.highlight(text)
     spans = {text.plain[span.start : span.end]: span.style for span in text.spans}
     assert spans["run"] == "varve.run"
     assert spans["done"] == "varve.done"
+    assert spans["needs-review"] == "varve.needs_review"
     assert spans["needs-run"] == "varve.needs_run"
     assert spans["failed"] == "varve.failed"
 

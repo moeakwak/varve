@@ -8,12 +8,28 @@ from pathlib import Path
 from typing import Any, Literal
 
 from varve.engine.runner import probe_pipeline
-from varve.engine.state import STATUS_SEVERITY, Status, aggregate_status
+from varve.engine.state import (
+    STATUS_SEVERITY,
+    SourceReviewState,
+    Status,
+    aggregate_status,
+)
 from varve.matrix import PipelineGraph, build_graph
 from varve.models import FileFingerprint
 from varve.pipeline import Pipeline
 
 SourceChange = Literal["changed", "added", "removed"]
+LegacySourceReview = Literal["confirmed", "pending", "accepted", "rerun-required"]
+
+
+def legacy_source_review(state: SourceReviewState) -> LegacySourceReview:
+    """Adapt engine review state for the pre-Phase-3 status/dashboard views."""
+
+    if state.relationship != "changed":
+        return "confirmed"
+    if state.decision == "none":
+        return "pending"
+    return "accepted" if state.decision == "accept" else "rerun-required"
 
 
 @dataclass(frozen=True)
@@ -48,7 +64,7 @@ class StageStatus:
     source_changes: dict[str, SourceChange]
     unavailable_reason: str | None
     failure: str | None = None
-    source_review: str = "confirmed"
+    source_review: LegacySourceReview = "confirmed"
 
 
 @dataclass(frozen=True)
@@ -180,6 +196,7 @@ def collect_pipeline_status(
     )
     stages: list[StageStatus] = []
     for probe in selected_probes:
+        legacy_review = legacy_source_review(probe.source_review)
         spec = graph.stages[probe.stage]
         components = probe.components
         key_inputs = (
@@ -194,7 +211,7 @@ def collect_pipeline_status(
         )
         previous = probe.previous
         source_changes: dict[str, SourceChange] = {}
-        if probe.source_review == "pending" and previous is not None:
+        if legacy_review == "pending" and previous is not None:
             old_files = {
                 item.path: item.digest for item in previous.executed_source_fingerprint.files
             }
@@ -225,7 +242,7 @@ def collect_pipeline_status(
                     if probe.failure is None
                     else f"{probe.failure.exception_type}: {probe.failure.message}"
                 ),
-                source_review=probe.source_review,
+                source_review=legacy_review,
             )
         )
     return PipelineStatus(

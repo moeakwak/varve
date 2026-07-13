@@ -9,7 +9,14 @@ import pytest
 from pydantic import BaseModel
 
 from varve import Dependencies, Pipeline, batch_stage, stage
-from varve.engine.runner import evaluate_state, probe_pipeline, run, selected_stages
+from varve.engine.runner import (
+    evaluate_state,
+    probe_pipeline,
+    record_source_review,
+    run,
+    selected_stages,
+)
+from varve.models import BatchRecord, SourceFingerprint
 from varve.store.store import Store
 
 
@@ -140,6 +147,89 @@ class NakedYieldBatchPipeline(Pipeline):
 
 def _out(base: Path) -> Path:
     return base / "main"
+
+
+@pytest.mark.parametrize("mode", ["force", "reject"])
+def test_batch_restart_clears_all_partial_before_attempt_and_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    events: list[str] = []
+    interrupt = False
+
+    class RestartBatch(Pipeline):
+        Config = Config
+
+        @batch_stage()
+        async def build(self, ctx):
+            events.append("body")
+            if interrupt:
+                raise KeyboardInterrupt
+            async for index, item in ctx.resume([0], progress=False):
+                path = ctx.out / f"part-{index}.txt"
+                path.write_text(str(item), encoding="utf-8")
+                yield path
+
+    run(RestartBatch, Config(), cli_out=tmp_path)
+    store = Store(_out(tmp_path))
+    if mode == "reject":
+        previous = store.read_success("build")
+        assert previous is not None
+        store.write_success(
+            previous.model_copy(
+                update={
+                    "executed_source_fingerprint": SourceFingerprint(
+                        fingerprint="old-source",
+                        files=[],
+                    )
+                }
+            )
+        )
+        record_source_review(
+            RestartBatch,
+            Config(),
+            decision="reject",
+            cli_out=tmp_path,
+        )
+    store.write_batch(
+        "build",
+        "old-key",
+        BatchRecord(
+            index=0,
+            yielded=[],
+            artifacts=[],
+            committed_at="test",
+            total=1,
+        ),
+    )
+    assert (store.root / "partial" / "build" / "old-key").exists()
+    events.clear()
+    interrupt = True
+    original_clear = Store.clear_partial
+    original_attempt = Store.write_attempt
+
+    def tracked_clear(self, stage, input_key=None):
+        result = original_clear(self, stage, input_key)
+        if stage == "build":
+            events.append(f"clear:{input_key}")
+        return result
+
+    def tracked_attempt(self, stage, marker):
+        result = original_attempt(self, stage, marker)
+        if stage == "build":
+            events.append("attempt")
+        return result
+
+    monkeypatch.setattr(Store, "clear_partial", tracked_clear)
+    monkeypatch.setattr(Store, "write_attempt", tracked_attempt)
+
+    with pytest.raises(KeyboardInterrupt):
+        run(RestartBatch, Config(), cli_out=tmp_path, force=mode == "force")
+
+    assert events == ["clear:None", "attempt", "body"]
+    assert not (store.root / "partial" / "build").exists()
+    assert store.read_attempt("build") is not None
 
 
 def test_selected_stages() -> None:

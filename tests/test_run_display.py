@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 from pydantic import BaseModel
@@ -19,6 +20,14 @@ from varve.engine.run_display import (
     outcome_rows,
 )
 from varve.engine.runner import run
+from varve.engine.state import (
+    ExecutionStatus,
+    SourceReviewState,
+    aggregate_effective_status,
+    aggregate_execution_status,
+    effective_reason,
+    effective_status,
+)
 from varve.matrix import build_graph
 from varve.models import (
     ArtifactFingerprint,
@@ -44,6 +53,20 @@ class LargeMatrix(Pipeline):
     @stage()
     def work(self, ctx: Ctx, *, item: str) -> None:
         pass
+
+
+def test_execution_and_effective_statuses_are_orthogonal() -> None:
+    assert get_type_hints(StageOutcome)["status"] == ExecutionStatus
+    assert SourceReviewState("current", "accept") == SourceReviewState("current")
+    assert aggregate_execution_status(("hit", "failed", "needs-run")) == "failed"
+    assert aggregate_effective_status(("error", "needs-review")) == "needs-review"
+    assert effective_status("error", SourceReviewState("changed")) == "needs-review"
+    assert effective_reason("artifact-missing", SourceReviewState("changed")) == "source-changed"
+    assert effective_status("hit", SourceReviewState("changed", "accept")) == "hit"
+    assert effective_reason("artifact-missing", SourceReviewState("changed", "accept")) == (
+        "artifact-missing"
+    )
+    assert effective_status("failed", SourceReviewState("changed", "reject")) == "needs-run"
 
 
 def _record(stage: str, *, elapsed: float) -> SuccessRecord:
@@ -126,7 +149,7 @@ def test_compact_reporter_finishes_non_contiguous_group_by_count(caplog) -> None
 
     # Completion depends on the selected-cell count, not adjacency in the
     # caller's event stream.
-    reporter.record(plan.outcome(stages[-1], "needs-run", "source-change", 0.25))
+    reporter.record(plan.outcome(stages[-1], "needs-run", "source-changed", 0.25))
     messages = [record.getMessage() for record in caplog.records]
     assert "[work] start · 8 cells" in messages
     assert "[work] done · 8 cells · 7 hit, 1 needs-run · ran 1 · 0.25s" in messages
@@ -210,7 +233,7 @@ def test_compact_cli_outcome_table_styles_each_status_token(
         StageOutcome(
             "work@item=1",
             "needs-run",
-            "source-change",
+            "source-changed",
             0.5,
             display_base="work",
             display_compact=True,
@@ -268,12 +291,12 @@ def test_compact_failure_always_logs_concrete_cell(tmp_path: Path, caplog) -> No
 def test_non_matrix_outcome_rows_remain_one_row_per_stage() -> None:
     outcomes = [
         StageOutcome("prepare", "hit", "hit", None),
-        StageOutcome("finish", "no-cache", "no cache", 0.5),
+        StageOutcome("finish", "needs-run", "no-cache", 0.5),
     ]
 
     rows = outcome_rows(outcomes)
 
     assert [(row.stage, row.status, row.grouped) for row in rows] == [
         ("prepare", "hit", False),
-        ("finish", "no-cache", False),
+        ("finish", "needs-run", False),
     ]

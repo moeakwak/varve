@@ -7,6 +7,7 @@ import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from difflib import get_close_matches
 from enum import Enum
 from graphlib import TopologicalSorter
 from itertools import product
@@ -87,6 +88,25 @@ class Cell(Mapping[str, Any]):
 
 
 @dataclass(frozen=True)
+class ResolvedStageSelector:
+    """One validated selector and its active concrete stage seeds."""
+
+    text: str
+    canonical: str
+    base_stage: str
+    coordinates: tuple[tuple[str, str], ...]
+    concrete_stages: tuple[str, ...]
+
+    @property
+    def is_concrete(self) -> bool:
+        return len(self.concrete_stages) == 1 and self.canonical == self.concrete_stages[0]
+
+    @property
+    def matched_count(self) -> int:
+        return len(self.concrete_stages)
+
+
+@dataclass(frozen=True)
 class PipelineGraph:
     """An immutable concrete stage graph expanded for one branch axis domain."""
 
@@ -100,11 +120,89 @@ class PipelineGraph:
         return list(TopologicalSorter(dependencies).static_order())
 
     def names_for(self, name: str) -> tuple[str, ...]:
-        if name in self.base_cells:
-            return self.base_cells[name]
-        if name in self.stages:
-            return (name,)
-        raise ValueError(f"Unknown varve stage: {name}")
+        return self.resolve_selector(name).concrete_stages
+
+    def resolve_selector(self, text: str) -> ResolvedStageSelector:
+        """Resolve an ordinary, Matrix base, partial, or concrete selector."""
+
+        if not text or text.count("@") > 1:
+            raise ValueError(f"Invalid stage selector {text!r}")
+        base_stage, separator, raw_coordinates = text.partition("@")
+        templates = self.pipeline.stages()
+        template = templates.get(base_stage)
+        if template is None:
+            suggestions = get_close_matches(base_stage, templates, n=1)
+            hint = f"; did you mean {suggestions[0]!r}?" if suggestions else ""
+            raise ValueError(f"Unknown varve stage: {base_stage!r}{hint}")
+
+        declared_axes = tuple(template.matrix)
+        if separator and not declared_axes:
+            raise ValueError(f"Ordinary stage {base_stage!r} does not accept coordinates")
+        if separator and not raw_coordinates:
+            raise ValueError(f"Invalid stage selector {text!r}: coordinates are empty")
+
+        supplied: dict[str, str] = {}
+        if separator:
+            for coordinate in raw_coordinates.split(","):
+                axis_name, equals, value_id = coordinate.partition("=")
+                if not equals or not axis_name or not value_id or "=" in value_id:
+                    raise ValueError(
+                        f"Invalid stage selector {text!r}: expected AXIS=VALUE coordinates"
+                    )
+                if axis_name in supplied:
+                    raise ValueError(f"Duplicate axis {axis_name!r} in stage selector {text!r}")
+                supplied[axis_name] = value_id
+
+        axes_by_name = {axis.name: axis for axis in declared_axes}
+        unknown_axes = [name for name in supplied if name not in axes_by_name]
+        if unknown_axes:
+            raise ValueError(
+                f"Unknown axis {unknown_axes[0]!r} for stage {base_stage!r}; "
+                f"available axes: {list(axes_by_name)!r}"
+            )
+        for axis_name, value_id in supplied.items():
+            axis = axes_by_name[axis_name]
+            if value_id not in axis.ids:
+                raise ValueError(
+                    f"Unknown value {value_id!r} for axis {axis_name!r}; "
+                    f"active values: {list(self.axes[axis_name])!r}"
+                )
+            if value_id not in self.axes[axis_name]:
+                raise ValueError(
+                    f"Value {value_id!r} for axis {axis_name!r} is declared but inactive; "
+                    f"active values: {list(self.axes[axis_name])!r}"
+                )
+
+        coordinates = tuple(
+            (axis.name, supplied[axis.name]) for axis in declared_axes if axis.name in supplied
+        )
+        canonical = base_stage
+        if coordinates:
+            canonical += "@" + ",".join(f"{name}={value}" for name, value in coordinates)
+        matches = []
+        for stage_name in self.base_cells[base_stage]:
+            spec = self.stages[stage_name]
+            cell = {axis.name: axis.id_of(value) for axis, value in spec.cell}
+            if all(cell.get(axis_name) == value_id for axis_name, value_id in coordinates):
+                matches.append(stage_name)
+        if not matches:
+            raise ValueError(f"Stage selector {canonical!r} matches no active cells")
+        topology = {name: index for index, name in enumerate(self.topo_order())}
+        matches.sort(key=topology.__getitem__)
+        return ResolvedStageSelector(
+            text=text,
+            canonical=canonical,
+            base_stage=base_stage,
+            coordinates=coordinates,
+            concrete_stages=tuple(matches),
+        )
+
+    def resolve_selectors(self, texts: Sequence[str]) -> tuple[str, ...]:
+        """Validate all selectors, then return their stable topology-order union."""
+
+        resolved = tuple(self.resolve_selector(text) for text in texts)
+        selected = {stage for selector in resolved for stage in selector.concrete_stages}
+        return tuple(name for name in self.topo_order() if name in selected)
 
     def selected(
         self,
@@ -133,11 +231,11 @@ class PipelineGraph:
             return seen
 
         if only is not None:
-            selected = set(self.names_for(only))
+            selected = set(self.resolve_selector(only).concrete_stages)
         elif downstream is not None:
-            selected = closure(self.names_for(downstream), descendants)
+            selected = closure(self.resolve_selector(downstream).concrete_stages, descendants)
         elif upto is not None:
-            selected = closure(self.names_for(upto), ancestors)
+            selected = closure(self.resolve_selector(upto).concrete_stages, ancestors)
         else:
             selected = set(self.stages)
         if not slices:

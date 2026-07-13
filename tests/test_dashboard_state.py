@@ -9,7 +9,7 @@ from varve import Pipeline, stage
 from varve.dashboard.models import PipelineEntry
 from varve.dashboard.state import load_state
 from varve.engine.runner import StageProbe, run
-from varve.engine.state import Decision
+from varve.engine.state import Decision, SourceReviewState
 from varve.models import (
     ArtifactFingerprint,
     KeyComponents,
@@ -17,6 +17,7 @@ from varve.models import (
     SourceFingerprint,
     SuccessRecord,
 )
+from varve.status import legacy_source_review
 from varve.store.store import Store
 
 
@@ -86,8 +87,25 @@ def _probe(stage: str, decision: Decision, previous: SuccessRecord | None) -> St
         components=None,
         previous=previous,
         source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
-        source_review="confirmed",
+        source_review=SourceReviewState("current"),
     )
+
+
+@pytest.mark.parametrize(
+    ("state", "legacy"),
+    [
+        (SourceReviewState("not-applicable"), "confirmed"),
+        (SourceReviewState("current"), "confirmed"),
+        (SourceReviewState("changed"), "pending"),
+        (SourceReviewState("changed", "accept"), "accepted"),
+        (SourceReviewState("changed", "reject"), "rerun-required"),
+    ],
+)
+def test_legacy_source_review_is_converted_only_at_the_view_boundary(
+    state: SourceReviewState,
+    legacy: str,
+) -> None:
+    assert legacy_source_review(state) == legacy
 
 
 def test_load_state_uses_engine_outcomes_and_topo_order(

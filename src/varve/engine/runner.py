@@ -16,13 +16,26 @@ from typing import Any
 from varve.context import Ctx, StageDisplay
 from varve.decorators import ProducesItem, ProducesSpec
 from varve.dependencies import merge_dependencies
+from varve.engine.review import (
+    ReviewAction,
+    ReviewCandidate,
+    SourceReviewResult,
+    apply_review_writes,
+    plan_review_writes,
+    plan_source_review,
+)
 from varve.engine.run_display import (
     RunDisplayMode,
     RunReporter,
     StageOutcome,
     build_run_display_plan,
 )
-from varve.engine.state import Decision, decide_batch, decide_single
+from varve.engine.state import (
+    Decision,
+    SourceReviewState,
+    decide_batch,
+    decide_single,
+)
 from varve.keying.config_access import ConfigAccess, RecordingConfig, project_config
 from varve.keying.fingerprint import (
     FingerprintSession,
@@ -62,7 +75,7 @@ class StageProbe:
     components: KeyComponents | None
     previous: SuccessRecord | None
     source_fingerprint: SourceFingerprint
-    source_review: str
+    source_review: SourceReviewState
     failure: FailureRecord | None = None
     unavailable_reason: str | None = None
 
@@ -74,18 +87,11 @@ class _KeyingSession:
     fingerprints: FingerprintSession = field(default_factory=FingerprintSession)
     sources: SourceFingerprintSession = field(default_factory=SourceFingerprintSession)
     records: dict[tuple[Path, str], SuccessRecord | object] = field(default_factory=dict)
+    reviews: dict[tuple[Path, str], ReviewRecord | object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.fingerprints.force_rehash:
             self.sources.force_rehash = True
-
-    def fresh_observations(self) -> _KeyingSession:
-        """Share static source inspection while starting fresh mutable observations."""
-
-        return _KeyingSession(
-            fingerprints=FingerprintSession(force_rehash=self.fingerprints.force_rehash),
-            sources=self.sources,
-        )
 
     def refresh_fingerprints(self) -> None:
         """Discard filesystem observations after a successful stage."""
@@ -98,6 +104,7 @@ class _KeyingSession:
         self.fingerprints = FingerprintSession(force_rehash=self.fingerprints.force_rehash)
         self.sources = SourceFingerprintSession(force_rehash=self.sources.force_rehash)
         self.records.clear()
+        self.reviews.clear()
 
     def read_success(self, store: Store, stage: str) -> SuccessRecord | None:
         key = (store.root, stage)
@@ -115,6 +122,15 @@ class _KeyingSession:
     def discard_success(self, store: Store, stage: str) -> None:
         self.records.pop((store.root, stage), None)
 
+    def read_review(self, store: Store, stage: str) -> ReviewRecord | None:
+        key = (store.root, stage)
+        cached = self.reviews.get(key, _RECORD_UNOBSERVED)
+        if cached is _RECORD_UNOBSERVED:
+            record = store.read_review(stage)
+            self.reviews[key] = _RECORD_MISSING if record is None else record
+            return record
+        return None if cached is _RECORD_MISSING else cached  # type: ignore[return-value]
+
     def source_fingerprint(
         self,
         pipeline_type: type[Pipeline],
@@ -122,7 +138,7 @@ class _KeyingSession:
         store: Store,
     ) -> SourceFingerprint:
         cached: list[SourceFingerprint] = []
-        review = store.read_review(stage_spec.name)
+        review = self.read_review(store, stage_spec.name)
         if review is not None:
             cached.append(review.source_observation)
         previous = self.read_success(store, stage_spec.name)
@@ -327,13 +343,16 @@ def _source_review(
     stage_name: str,
     previous: SuccessRecord | None,
     current: SourceFingerprint,
-) -> str:
-    if previous is None or previous.executed_source_fingerprint.fingerprint == current.fingerprint:
-        return "confirmed"
-    review = store.read_review(stage_name)
+    keying_session: _KeyingSession,
+) -> SourceReviewState:
+    if previous is None:
+        return SourceReviewState("not-applicable")
+    if previous.executed_source_fingerprint.fingerprint == current.fingerprint:
+        return SourceReviewState("current")
+    review = keying_session.read_review(store, stage_name)
     if review is None or review.source_fingerprint != current.fingerprint:
-        return "pending"
-    return "accepted" if review.decision == "accept" else "rerun-required"
+        return SourceReviewState("changed")
+    return SourceReviewState("changed", review.decision)
 
 
 def _stage_sets(
@@ -397,59 +416,6 @@ def _upstream_keys(
         else:
             keys[name] = record.artifact_fingerprint
     return keys
-
-
-def _validate_external_upstreams(
-    pipeline_type: type[Pipeline],
-    graph: PipelineGraph,
-    selected: set[str],
-    store: Store,
-    out: Path,
-    config: Any,
-    args: Any,
-    keying_session: _KeyingSession,
-) -> None:
-    validation_session = keying_session.fresh_observations()
-    stages = graph.stages
-    external = {
-        upstream
-        for stage_name in selected
-        for upstream in stages[stage_name].needs
-        if upstream not in selected
-    }
-    if not external:
-        return
-    ancestors, _ = _stage_sets(graph)
-    validation_stages: set[str] = set()
-    for upstream in external:
-        validation_stages.update(_closure(upstream, ancestors))
-    for stage_name in graph.topo_order():
-        if stage_name not in external:
-            continue
-        attempt = store.read_attempt(stage_name)
-        record = validation_session.read_success(store, stage_name)
-        if attempt is not None:
-            raise ValueError(f"Upstream stage has an unfinished attempt: {stage_name}")
-        if record is None:
-            raise ValueError(f"Upstream stage has not been built: {stage_name}")
-        if not _success_outputs_exist(record, out):
-            raise ValueError(f"Upstream stage artifacts are missing: {stage_name}")
-    probes = probe_pipeline(
-        pipeline_type,
-        config,
-        args=args,
-        out=out,
-        graph=graph,
-        _keying_session=validation_session,
-        _stage_names=validation_stages,
-    )
-    for probe in probes:
-        decision = probe.decision
-        if decision.status != "hit":
-            raise ValueError(
-                f"Upstream stage is not current: {probe.stage} "
-                f"({decision.status}: {decision.reason})"
-            )
 
 
 def _batch_outputs_from_records(
@@ -567,12 +533,13 @@ def _probe_stage(
 ) -> StageProbe:
     stage_spec = graph.stages[stage_name]
     previous = keying_session.read_success(store, stage_name)
-    review = _source_review(store, stage_name, previous, source_fingerprint)
+    review = _source_review(store, stage_name, previous, source_fingerprint, keying_session)
     upstream_keys = _upstream_keys(stage_spec, store, keying_session, known_upstream_fingerprints)
     cached_inputs = previous.key_components.inputs if previous is not None else None
     previous_access = (
         previous.key_components.config_access
-        if previous is not None and review != "rerun-required"
+        if previous is not None
+        and not (review.relationship == "changed" and review.decision == "reject")
         else None
     )
     ctx_for_key = Ctx(
@@ -634,8 +601,6 @@ def _probe_stage(
             artifacts_match=artifacts_match,
             failure=failure,
         )
-    if review == "rerun-required":
-        decision = Decision("needs-run", "source-change")
     return StageProbe(
         stage=stage_name,
         decision=decision,
@@ -690,7 +655,7 @@ def probe_pipeline(
                     components=None,
                     previous=keying_session.read_success(store, stage_name),
                     source_fingerprint=SourceFingerprint(fingerprint="error", files=[]),
-                    source_review="confirmed",
+                    source_review=SourceReviewState("not-applicable"),
                     unavailable_reason=str(error),
                 )
             )
@@ -705,7 +670,7 @@ def probe_pipeline(
                     components=None,
                     previous=None,
                     source_fingerprint=source_fingerprint,
-                    source_review="confirmed",
+                    source_review=SourceReviewState("not-applicable"),
                     unavailable_reason=(
                         f"store schema {manifest.schema_version} must be rebuilt as "
                         f"schema {SCHEMA_VERSION}"
@@ -727,13 +692,19 @@ def probe_pipeline(
                     components=None,
                     previous=previous,
                     source_fingerprint=source_fingerprint,
-                    source_review=_source_review(store, stage_name, previous, source_fingerprint),
+                    source_review=_source_review(
+                        store,
+                        stage_name,
+                        previous,
+                        source_fingerprint,
+                        keying_session,
+                    ),
                     unavailable_reason=f"upstream {missing_upstream} has no success record",
                 )
             )
             continue
         previous = keying_session.read_success(store, stage_name)
-        review = _source_review(store, stage_name, previous, source_fingerprint)
+        review = _source_review(store, stage_name, previous, source_fingerprint, keying_session)
         try:
             probe = _probe_stage(
                 pipeline_type,
@@ -818,17 +789,9 @@ async def _drive(
         reporter = RunReporter(display_plan, logging.getLogger("varve"))
     else:
         display_plan = reporter.plan
+    preflight_by_stage: dict[str, StageProbe] = {}
+    execution_source_reviews: dict[str, SourceReviewState] = {}
     if execute:
-        _validate_external_upstreams(
-            pipeline_type,
-            graph,
-            selected,
-            store,
-            out,
-            config,
-            args,
-            keying_session,
-        )
         ancestors, _ = _stage_sets(graph)
         preflight_names = set(selected)
         for selected_name in selected:
@@ -839,16 +802,72 @@ async def _drive(
             args=args,
             out=out,
             graph=graph,
-            _keying_session=keying_session.fresh_observations(),
+            _keying_session=keying_session,
             _stage_names=preflight_names,
         )
-        pending = [probe.stage for probe in preflight if probe.source_review == "pending"]
+        preflight_by_stage = {probe.stage: probe for probe in preflight}
+        pending_all = [
+            probe.stage
+            for probe in preflight
+            if probe.source_review.relationship == "changed"
+            and probe.source_review.decision == "none"
+        ]
+        if pending_all and not force:
+            raise ReviewRequiredError(pending_all)
+        external = preflight_names.difference(selected)
+        pending_external = [stage for stage in pending_all if stage in external]
+        if pending_external:
+            raise ReviewRequiredError(pending_external)
         errors = [probe for probe in preflight if probe.decision.status == "error"]
         if errors:
             details = "; ".join(f"{probe.stage}: {probe.decision.reason}" for probe in errors)
             raise ValueError(f"Cannot evaluate selected stages: {details}")
-        if pending:
-            raise ReviewRequiredError(pending)
+        unavailable_external = [
+            probe
+            for probe in preflight
+            if probe.stage in external
+            and (
+                probe.decision.status != "hit"
+                or (
+                    probe.source_review.relationship == "changed"
+                    and probe.source_review.decision == "reject"
+                )
+            )
+        ]
+        if unavailable_external:
+            details = "; ".join(
+                f"{probe.stage}: "
+                + (
+                    "needs-run: source-changed"
+                    if probe.source_review.relationship == "changed"
+                    and probe.source_review.decision == "reject"
+                    else f"{probe.decision.status}: {probe.decision.reason}"
+                )
+                for probe in unavailable_external
+            )
+            raise ValueError(f"Upstream stage is not current: {details}")
+        if force:
+            candidates = tuple(
+                ReviewCandidate(
+                    stage=probe.stage,
+                    base_stage=graph.stages[probe.stage].base_name or probe.stage,
+                    source_fingerprint=probe.source_fingerprint,
+                    source_review=probe.source_review,
+                )
+                for probe in preflight
+                if probe.stage in selected
+            )
+            writes = plan_review_writes(candidates, "reject")
+            apply_review_writes(store, writes, _now())
+        execution_source_reviews = {
+            probe.stage: (
+                SourceReviewState("changed", "reject")
+                if force and probe.source_review.relationship == "changed"
+                else probe.source_review
+            )
+            for probe in preflight
+            if probe.stage in selected
+        }
 
     instance = pipeline_type()
     outcomes: list[StageOutcome] = []
@@ -906,14 +925,15 @@ async def _drive(
             outcomes.append(outcome)
             reporter.record(outcome)
             continue
-        source_fingerprint = keying_session.source_fingerprint(pipeline_type, stage_spec, store)
+        source_fingerprint = preflight_by_stage[stage_name].source_fingerprint
         upstream_keys = _upstream_keys(stage_spec, store, keying_session)
         previous = keying_session.read_success(store, stage_name)
-        review = _source_review(store, stage_name, previous, source_fingerprint)
+        review = execution_source_reviews[stage_name]
         cached_inputs = previous.key_components.inputs if previous is not None else None
         previous_access = (
             previous.key_components.config_access
-            if previous is not None and review != "rerun-required"
+            if previous is not None
+            and not (review.relationship == "changed" and review.decision == "reject")
             else None
         )
         declared_needs = frozenset(stage_spec.logical_needs)
@@ -1021,7 +1041,12 @@ async def _drive(
                     out,
                     keying_session.fingerprints,
                 )
-                if review == "accepted" and probe_key != current_key and probe_partial:
+                if (
+                    review.relationship == "changed"
+                    and review.decision == "accept"
+                    and probe_key != current_key
+                    and probe_partial
+                ):
                     partial = dict(probe_partial)
                     partial.update(full_key_partial or {})
                     partial_adoption = (probe_key, current_key, partial)
@@ -1052,8 +1077,8 @@ async def _drive(
                 else Decision("needs-run", "retry-failed")
             )
 
-        if review == "rerun-required":
-            decision = Decision("needs-run", "source-change")
+        if review.relationship == "changed" and review.decision == "reject":
+            decision = Decision("needs-run", "source-changed")
         if force:
             decision = Decision("needs-run", "forced")
         if execute and decision.status == "hit":
@@ -1076,6 +1101,11 @@ async def _drive(
             for batch in adopted.values():
                 store.write_batch(stage_name, new_key, batch)
             store.clear_partial(stage_name, old_key)
+        if stage_spec.kind == "batch":
+            if force or (review.relationship == "changed" and review.decision == "reject"):
+                store.clear_partial(stage_name)
+            elif not decision.resume_skip:
+                store.clear_partial(stage_name, current_key)
         started = time.monotonic()
         reporter.lifecycle(stage_name, "run", decision.reason)
         reporter.input_key(stage_name, current_key)
@@ -1130,10 +1160,6 @@ async def _drive(
                 ),
             )
         else:
-            if force or review == "rerun-required":
-                store.clear_partial(stage_name)
-            elif not decision.resume_skip:
-                store.clear_partial(stage_name, current_key)
             partial_for_outputs = partial if decision.resume_skip else None
             outputs_by_index = _batch_outputs_from_records(
                 previous=None,
@@ -1335,7 +1361,7 @@ def record_source_review(
     pipeline: type[Pipeline],
     config: Any,
     *,
-    decision: str,
+    decision: ReviewAction,
     args: Any = None,
     targets: tuple[str, ...] = (),
     cli_out: Path | None = None,
@@ -1343,7 +1369,7 @@ def record_source_review(
     is_temporary: bool = False,
     axes: dict[str, tuple[str, ...]] | None = None,
     graph: PipelineGraph | None = None,
-) -> list[str]:
+) -> SourceReviewResult:
     """Atomically validate and record accept/reject decisions for source changes."""
 
     if decision not in {"accept", "reject"}:
@@ -1354,34 +1380,24 @@ def record_source_review(
     store = Store(out)
     with OutputLock(store.root):
         probes = probe_pipeline(pipeline, config, args=args, out=out, graph=graph)
-        by_name = {probe.stage: probe for probe in probes}
-        if targets:
-            names: list[str] = []
-            for target in targets:
-                names.extend(graph.names_for(target))
-            selected = list(dict.fromkeys(names))
-        else:
-            selected = [probe.stage for probe in probes if probe.source_review == "pending"]
-        if not selected:
-            raise ValueError("No source changes require review")
-        for name in selected:
-            probe = by_name.get(name)
-            if probe is None:
-                raise ValueError(f"Unknown varve stage: {name}")
-            if probe.previous is None or probe.source_review == "confirmed":
-                raise ValueError(f"Stage has no source changes: {name}")
-        now = _now()
-        for name in selected:
-            store.write_review(
-                name,
-                ReviewRecord(
-                    source_fingerprint=by_name[name].source_fingerprint.fingerprint,
-                    source_observation=by_name[name].source_fingerprint,
-                    decision=decision,
-                    decided_at=now,
-                ),
+        resolved_selectors = tuple(graph.resolve_selector(target) for target in targets)
+        candidates = tuple(
+            ReviewCandidate(
+                stage=probe.stage,
+                base_stage=graph.stages[probe.stage].base_name or probe.stage,
+                source_fingerprint=probe.source_fingerprint,
+                source_review=probe.source_review,
             )
-        return selected
+            for probe in probes
+        )
+        writes, result = plan_source_review(
+            graph,
+            resolved_selectors,
+            candidates,
+            decision,
+        )
+        apply_review_writes(store, writes, _now())
+        return result
 
 
 def evaluate_state(

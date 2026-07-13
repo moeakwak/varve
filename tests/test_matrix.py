@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 from pydantic import BaseModel
@@ -88,6 +90,91 @@ def test_branch_axis_domain_limits_expansion_without_reordering() -> None:
         "score@bench=a,model=large",
         "score@bench=b,model=large",
     )
+
+
+def test_stage_selector_resolves_ordinary_base_partial_and_concrete_stages() -> None:
+    graph = build_graph(MatrixPipeline)
+
+    ordinary = graph.resolve_selector("finish")
+    base = graph.resolve_selector("score")
+    partial = graph.resolve_selector("score@model=large")
+    concrete = graph.resolve_selector("score@model=large,bench=a")
+
+    assert ordinary.is_concrete
+    assert ordinary.concrete_stages == ("finish",)
+    assert not base.is_concrete
+    assert base.matched_count == 4
+    assert partial.concrete_stages == (
+        "score@bench=a,model=large",
+        "score@bench=b,model=large",
+    )
+    assert concrete.is_concrete
+    assert concrete.canonical == "score@bench=a,model=large"
+    assert concrete.coordinates == (("bench", "a"), ("model", "large"))
+
+
+def test_repeatable_stage_selectors_validate_then_form_a_topology_order_union() -> None:
+    graph = build_graph(MatrixPipeline)
+
+    assert graph.resolve_selectors(("score@model=large", "score@bench=a", "finish")) == (
+        "score@bench=a,model=small",
+        "score@bench=a,model=large",
+        "score@bench=b,model=large",
+        "finish",
+    )
+
+
+@pytest.mark.parametrize(
+    ("selector", "message"),
+    [
+        ("score@bench=a,bench=b", "Duplicate axis"),
+        ("score@unknown=a", "available axes"),
+        ("score@bench=missing", "Unknown value"),
+        ("finish@bench=a", "does not accept coordinates"),
+        ("score@bench", "expected AXIS=VALUE"),
+        ("finsh", "did you mean 'finish'"),
+    ],
+)
+def test_stage_selector_diagnostics(selector: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_graph(MatrixPipeline).resolve_selector(selector)
+
+
+def test_stage_selector_distinguishes_declared_but_inactive_values() -> None:
+    graph = build_graph(MatrixPipeline, {"model": ["large"]})
+
+    with pytest.raises(ValueError, match="declared but inactive"):
+        graph.resolve_selector("score@model=small")
+
+
+def test_stage_selector_rejects_zero_active_cell_matches() -> None:
+    graph = build_graph(MatrixPipeline)
+    empty = replace(
+        graph,
+        base_cells=MappingProxyType({**graph.base_cells, "score": ()}),
+    )
+
+    with pytest.raises(ValueError, match="matches no active cells"):
+        empty.resolve_selector("score")
+
+
+def test_partial_stage_selector_applies_requested_graph_closure() -> None:
+    graph = build_graph(MatrixPipeline)
+
+    assert graph.selected(only="score@bench=a") == {
+        "score@bench=a,model=small",
+        "score@bench=a,model=large",
+    }
+    assert graph.selected(upto="score@model=small,bench=a") == {
+        "source@bench=a",
+        "score@bench=a,model=small",
+    }
+    assert graph.selected(downstream="source@bench=a") == {
+        "source@bench=a",
+        "score@bench=a,model=small",
+        "score@bench=a,model=large",
+        "finish",
+    }
 
 
 def test_matrix_run_injects_coordinates_fans_in_and_isolates_outputs(tmp_path: Path) -> None:
@@ -507,8 +594,6 @@ def test_only_rejects_stale_external_upstream(tmp_path: Path) -> None:
             [
                 "source@bench=a",
                 "source@bench=b",
-                "source@bench=a",
-                "source@bench=b",
                 "score@bench=a,model=small",
                 "score@bench=a,model=large",
                 "score@bench=b,model=small",
@@ -526,12 +611,6 @@ def test_only_rejects_stale_external_upstream(tmp_path: Path) -> None:
                 "score@bench=a,model=large",
                 "score@bench=b,model=small",
                 "score@bench=b,model=large",
-                "source@bench=a",
-                "source@bench=b",
-                "score@bench=a,model=small",
-                "score@bench=a,model=large",
-                "score@bench=b,model=small",
-                "score@bench=b,model=large",
                 "finish",
             ],
         ),
@@ -540,8 +619,6 @@ def test_only_rejects_stale_external_upstream(tmp_path: Path) -> None:
             "score",
             (),
             [
-                "source@bench=a",
-                "source@bench=b",
                 "source@bench=a",
                 "source@bench=b",
                 "score@bench=a,model=small",

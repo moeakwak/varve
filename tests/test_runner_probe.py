@@ -14,7 +14,8 @@ from varve.engine import runner as runner_module
 from varve.engine.runner import _KeyingSession, evaluate_state, probe_pipeline, run
 from varve.keying.fingerprint import FingerprintSession, file_fingerprint
 from varve.keying.keys import input_key
-from varve.models import AttemptMarker
+from varve.keying.source import SourceFingerprintSession
+from varve.models import AttemptMarker, SourceFingerprint
 from varve.store.store import Store
 
 
@@ -309,7 +310,7 @@ def test_external_validation_probes_only_the_external_ancestor_closure(
         only="target",
     )
 
-    assert probed == ["ancestor", "external", "ancestor", "external", "target"]
+    assert probed == ["ancestor", "external", "target"]
     assert [(outcome.stage, outcome.status) for outcome in outcomes] == [("target", "needs-run")]
 
     probes = probe_pipeline(
@@ -457,7 +458,7 @@ def test_all_hit_matrix_cells_share_one_fingerprint_session(
     assert len(outcomes) == 97
     assert {outcome.status for outcome in outcomes} == {"hit"}
     assert len(sessions) >= 97
-    assert len({id(session) for session in sessions}) == 2
+    assert len({id(session) for session in sessions}) == 1
 
 
 def test_probe_reads_each_success_record_once(
@@ -482,6 +483,57 @@ def test_probe_reads_each_success_record_once(
 
     assert len(probes) == 4
     assert reads == {stage: 1 for stage in MatrixProbePipeline.graph().topo_order()}
+
+
+def test_forced_auto_reject_reuses_single_preflight_observations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run(ProbePipeline, Config(), cli_out=tmp_path)
+    store = Store(tmp_path / "main")
+    previous = store.read_success("sample")
+    assert previous is not None
+    store.write_success(
+        previous.model_copy(
+            update={
+                "executed_source_fingerprint": SourceFingerprint(
+                    fingerprint="old-source",
+                    files=[],
+                )
+            }
+        )
+    )
+    success_reads = 0
+    review_reads = 0
+    source_observations = 0
+    original_success = Store.read_success
+    original_review = Store.read_review
+    original_source = SourceFingerprintSession.fingerprint
+
+    def counted_success(self, stage):
+        nonlocal success_reads
+        success_reads += 1
+        return original_success(self, stage)
+
+    def counted_review(self, stage):
+        nonlocal review_reads
+        review_reads += 1
+        return original_review(self, stage)
+
+    def counted_source(self, *args, **kwargs):
+        nonlocal source_observations
+        source_observations += 1
+        return original_source(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "read_success", counted_success)
+    monkeypatch.setattr(Store, "read_review", counted_review)
+    monkeypatch.setattr(SourceFingerprintSession, "fingerprint", counted_source)
+
+    run(ProbePipeline, Config(), cli_out=tmp_path, force=True)
+
+    assert success_reads == 1
+    assert review_reads == 1
+    assert source_observations == 1
 
 
 def test_probe_reports_old_store_schema_without_rewriting_manifest(tmp_path: Path) -> None:

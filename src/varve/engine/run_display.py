@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal
 
-from varve.engine.state import STATUS_SEVERITY, Status
+from varve.engine.state import EXECUTION_STATUS_SEVERITY, ExecutionStatus
 from varve.matrix import PipelineGraph
 from varve.store.store import Store
 
@@ -24,7 +24,7 @@ AUTO_EXPAND_SLOW_SECONDS = 30.0
 @dataclass(frozen=True)
 class StageOutcome:
     stage: str
-    status: Status
+    status: ExecutionStatus
     reason: str
     elapsed: float | None
     display_base: str | None = None
@@ -64,7 +64,7 @@ class RunDisplayPlan:
     def outcome(
         self,
         stage: str,
-        status: Status,
+        status: ExecutionStatus,
         reason: str,
         elapsed: float | None,
     ) -> StageOutcome:
@@ -128,9 +128,11 @@ def build_run_display_plan(
     return RunDisplayPlan(tuple(groups), MappingProxyType(by_stage))
 
 
-def _status_counts(outcomes: list[StageOutcome]) -> tuple[tuple[Status, int], ...]:
+def _status_counts(
+    outcomes: list[StageOutcome],
+) -> tuple[tuple[ExecutionStatus, int], ...]:
     counts = Counter(outcome.status for outcome in outcomes)
-    return tuple((status, counts[status]) for status in STATUS_SEVERITY if counts[status])
+    return tuple((status, counts[status]) for status in EXECUTION_STATUS_SEVERITY if counts[status])
 
 
 def _status_distribution(outcomes: list[StageOutcome]) -> str:
@@ -201,7 +203,7 @@ class RunReporter:
 class RunOutcomeRow:
     stage: str
     status: str
-    status_counts: tuple[tuple[Status, int], ...]
+    status_counts: tuple[tuple[ExecutionStatus, int], ...]
     reason: str
     cells: int
     ran: int

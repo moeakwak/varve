@@ -20,11 +20,27 @@ from rich.theme import Theme
 STATUS_STYLES: dict[str, str] = {
     "hit": "green",
     "done": "green",
+    "needs-review": "bold yellow",
     "needs-run": "yellow",
     "resume": "yellow",
     "run": "cyan",
     "failed": "red",
     "error": "red",
+}
+
+REVIEW_STYLES: dict[str, str] = {
+    "accept_heading": "bold green",
+    "accept_action": "green",
+    "accept_already": "dim green",
+    "reject_heading": "bold yellow",
+    "reject_action": "yellow",
+    "reject_already": "dim yellow",
+    "stage": "cyan",
+    "module": "blue",
+    "branch": "dim",
+    "noop": "dim",
+    "error": "red",
+    "total": "bold",
 }
 
 
@@ -58,6 +74,7 @@ def _theme_key(status: str) -> str:
 _THEME = Theme(
     {f"varve.{_theme_key(status)}": style for status, style in STATUS_STYLES.items()}
     | {f"varve.dependency.{kind}": style for kind, style in DEPENDENCY_STYLES.items()}
+    | {f"varve.review.{name}": style for name, style in REVIEW_STYLES.items()}
     | {"varve.stage": STAGE_STYLE, "varve.refresh": REFRESH_STYLE}
 )
 

@@ -2,44 +2,117 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
 from varve.keying.fingerprint import file_digest_view
 from varve.models import AttemptMarker, BatchRecord, KeyComponents, SuccessRecord
 
-Status = Literal[
+ExecutionStatus = Literal[
     "hit",
     "needs-run",
     "resume",
     "failed",
     "error",
 ]
+EffectiveStatus = Literal[
+    "hit",
+    "needs-review",
+    "needs-run",
+    "resume",
+    "failed",
+    "error",
+]
+SourceRelationship = Literal["not-applicable", "current", "changed"]
+ReviewDecision = Literal["none", "accept", "reject"]
+
+
+@dataclass(frozen=True)
+class SourceReviewState:
+    """The observed source relationship and any decision bound to it."""
+
+    relationship: SourceRelationship
+    decision: ReviewDecision = "none"
+
+    def __post_init__(self) -> None:
+        if self.relationship != "changed" and self.decision != "none":
+            object.__setattr__(self, "decision", "none")
+
 
 # Least to most severe. Every aggregate status view must use this order so a
 # folded group and the dashboard cannot disagree about the state to surface.
-STATUS_SEVERITY: tuple[Status, ...] = (
+EXECUTION_STATUS_SEVERITY: tuple[ExecutionStatus, ...] = (
     "hit",
     "needs-run",
     "resume",
     "failed",
     "error",
 )
-_STATUS_SEVERITY = {status: index for index, status in enumerate(STATUS_SEVERITY)}
+EFFECTIVE_STATUS_SEVERITY: tuple[EffectiveStatus, ...] = (
+    "hit",
+    "needs-run",
+    "resume",
+    "failed",
+    "error",
+)
+_EXECUTION_STATUS_SEVERITY = {
+    status: index for index, status in enumerate(EXECUTION_STATUS_SEVERITY)
+}
+_EFFECTIVE_STATUS_SEVERITY = {
+    status: index for index, status in enumerate(EFFECTIVE_STATUS_SEVERITY)
+}
 
 
-def aggregate_status(statuses: list[Status] | tuple[Status, ...]) -> Status:
-    """Return the most severe status, treating an empty aggregate as a hit."""
+def aggregate_execution_status(statuses: Sequence[ExecutionStatus]) -> ExecutionStatus:
+    """Return the most severe execution status, treating no stages as a hit."""
 
     if not statuses:
         return "hit"
-    return max(statuses, key=_STATUS_SEVERITY.__getitem__)
+    return max(statuses, key=_EXECUTION_STATUS_SEVERITY.__getitem__)
+
+
+def aggregate_effective_status(statuses: Sequence[EffectiveStatus]) -> EffectiveStatus:
+    """Aggregate successfully probed effective states with review-gate priority."""
+
+    if "needs-review" in statuses:
+        return "needs-review"
+    if not statuses:
+        return "hit"
+    return max(statuses, key=_EFFECTIVE_STATUS_SEVERITY.__getitem__)
+
+
+def effective_status(
+    execution_status: ExecutionStatus,
+    source_review: SourceReviewState,
+) -> EffectiveStatus:
+    """Overlay source review semantics without changing the cache decision."""
+
+    if source_review.relationship != "changed" or source_review.decision == "accept":
+        return execution_status
+    if source_review.decision == "none":
+        return "needs-review"
+    return "needs-run"
+
+
+def effective_reason(execution_reason: str, source_review: SourceReviewState) -> str:
+    """Return the summary reason for an effective stage status."""
+
+    if source_review.relationship == "changed" and source_review.decision != "accept":
+        return "source-changed"
+    return execution_reason
+
+
+# Kept until the shared status/dashboard model is migrated in Phase 3. Engine
+# execution code must use the explicit names above.
+Status = ExecutionStatus
+STATUS_SEVERITY = EXECUTION_STATUS_SEVERITY
+aggregate_status = aggregate_execution_status
 
 
 @dataclass(frozen=True)
 class Decision:
-    status: Status
+    status: ExecutionStatus
     reason: str
     resume_skip: frozenset[int] = field(default_factory=frozenset)
     resume_total: int | None = None
