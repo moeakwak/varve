@@ -41,10 +41,6 @@ def format_needs(needs: tuple[str, ...]) -> str:
     return f"{visible} · +{hidden} more" if hidden > 0 else visible
 
 
-def format_source_review(review: str) -> str:
-    return "source-changed" if review == "pending" else review
-
-
 def compact_reason(reason: str) -> str:
     for prefix, compact in _COMPACT_REASON_PREFIXES:
         if reason.startswith(prefix):
@@ -66,10 +62,18 @@ def reason_text(reason: str) -> Text:
     return label
 
 
-def _render_pipeline_heading(console: Console, status: PipelineStatus) -> None:
+def _render_pipeline_heading(
+    console: Console,
+    status: PipelineStatus,
+    *,
+    target_module: str | None = None,
+) -> None:
+    title = "Pipeline status"
+    if target_module is not None:
+        title += f"  {target_module} · {status.pipeline}"
     console.print(
         Text.assemble(
-            ("Pipeline status", "varve.dependency.stage"),
+            (title, "varve.dependency.stage"),
             (f"  branch {status.branch} · output {status.output_root}", "dim"),
         )
     )
@@ -157,7 +161,6 @@ def _summary_table(console: Console, groups: tuple[StageStatusGroup, ...]) -> Ta
         no_wrap=has_matrix,
         overflow="ellipsis" if has_matrix else "fold",
     )
-    table.add_column("REVIEW", overflow="fold")
     table.add_column(
         "REASON",
         min_width=6 if has_matrix else None,
@@ -177,7 +180,6 @@ def _summary_table(console: Console, groups: tuple[StageStatusGroup, ...]) -> Ta
                 format_needs(group.logical_needs),
             ]
         )
-        row.append(group.review)
         row.append(reason_text(group.reason))
         table.add_row(*row)
     return table
@@ -214,8 +216,7 @@ def _compact_matrix_summary(console: Console, groups: tuple[StageStatusGroup, ..
         ),
     )
     duration_width = max(len("DURATION"), *(len(format_group_duration(group)) for group in groups))
-    review_width = max(len("REVIEW"), *(len(group.review) for group in groups))
-    fixed_width = stage_width + status_width + cells_width + duration_width + review_width + 12
+    fixed_width = stage_width + status_width + cells_width + duration_width + 10
     flexible_width = max(console.width - fixed_width, 10)
     needs_width = max(5, flexible_width * 3 // 5)
     reason_width = max(5, flexible_width - needs_width)
@@ -226,7 +227,6 @@ def _compact_matrix_summary(console: Console, groups: tuple[StageStatusGroup, ..
                 ("STATUS", status_width, "bold"),
                 ("CELLS", cells_width, "bold"),
                 ("DURATION", duration_width, "bold"),
-                ("REVIEW", review_width, "bold"),
                 ("NEEDS", needs_width, "bold"),
                 ("REASON", reason_width, "bold"),
             )
@@ -244,7 +244,6 @@ def _compact_matrix_summary(console: Console, groups: tuple[StageStatusGroup, ..
                         None,
                     ),
                     (format_group_duration(group), duration_width, None),
-                    (group.review, review_width, None),
                     (format_needs(group.logical_needs), needs_width, "dim"),
                     (reason_text(group.reason), reason_width, None),
                 )
@@ -252,8 +251,25 @@ def _compact_matrix_summary(console: Console, groups: tuple[StageStatusGroup, ..
         )
 
 
-def render_pipeline_summary(console: Console, status: PipelineStatus) -> None:
-    _render_pipeline_heading(console, status)
+def render_pipeline_summary(
+    console: Console,
+    status: PipelineStatus,
+    *,
+    target_module: str | None = None,
+) -> None:
+    _render_pipeline_heading(console, status, target_module=target_module)
+    if (
+        status.selector is not None
+        and not status.selector.is_concrete
+        and any(group.is_matrix for group in status.groups)
+    ):
+        selector_heading = Text(status.selector.canonical, style="varve.dependency.stage")
+        selector_heading.append(
+            f"  {status.selector.matched_count} cells",
+            style="dim",
+        )
+        console.print(selector_heading)
+        console.print()
     if any(group.is_matrix for group in status.groups) and console.width < 120:
         _compact_matrix_summary(console, status.groups)
     else:
@@ -268,13 +284,19 @@ def render_pipeline_summary(console: Console, status: PipelineStatus) -> None:
         console.print(Text("Status is folded; " + "; ".join(hints) + ".", style="dim"))
 
 
-def render_expanded_groups(console: Console, status: PipelineStatus) -> None:
-    _render_pipeline_heading(console, status)
+def render_expanded_groups(
+    console: Console,
+    status: PipelineStatus,
+    *,
+    target_module: str | None = None,
+) -> None:
+    _render_pipeline_heading(console, status, target_module=target_module)
     ordinary = tuple(group for group in status.groups if not group.is_matrix)
     for group in status.groups:
         if not group.is_matrix:
             continue
-        heading = Text(group.base_name, style="varve.dependency.stage")
+        target = status.selector.canonical if status.selector is not None else group.base_name
+        heading = Text(target, style="varve.dependency.stage")
         heading.append(
             f"  {len(group.cells)} cells · needs {format_needs(group.logical_needs)}",
             style="dim",
@@ -284,14 +306,12 @@ def render_expanded_groups(console: Console, status: PipelineStatus) -> None:
         for axis in group.axes:
             table.add_column(axis.upper(), style="bold")
         table.add_column("STATUS")
-        table.add_column("REVIEW")
         table.add_column("DURATION", justify="right")
         table.add_column("REASON", overflow="fold")
         for cell in group.cells:
             table.add_row(
                 *(coordinate.value_id for coordinate in cell.cell),
                 status_text(cell.status),
-                format_source_review(cell.source_review),
                 format_elapsed(cell.duration, missing="-"),
                 reason_text(cell.summary_reason),
             )
@@ -340,10 +360,30 @@ def render_stage_status(
     overview = Table(box=None, show_header=False, padding=(0, 2))
     overview.add_column(style="dim", no_wrap=True)
     overview.add_column(overflow="fold")
-    overview.add_row("Reason", reason_text(stage.reason))
+    detail_reason = stage.reason
+    if stage.source_relationship == "changed" and stage.execution_reason not in {
+        "hit",
+        stage.reason,
+    }:
+        detail_reason += f" · {stage.execution_reason}"
+    overview.add_row("Reason", reason_text(detail_reason))
     if stage.failure is not None:
         overview.add_row("Failure", stage.failure)
-    overview.add_row("Source review", format_source_review(stage.source_review))
+    source = Text()
+    if stage.source_relationship == "not-applicable":
+        source.append("not recorded", style="dim")
+    elif stage.source_relationship == "current":
+        source.append("current", style="green")
+    else:
+        source.append("changed", style="yellow")
+    overview.add_row("Source", source)
+    if stage.source_relationship == "changed":
+        review = {
+            "none": Text("required", style="yellow"),
+            "accept": Text("accepted", style="green"),
+            "reject": Text("rejected", style="yellow"),
+        }[stage.review_decision]
+        overview.add_row("Review", review)
     overview.add_row("Needs", ", ".join(stage.needs) if stage.needs else "-")
     if show_keys:
         overview.add_row("Decision key", stage.decision_key or "unavailable")
@@ -373,13 +413,16 @@ def render_status(
     *,
     view: Literal["summary", "cells", "detail"],
     dependency_depth: int | None = 0,
+    target_module: str | None = None,
 ) -> None:
     if view == "summary":
-        render_pipeline_summary(console, status)
+        render_pipeline_summary(console, status, target_module=target_module)
         return
     if view == "cells":
-        render_expanded_groups(console, status)
+        render_expanded_groups(console, status, target_module=target_module)
         return
+    if target_module is not None:
+        _render_pipeline_heading(console, status, target_module=target_module)
     for index, stage in enumerate(status.stages):
         if index:
             console.print()
@@ -389,3 +432,16 @@ def render_status(
             depth=dependency_depth,
             show_keys=True,
         )
+
+
+def status_view(status: PipelineStatus, *, expand: bool) -> Literal["summary", "cells", "detail"]:
+    """Choose one shared view from selector metadata and display intent."""
+
+    has_matrix = any(group.is_matrix for group in status.groups)
+    if status.selector is None:
+        if expand and has_matrix:
+            return "cells"
+        return "detail" if expand else "summary"
+    if status.selector.is_concrete or not has_matrix:
+        return "detail"
+    return "cells" if expand else "summary"

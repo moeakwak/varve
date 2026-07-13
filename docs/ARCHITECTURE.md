@@ -13,6 +13,7 @@ src/varve/
 ├── matrix.py            # axes and branch-scoped concrete graph expansion
 ├── decorators.py        # @stage, @batch_stage, StageSpec
 ├── context.py           # Ctx passed to stage methods
+├── command.py           # frontend-independent resolved command context
 ├── status.py            # read-only structured pipeline and stage status
 ├── branch.py            # varve.yaml and override branch helpers
 ├── branch_config.py     # Config construction and output-root selection
@@ -21,9 +22,9 @@ src/varve/
 ├── style.py             # shared Rich status colors for cli and dashboard
 ├── keying/              # source discovery and file/config/upstream key components
 ├── store/               # file lock and latest-wins Store
-├── engine/              # cache-state decisions, runner, and run display
-├── cli/                 # generated Pipeline.cli() commands and Rich status rendering
-└── dashboard/           # discovery and varve ls/show/refresh
+├── engine/              # execution decisions, review persistence, runner, and run display
+├── cli/                 # generated commands and shared single-pipeline renderers
+└── dashboard/           # manifest discovery, top-level commands, and overview rendering
 ```
 
 ## Public surface
@@ -41,8 +42,8 @@ Everything else is internal unless this document, `GUIDE.md`, or `README.md` say
 ## Dependency direction
 
 - Low-level packages: `keying`, `store`, and `engine.state`. They depend only on leaf modules such as `models`, `log`, and `dependencies`.
-- Middle layer: `branch_config` and `engine.runner`.
-- Top layers: `cli` and `dashboard`.
+- Middle layer: `branch_config`, `command`, `status`, and `engine.runner`.
+- Top layers: `cli` and `dashboard`; both call shared command services and renderers rather than invoking each other through argv.
 - Public-facing modules such as `pipeline`, `decorators`, and `context` may use internals to keep the user API small.
 - The only intentional reverse edge is the lazy import inside `Pipeline.cli()`: `from varve.cli.app import main`.
 
@@ -71,7 +72,7 @@ Each file or directory artifact has a content fingerprint. A stage success addit
 
 Upstream keys enter through reads. A stage body takes upstream outputs via `ctx.input(stage)` for exactly one path or `ctx.inputs(stage)` for a list, and both require `stage` to appear in the current stage's `needs=`, because only declared upstreams are folded into the input key.
 
-A concrete stage resolves to `hit`, `needs-run`, `resume`, `failed`, or `error`. Source review is an orthogonal `confirmed`, `pending`, `accepted`, or `rerun-required` dimension.
+A concrete stage has an execution status of `hit`, `needs-run`, `resume`, `failed`, or `error`. Source review is represented by an orthogonal relationship (`not-applicable`, `current`, or `changed`) and decision (`none`, `accept`, or `reject`). The effective overlay adds `needs-review` for changed plus none and maps changed plus reject to `needs-run · source-changed`; these computed states are never persisted, and the store remains schema 5.
 
 ## Command-scoped observation snapshots
 
@@ -79,7 +80,7 @@ Exact state evaluation shares filesystem fingerprints, normalized Python-file ob
 
 Each regular file hash can reuse persisted metadata when path, inode, size, mtime_ns, algorithm, and cache schema match. Directory trees are still walked completely. Files written by the current stage are rehashed at commit.
 
-`status`, `show`, and dashboard `ls` share one read-only command session. Runs use an independent snapshot for external-upstream validation, refresh filesystem observations after each successful stage, and update the cached success record after commit. Dashboard `refresh` clears source, filesystem, and record observations after every attempted run, including failures, so its final exact evaluation can observe source files changed during execution.
+Generated status, top-level single status, and top-level `ls` use the same exact collector and command-scoped `_KeyingSession`. Runs use an independent snapshot for external-upstream validation, refresh filesystem observations after each successful stage, and update the cached success record after commit. Bulk review passes one session through every review probe and refreshes it after each entry. Bulk run clears source, filesystem, and record observations after every attempted entry, including failures, before exact final evaluation can observe source files changed during execution.
 
 ## Source observation
 
@@ -95,9 +96,9 @@ Scoped runs validate less. An internal stage filter probes only the direct upstr
 
 Probes compute the source fingerprint before checking for missing upstream records, so source observation errors remain strict even when other inputs are unavailable.
 
-`status.py` turns probes into immutable, cell-aware view models: it groups concrete cells by base stage and compares source manifests when a review is pending so changed files can be shown. Every concrete stage is probed before display selection and folding, so folding never changes a cache decision or a cell's identity. Aggregate status uses the least-to-most-severe order in `engine.state`, source review remains a separate count, and aggregate duration sums recorded cell durations while carrying the recorded count so the renderer can flag missing values.
+`status.py` turns probes into immutable, cell-aware view models containing execution status and reason, source relationship, review decision, effective status, changed source files, selector metadata, duration, and last-commit metadata. Every concrete stage is probed before display selection and folding, so folding never changes a cache decision or a cell's identity. Matrix groups and pipelines aggregate effective status, with `needs-review` taking precedence; aggregate duration sums recorded cell durations while carrying the recorded count so the renderer can flag missing values.
 
-`cli/status.py` renders the folded summary, axis-column cell tables, single-stage key inputs, source-review state, and changed source files. It reads base names, canonical coordinates, axis order, and logical needs from the view model rather than parsing concrete stage names. No inferred source dependency graph exists.
+`cli/status.py` is the shared generated/top-level single-pipeline renderer. It renders folded effective status without a separate review column, axis-column cell tables, partial-selector headings, single-stage key inputs, source relationship, conditional review decision, and changed source files. It reads base names, canonical coordinates, axis order, and logical needs from the view model rather than parsing concrete stage names. No inferred source dependency graph exists.
 
 The command is read-only — it does not execute stages, initialize the store, or persist dependency graphs. A displayed decision key is the current cache-decision input, not a promise that the next execution will commit the same final key after recording config access.
 
@@ -136,13 +137,15 @@ base/.tmp/<branch>   # temporary override branches
 
 `varve.yaml` is discovered next to the pipeline module. Missing `varve.yaml` is allowed for `main`.
 
-Each branch section has three independent facets: `config`, `axes`, and `is_temporary`. `config` controls stage behavior and participates in input keys. `axes` selects a branch's active matrix domain and controls graph construction without entering input keys. Temporary manifests snapshot both the validated Config and normalized active axes so later status and refresh operations reconstruct the same graph.
+Each branch section has three independent facets: `config`, `axes`, and `is_temporary`. `config` controls stage behavior and participates in input keys. `axes` selects a branch's active matrix domain and controls graph construction without entering input keys. Temporary manifests snapshot both the validated Config and normalized active axes so later generated commands and explicitly opted-in top-level commands reconstruct the same graph.
 
 Recorded artifact paths are always output-root-relative. Ordinary stages write managed artifacts through `ctx.out`; matrix cells write through `ctx.cell_out`, described under Matrix graph expansion.
 
 ## Matrix graph expansion
 
-`Pipeline.stages()` collects branch-independent stage templates. After branch resolution, `Pipeline.graph(axes)` delegates to `build_graph(pipeline, axes)` to construct an immutable `PipelineGraph`: it expands each matrix template into concrete cell stages, resolves logical dependencies by equality on shared `Axis` object identities, and computes the concrete topology once. Runners, status, clean, and dashboard state all consume that branch-scoped graph, and dashboard discovery remains zero-import.
+`Pipeline.stages()` collects branch-independent stage templates. After branch resolution, `Pipeline.graph(axes)` delegates to `build_graph(pipeline, axes)` to construct an immutable `PipelineGraph`: it expands each matrix template into concrete cell stages, resolves logical dependencies by equality on shared `Axis` object identities, and computes the concrete topology once. Runners, status, review, clean, and top-level state all consume that branch-scoped graph, while manifest discovery remains zero-import.
+
+`PipelineGraph.resolve_selector()` is the only StageSelector parser. It resolves an ordinary stage, a bare Matrix base, any non-empty subset of active `AXIS=VALUE` coordinates, or a full concrete cell into a canonical selector and stable topology-ordered seed set. Axis declaration order owns canonicalization and diagnostics distinguish unknown from declared-but-inactive values. `resolve_selectors()` validates every repeated selector before returning a stable union. Run and plan apply only/upstream/descendant closure after resolution, clean applies descendant closure, and status or review use the seeds without implicit topology expansion. Temporary `--slice` remains a separate cross-stage constraint.
 
 Concrete cell names encode coordinates in declaration order, so store slots and partial records stay structurally unchanged: a cell is an ordinary stage with an independent name and input key. Coordinates do not add a key component. A matrix-only internal layout version does enter the input key, so records and partial state from a previous artifact layout become `needs-run` instead of being mixed with current outputs. Logical `ctx.input()` and `ctx.inputs()` calls map to the aligned concrete upstream cells, ordered by upstream axis declaration order and then batch index.
 
@@ -156,15 +159,17 @@ Ordinary stages are never folded. In `auto` mode a matrix group folds when at le
 
 `Ctx` receives structured stage-display metadata from the graph. Matrix batch progress defaults to canonical cell values in declared axis order, without parsing or changing the concrete stage name; ordinary stages retain the stage name, and an explicit `ctx.resume(desc=...)` remains authoritative.
 
-Generated `status` output folds concrete cells by base template by default. `--expand` dispatches by selection: a matrix base or an untargeted matrix pipeline renders cells with one column per declared axis, while an ordinary stage, concrete cell, or non-matrix pipeline renders exact key inputs, source review, and changed source files. Source call-tree expansion flags do not exist.
+Generated and top-level single-pipeline status fold concrete cells by base template by default. `--expand` dispatches by selection: a Matrix base, partial subset, or untargeted Matrix pipeline renders cells with one column per declared axis, while an ordinary stage, concrete cell, or non-Matrix pipeline renders exact key inputs, source relationship, review decision, and changed source files. Source call-tree expansion flags do not exist.
 
 Managed matrix artifacts are contained under `ctx.cell_out`, which is `<output-root>/.matrix/<base-stage>/<axis-name>=<canonical-id>/...`; each coordinate occupies one directory level in the stage's axis declaration order. For example, `score@bench=unimer,model=qwen3-vl-8b` writes under `.matrix/score/bench=unimer/model=qwen3-vl-8b/` while its concrete stage and store identity remains `score@bench=unimer,model=qwen3-vl-8b`. Relative `produces` declarations and batch yields resolve under `ctx.cell_out`; absolute paths must remain inside it. Store records still hold paths relative to the branch output root, so artifact existence checks, upstream reads, and stage clean operate from recorded paths rather than reconstructing physical paths. Ordinary stages retain `ctx.cell_out == ctx.out`.
 
 ## CLI and config
 
-`Pipeline.cli(argv)` delegates to `varve.cli.app.main` and provides `run`, `status`, `accept`, `reject`, `plan`, `list`, and `clean`.
+`Pipeline.cli(argv)` delegates to `varve.cli.app.main` and provides `run`, `status`, `accept`, `reject`, `plan`, `ls`, and `clean`.
 
-`argparse` parses commands and generated `Args` flags. `pydantic-settings` builds semantic `Config` values from branch/override values, environment variables, `.env`, and model defaults.
+`ResolvedCommandContext` carries the pipeline class, resolved branch/config/axes, output base and root, graph, and runtime Args without probing or mutating the store. The generated frontend constructs it from `ResolvedBranch`; the top-level frontend restores the same identity from an exact manifest MODULE and branch. Plan and structure listing use lighter resolved targets because they do not consume Args or probe keys.
+
+`argparse` parses commands and generated `Args` flags. Top-level run/status/clean/accept/reject use two stages: a fixed `COMMAND MODULE [OPTIONS]` target identifies and imports one discovered pipeline, then its Args fields are registered before full parsing. Bulk commands use default Args and reject pipeline-specific flags. `pydantic-settings` builds semantic `Config` values from branch/override values, environment variables, `.env`, and model defaults.
 
 Config priority:
 
@@ -184,15 +189,21 @@ Full clean removes the whole output root after rejecting dangerous roots such as
 
 Per-stage clean only deletes recorded artifacts and store records for the selected downstream closure. It does not use `allowed_roots`; its boundary is the manifest anchor plus recorded artifact paths.
 
-## Dashboard
+## Top-level discovery and commands
 
-The top-level `varve` console script reads existing stores. Discovery is zero-import and stops descending once `_branch_output_id()` confirms a valid branch output root, so materialized artifacts are never treated as further scan roots. A valid temporary output root remains terminal even when it is filtered out because `--include-temp` was not passed. An invalid `.varve` directory does not stop traversal and therefore cannot hide a deeper valid store.
+The top-level `varve` console script operates only on existing manifest-anchored stores. Discovery is zero-import and stops descending once `_branch_output_id()` confirms a valid branch output root, so materialized artifacts are never treated as further scan roots. Prefix, exact branch, and temporary scope filters run before import. A valid temporary output root remains terminal even when it is filtered out because `--include-temp` was not passed. An invalid `.varve` directory does not stop traversal and therefore cannot hide a deeper valid store.
 
-`varve ls`, `show`, and `refresh` use the same exact state loader. It imports stored manifest modules, resolves branches, builds graphs, fingerprints current inputs, and probes artifacts and source reviews. `ls` renders the main `STATUS`, separate `REVIEW`, and hit/total `STAGES`. `refresh` skips whole pipelines with pending reviews, attempts other executable pipelines, clears mutable observations, exact-evaluates every attempted store again, and reports review-required, failed, error, and still-pending results together. Only an all-hit state with no pending review is complete. Top-level `accept` and `reject` route to the same locked review writer as generated commands and never execute stages.
+`varve ls` imports filtered manifest modules, resolves branches, and calls `collect_pipeline_status()` once per entry with a shared observation session. The dashboard model only wraps discovery metadata around shared `PipelineStatus`; it has no parallel stage taxonomy. The overview renderer shows exact MODULE, BRANCH, and effective STATUS, adds duration and last run when wide enough, and switches to stacked rows rather than truncating MODULE. Status filtering runs after exact evaluation.
 
-The dashboard and the generated `Pipeline.cli()` commands share `style.py` for status colors and console construction, so both render the same aligned tables and semantic colors. Rich drops color automatically when output is not a terminal.
+Top-level single commands call the same status, run, review, plan, clean, and structure services as generated commands. `cli/status.py`, `cli/structure.py`, `cli/review.py`, and `cli/run.py` own the shared single-pipeline rendering; `dashboard/render.py` owns only multi-pipeline overview and bulk-run reports. Engine and store modules do not import Rich or dashboard code.
 
-Potentially slow discovery and exact evaluation use transient Rich status spinners only when the shared console is attached to a TTY. The status context ends before final tables or refresh run logs are emitted; redirected output contains only the existing final command output.
+`engine.review` owns pure candidate normalization, idempotent write planning, result grouping, and ReviewRecord persistence primitives. Explicit accept/reject holds one output lock, probes once, resolves all selectors before the first write, and returns a structured result. Forced run already holds the lock and passes exact preflight candidates to the same persistence primitive, so it neither nests locks nor repeats source/store/fingerprint observations. Review records remain per-stage atomic replacements; an interruption during a write loop may leave a validated subset that the same command safely completes on retry.
+
+Bulk commands only enumerate filtered entries, reuse a command session, call single-entry services, refresh observations, and aggregate results. Review writes and locks are independent per store, so one failure does not roll back completed entries or stop later entries. Bulk run skips hits and `needs-review`, attempts `needs-run`, `resume`, or `failed`, refreshes observations after every attempt or failure, and exact-evaluates final state. The report groups review blockers, failures, evaluation errors, and remaining runnable work; completion uses the shared effective status rather than a second dashboard rule.
+
+The top-level and generated commands share `style.py` for effective status, source reason, review action, module, branch, and bulk-run heading styles. Reject is yellow because it requests a rerun rather than representing an execution failure. Rich drops color automatically when output is not a terminal, and every category remains explicit in text.
+
+Potentially slow discovery and exact evaluation use transient Rich status spinners only when the shared console is attached to a TTY. The status context ends before final tables or bulk-run logs are emitted; redirected output contains only final command output.
 
 ## Known limitations
 

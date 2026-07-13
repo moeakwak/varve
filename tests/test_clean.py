@@ -5,9 +5,10 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from varve import Pipeline, stage
+from varve import Axis, Pipeline, matrix, stage
 from varve.cli.clean import _validate_destructive, clean
 from varve.engine.runner import run
+from varve.matrix import build_graph
 from varve.models import ProducedPath
 from varve.store.lock import OutputLock
 from varve.store.store import Store
@@ -37,6 +38,32 @@ class RestrictedCleanPipeline(CleanPipeline):
     @classmethod
     def clean_roots(cls, config: Config) -> list[Path] | None:
         return [Path("/tmp/varve-allowed-results")]
+
+
+BENCH = Axis("bench", ["a", "b"])
+MODEL = Axis("model", ["x", "y"])
+
+
+class MatrixCleanPipeline(Pipeline):
+    Config = Config
+
+    @matrix(BENCH)
+    @stage(produces="prepare.txt")
+    def prepare(self, ctx, *, bench: str):
+        ctx.cell_out.mkdir(parents=True, exist_ok=True)
+        (ctx.cell_out / "prepare.txt").write_text(bench, encoding="utf-8")
+
+    @matrix(BENCH, MODEL)
+    @stage(needs="prepare", produces="score.txt")
+    def score(self, ctx, *, bench: str, model: str):
+        ctx.cell_out.mkdir(parents=True, exist_ok=True)
+        (ctx.cell_out / "score.txt").write_text(f"{bench}:{model}", encoding="utf-8")
+
+    @matrix(BENCH)
+    @stage(needs="score", produces="report.txt")
+    def report(self, ctx, *, bench: str):
+        ctx.cell_out.mkdir(parents=True, exist_ok=True)
+        (ctx.cell_out / "report.txt").write_text(bench, encoding="utf-8")
 
 
 def test_validate_destructive_rejects_dangerous_paths(tmp_path: Path) -> None:
@@ -225,3 +252,52 @@ def test_cli_clean_target_ignores_clean_roots_restriction(tmp_path: Path) -> Non
     assert root.exists()
     assert (root / "sample.txt").exists()
     assert not (root / "summary.txt").exists()
+
+
+def test_clean_partial_matrix_selector_deletes_only_matching_descendants(
+    tmp_path: Path,
+) -> None:
+    run(MatrixCleanPipeline, Config(), cli_out=tmp_path)
+    root = tmp_path / "main" / ".matrix"
+
+    clean(
+        MatrixCleanPipeline,
+        Config(),
+        cli_out=tmp_path,
+        target="score@bench=a",
+        yes=True,
+    )
+
+    assert (root / "prepare" / "bench=a" / "prepare.txt").exists()
+    assert (root / "prepare" / "bench=b" / "prepare.txt").exists()
+    assert not (root / "score" / "bench=a" / "model=x" / "score.txt").exists()
+    assert not (root / "score" / "bench=a" / "model=y" / "score.txt").exists()
+    assert (root / "score" / "bench=b" / "model=x" / "score.txt").exists()
+    assert (root / "score" / "bench=b" / "model=y" / "score.txt").exists()
+    assert not (root / "report" / "bench=a" / "report.txt").exists()
+    assert (root / "report" / "bench=b" / "report.txt").exists()
+
+
+def test_clean_inactive_partial_selector_fails_before_confirmation(tmp_path: Path) -> None:
+    axes = {"bench": ("a",), "model": ("x", "y")}
+    graph = build_graph(MatrixCleanPipeline, axes)
+    run(MatrixCleanPipeline, Config(), cli_out=tmp_path, axes=axes, graph=graph)
+    confirmation_requested = False
+
+    def confirm(message: str) -> bool:
+        nonlocal confirmation_requested
+        confirmation_requested = True
+        return True
+
+    with pytest.raises(ValueError, match="declared but inactive"):
+        clean(
+            MatrixCleanPipeline,
+            Config(),
+            cli_out=tmp_path,
+            target="score@bench=b",
+            confirm=confirm,
+            axes=axes,
+            graph=graph,
+        )
+    assert confirmation_requested is False
+    assert (tmp_path / "main" / ".matrix" / "score" / "bench=a").exists()

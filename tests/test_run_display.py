@@ -9,8 +9,8 @@ from pydantic import BaseModel
 from rich.text import Text
 
 from varve import Axis, Ctx, Pipeline, matrix, stage
-from varve.cli import app as cli_app
-from varve.cli.app import _print_outcomes
+from varve.cli import run as cli_run
+from varve.cli.run import render_run_outcomes
 from varve.engine.run_display import (
     AUTO_COMPACT_MIN_CELLS,
     AUTO_EXPAND_SLOW_SECONDS,
@@ -37,6 +37,7 @@ from varve.models import (
     SuccessRecord,
 )
 from varve.store.store import Store
+from varve.style import make_console
 
 
 class Config(BaseModel):
@@ -167,7 +168,7 @@ def test_compact_reporter_surfaces_new_slow_cell_by_concrete_name(caplog) -> Non
     caplog.set_level(logging.INFO, logger="varve")
     stage_name = graph.base_cells["work"][0]
 
-    reporter.record(plan.outcome(stage_name, "no-cache", "no cache", AUTO_EXPAND_SLOW_SECONDS))
+    reporter.record(plan.outcome(stage_name, "needs-run", "no-cache", AUTO_EXPAND_SLOW_SECONDS))
 
     assert f"[{stage_name}] slow · {AUTO_EXPAND_SLOW_SECONDS:.2f}s" in [
         record.getMessage() for record in caplog.records
@@ -199,7 +200,7 @@ def test_compact_runner_aggregates_live_hits_runs_and_outcomes(tmp_path: Path, c
 def test_compact_cli_outcome_table_has_one_group_row(tmp_path: Path, capsys) -> None:
     outcomes = run(LargeMatrix, Config(), cli_out=tmp_path)
 
-    _print_outcomes(outcomes, elapsed=True)
+    render_run_outcomes(make_console(), outcomes, elapsed=True)
 
     output = capsys.readouterr().out
     assert "STAGE" in output
@@ -219,7 +220,7 @@ def test_compact_cli_outcome_table_styles_each_status_token(
         called.append(status)
         return Text(status)
 
-    monkeypatch.setattr(cli_app, "status_text", tracked_status_text)
+    monkeypatch.setattr(cli_run, "status_text", tracked_status_text)
     outcomes = [
         StageOutcome(
             "work@item=0",
@@ -241,7 +242,7 @@ def test_compact_cli_outcome_table_styles_each_status_token(
         ),
     ]
 
-    _print_outcomes(outcomes, elapsed=True)
+    render_run_outcomes(make_console(), outcomes, elapsed=True)
 
     assert called == ["hit", "needs-run"]
     assert "1 hit, 1 needs-run" in capsys.readouterr().out

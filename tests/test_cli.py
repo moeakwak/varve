@@ -107,8 +107,8 @@ class UnsupportedConfigPipeline(Pipeline):
         (ctx.out / "sample.txt").write_text("sample", encoding="utf-8")
 
 
-def test_cli_list_and_plan(capsys) -> None:
-    assert CliPipeline.cli(["list"]) == 0
+def test_cli_ls_and_plan(capsys) -> None:
+    assert CliPipeline.cli(["ls"]) == 0
     assert "sample" in capsys.readouterr().out
     assert CliPipeline.cli(["plan"]) == 0
     assert "sample" in capsys.readouterr().out
@@ -165,8 +165,8 @@ def test_cli_plan_target_filters_graph(capsys) -> None:
     assert capsys.readouterr().out.strip() == "sample"
 
 
-def test_cli_list_and_plan_do_not_require_supported_config(capsys) -> None:
-    assert UnsupportedConfigPipeline.cli(["list"]) == 0
+def test_cli_ls_and_plan_do_not_require_supported_config(capsys) -> None:
+    assert UnsupportedConfigPipeline.cli(["ls"]) == 0
     assert "sample" in capsys.readouterr().out
     assert UnsupportedConfigPipeline.cli(["plan"]) == 0
     assert capsys.readouterr().out.strip() == "sample"
@@ -540,8 +540,54 @@ def test_cli_status_accepts_optional_stage_and_expansion(tmp_path: Path, capsys)
         == 0
     )
     output = capsys.readouterr().out
-    assert "Source review" in output
+    assert "Source" in output
     assert "Decision key" in output
+
+
+def test_cli_rejects_removed_list_command() -> None:
+    with pytest.raises(SystemExit):
+        CliPipeline.cli(["list"])
+
+
+def test_cli_root_help_lists_only_unified_commands(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        CliPipeline.cli(["--help"])
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "{run,status,clean,accept,reject,plan,ls}" in output
+    assert "\n    list " not in output
+
+
+@pytest.mark.parametrize(
+    ("command", "target"),
+    [
+        ("run", "--only STAGE_SELECTOR"),
+        ("status", "STAGE_SELECTOR"),
+        ("clean", "--downstream STAGE_SELECTOR"),
+        ("accept", "--stage STAGE_SELECTOR"),
+        ("reject", "--stage STAGE_SELECTOR"),
+        ("plan", "--only STAGE_SELECTOR"),
+    ],
+)
+def test_cli_stage_target_help_uses_one_selector_contract(
+    command: str, target: str, capsys
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        CliPipeline.cli([command, "--help"])
+    assert exc_info.value.code == 0
+    output = " ".join(capsys.readouterr().out.split())
+    assert target in output
+    assert "Base selects all active cells" in output
+    assert "omitted axes are wildcards" in output
+    assert "full coordinates select one cell" in output
+
+
+def test_cli_review_uses_repeatable_stage_option(tmp_path: Path, capsys) -> None:
+    assert CliPipeline.cli(["run", f"--out={tmp_path}"]) == 0
+    assert CliPipeline.cli(["accept", f"--out={tmp_path}", "--stage", "sample"]) == 0
+    assert "sample did not need review." in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        CliPipeline.cli(["accept", "sample", f"--out={tmp_path}"])
 
 
 def test_cli_status_expands_all_stages_in_non_matrix_pipeline(tmp_path: Path, capsys) -> None:
@@ -585,8 +631,8 @@ def test_cli_help_hides_internal_dest(capsys) -> None:
     help_text = capsys.readouterr().out
     assert "__VARVE_CONFIG__" not in help_text
     assert "__VARVE_ARGS__" not in help_text
-    assert "--upto STAGE" in help_text
-    assert "--downstream STAGE" in help_text
+    assert "--upto STAGE_SELECTOR" in help_text
+    assert "--downstream STAGE_SELECTOR" in help_text
 
 
 @pytest.mark.parametrize(

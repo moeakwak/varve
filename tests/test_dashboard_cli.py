@@ -2,24 +2,20 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
-from time import sleep
 
 import pytest
 from pydantic import BaseModel
 from rich.console import Console
 
-from varve import Pipeline, stage
-from varve.dashboard import render
-from varve.dashboard.cli import _loading, main
-from varve.dashboard.models import (
-    PipelineEntry,
-    PipelineState,
-    StageState,
-    StateError,
-)
-from varve.dashboard.render import render_detail, render_overview
+from varve import Axis, Pipeline, matrix, stage
+from varve.dashboard import commands
+from varve.dashboard.cli import main
+from varve.dashboard.models import PipelineEntry, PipelineState, StateError
+from varve.dashboard.render import render_overview
+from varve.engine.review import SourceReviewResult
 from varve.engine.runner import run
-from varve.store.store import Store
+from varve.engine.state import EffectiveStatus, ExecutionStatus
+from varve.status import PipelineStatus, StageStatus
 
 
 class Config(BaseModel):
@@ -27,7 +23,8 @@ class Config(BaseModel):
 
 
 class Args(BaseModel):
-    pass
+    workers: int = 1
+    label: str = ""
 
 
 class CliDemo(Pipeline):
@@ -36,695 +33,779 @@ class CliDemo(Pipeline):
 
     @stage(produces="sample.txt")
     def sample(self, ctx):
-        (ctx.out / "sample.txt").write_text("sample", encoding="utf-8")
+        (ctx.out / "sample.txt").write_text(str(ctx.args.workers), encoding="utf-8")
 
     @stage(needs="sample", produces="summary.txt")
     def summary(self, ctx):
         (ctx.out / "summary.txt").write_text("summary", encoding="utf-8")
 
 
-def _run_demo(output_base: Path) -> None:
+class RequiredArgs(BaseModel):
+    workers: int
+
+
+class RequiredArgsDemo(Pipeline):
+    Config = Config
+    Args = RequiredArgs
+
+    @stage(produces="sample.txt")
+    def sample(self, ctx):
+        (ctx.out / "sample.txt").write_text(str(ctx.args.workers), encoding="utf-8")
+
+
+BENCH = Axis("bench", ["a", "b"])
+MODEL = Axis("model", ["x", "y"])
+
+
+class MatrixCliDemo(Pipeline):
+    Config = Config
+    Args = Args
+
+    @matrix(BENCH, MODEL)
+    @stage(produces="score.txt")
+    def score(self, ctx, *, bench: str, model: str):
+        ctx.cell_out.mkdir(parents=True, exist_ok=True)
+        (ctx.cell_out / "score.txt").write_text(f"{bench}:{model}", encoding="utf-8")
+
+
+def _run_demo(output_base: Path) -> PipelineEntry:
     run(CliDemo, Config(), args=Args(), cli_out=output_base)
+    return PipelineEntry(
+        output_root=output_base / "main",
+        pipeline_id="demo",
+        pipeline_name="CliDemo",
+        branch="main",
+        module=CliDemo.__module__,
+    )
 
 
-def test_ls_and_show_render_engine_state(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    output_base = tmp_path / "alpha" / "out"
-    output_root = output_base / "main"
-    _run_demo(output_base)
+def _stage_status(
+    status: EffectiveStatus,
+    *,
+    name: str = "sample",
+    reason: str | None = None,
+) -> StageStatus:
+    execution: ExecutionStatus = "hit" if status == "needs-review" else status
+    relationship = "changed" if status == "needs-review" else "current"
+    return StageStatus(
+        name=name,
+        base_name=name,
+        cell=(),
+        kind="single",
+        needs=(),
+        logical_needs=(),
+        status=status,
+        reason=reason or ("source-changed" if status == "needs-review" else status),
+        summary_reason=reason or ("source-changed" if status == "needs-review" else status),
+        execution_status=execution,
+        execution_reason="hit" if status == "needs-review" else (reason or status),
+        source_relationship=relationship,
+        review_decision="none",
+        duration=1.25,
+        committed_at=None,
+        decision_key=None,
+        stored_key=None,
+        key_inputs=None,
+        source_changes={},
+        unavailable_reason=None,
+        failure="RuntimeError: failed" if status == "failed" else None,
+    )
 
-    assert main(["ls", "--root", str(tmp_path)]) == 0
-    ls = capsys.readouterr()
-    assert "STATUS" in ls.out
-    assert "alpha" in ls.out
-    assert "hit" in ls.out
-    assert "2/2" in ls.out
 
-    assert main(["show", "alpha", "--root", str(tmp_path)]) == 0
-    detail = capsys.readouterr()
-    assert "Status: hit" in detail.out
-    assert "REASON" in detail.out
-    assert "sample" in detail.out
-    assert str(output_root) in detail.out
+def _state(
+    entry: PipelineEntry,
+    status: EffectiveStatus,
+    *,
+    reason: str | None = None,
+) -> PipelineState:
+    if status == "error":
+        return PipelineState(
+            entry=entry,
+            error=StateError(phase="import", message=reason or "broken"),
+        )
+    return PipelineState(
+        entry=entry,
+        pipeline_status=PipelineStatus(
+            pipeline=entry.pipeline_name or "Demo",
+            module=entry.module or "missing",
+            branch=entry.branch,
+            output_root=entry.output_root,
+            stages=(_stage_status(status, reason=reason),),
+        ),
+    )
 
 
-def test_show_renders_error_diagnostics(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    output_root = tmp_path / "broken" / "out" / "main"
-    Store(output_root).ensure_initialized("MissingPipeline", module="varve.no_such_module")
-
-    assert main(["show", "broken", "--root", str(tmp_path)]) == 0
-
+def test_top_level_help_lists_only_unified_commands(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--help"])
+    assert exc_info.value.code == 0
     output = capsys.readouterr().out
-    assert "Status: error" in output
-    assert "Error: import:" in output
+    for command in ("ls", "status", "run", "accept", "reject", "plan", "clean"):
+        assert command in output
+    assert "\n  show " not in output
+    assert "\n  refresh " not in output
+
+    for removed in ("show", "refresh"):
+        with pytest.raises(SystemExit):
+            main([removed])
 
 
-def test_ls_and_show_can_include_temporary_branches(
+@pytest.mark.parametrize("command", ["ls", "status", "run", "accept", "reject", "plan", "clean"])
+def test_top_level_subcommand_help_uses_unified_surface(command: str, capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main([command, "--help"])
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    if command in {"run", "accept", "reject"}:
+        assert "MODULE" in output and "--all" in output
+    elif command in {"status", "plan", "clean"}:
+        assert "MODULE" in output
+    if command in {"status", "run", "plan", "clean"}:
+        assert "STAGE_SELECTOR" in output
+
+
+def test_top_level_has_no_bulk_clean() -> None:
+    with pytest.raises(SystemExit):
+        main(["clean", "--all"])
+
+
+def test_bare_varve_is_exact_overview_and_uses_manifest_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run_demo(tmp_path / "demo" / "out")
+    monkeypatch.chdir(tmp_path)
+    assert main([]) == 0
+    output = capsys.readouterr().out
+    assert CliDemo.__module__ in output
+    assert "main" in output
+    assert "hit" in output
+    assert "REVIEW" not in output
+    assert "STAGES" not in output
+
+
+def test_ls_module_and_status_share_generated_renderers(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    Store(tmp_path / "demo" / "out" / "main").ensure_initialized(
-        "Demo",
-        module="varve.no_such_main",
+    _run_demo(tmp_path / "demo" / "out")
+    root = str(tmp_path)
+
+    assert main(["ls", CliDemo.__module__, "--root", root]) == 0
+    structure = capsys.readouterr().out
+    assert all(column in structure for column in ("STAGE", "KIND", "NEEDS", "MATRIX"))
+    assert "sample" in structure and "summary" in structure
+
+    assert main(["status", CliDemo.__module__, "--root", root]) == 0
+    status = capsys.readouterr().out
+    assert CliDemo.__module__ in status
+    assert "CliDemo" in status
+    assert "sample" in status and "summary" in status
+    assert "REVIEW" not in status
+
+    assert main(["run", CliDemo.__module__, "--root", root]) == 0
+    run_output = capsys.readouterr().out
+    assert "STAGE" in run_output and "STATUS" in run_output
+    assert "sample" in run_output and "summary" in run_output
+    assert "hit" in run_output
+
+
+def test_status_requires_module_and_points_to_overview(capsys) -> None:
+    with pytest.raises(SystemExit):
+        main(["status"])
+    assert "use 'varve ls'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["run", "accept", "reject"])
+def test_module_and_all_are_mutually_exclusive_and_required(command: str) -> None:
+    with pytest.raises(SystemExit):
+        main([command])
+    with pytest.raises(SystemExit):
+        main([command, "pkg.demo", "--all"])
+
+
+def test_single_run_registers_pipeline_args_after_module_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _run_demo(tmp_path / "demo" / "out")
+    captured = []
+
+    def fake_run(entry, pipeline, pipeline_args, **kwargs):
+        captured.append((entry, pipeline, pipeline_args, kwargs))
+        return 0
+
+    monkeypatch.setattr("varve.dashboard.cli.run_command", fake_run)
+    assert (
+        main(
+            [
+                "run",
+                CliDemo.__module__,
+                "--root",
+                str(tmp_path),
+                "--workers",
+                "4",
+                "--only",
+                "sample",
+                "--force",
+            ]
+        )
+        == 0
     )
-    Store(tmp_path / "demo" / "out" / ".tmp" / "quick").ensure_initialized(
-        "Demo",
-        module="varve.no_such_temp",
-        temporary_config={},
-    )
+    assert captured[0][2] == Args(workers=4)
+    assert captured[0][3]["only"] == "sample"
+    assert captured[0][3]["force"] is True
 
-    assert main(["ls", "--root", str(tmp_path)]) == 0
-    default_output = capsys.readouterr().out
-    assert "quick" not in default_output
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "run",
+                "--workers",
+                "3",
+                CliDemo.__module__,
+                "--root",
+                str(tmp_path),
+                "--only",
+                "sample",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert len(captured) == 1
 
-    assert main(["ls", "--root", str(tmp_path), "--include-temp"]) == 0
-    include_temp_output = capsys.readouterr().out
-    assert "demo" in include_temp_output
-    assert "main" in include_temp_output
-    assert "quick" in include_temp_output
 
-    assert main(["show", "demo", "--branch", "quick", "--root", str(tmp_path)]) == 1
-    assert "Unknown pipeline: demo (branch quick)" in capsys.readouterr().err
+def test_dynamic_args_require_module_first_and_keep_help_and_usage_consistent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run_demo(tmp_path / "demo" / "out")
+    with pytest.raises(SystemExit) as help_exit:
+        main(
+            [
+                "run",
+                CliDemo.__module__,
+                "--root",
+                str(tmp_path),
+                "--help",
+            ]
+        )
+    assert help_exit.value.code == 0
+    assert "--workers" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit) as static_help_exit:
+        main(["run", "--help"])
+    assert static_help_exit.value.code == 0
+    static_help = capsys.readouterr().out
+    assert "usage: varve run (MODULE [OPTIONS] | --all [OPTIONS])" in static_help
+    assert "--workers" not in static_help
+
+    with pytest.raises(SystemExit) as missing_exit:
+        main(["run", "--workers", "4", "--root", str(tmp_path)])
+    assert missing_exit.value.code == 2
+    error = capsys.readouterr().err
+    assert "requires exactly one of MODULE or --all" in error
+    assert "Unknown module: 4" not in error
+
+    with pytest.raises(SystemExit) as status_exit:
+        main(["status", "--workers", "4", "--root", str(tmp_path)])
+    assert status_exit.value.code == 2
+    status_error = capsys.readouterr().err
+    assert "use 'varve ls' for the overview" in status_error
+    assert "Unknown module: 4" not in status_error
+
+
+def test_dynamic_args_before_module_fail_and_after_module_execute_real_store(
+    tmp_path: Path,
+) -> None:
+    entry = _run_demo(tmp_path / "demo" / "out")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "run",
+                "--workers",
+                "4",
+                CliDemo.__module__,
+                "--root",
+                str(tmp_path),
+                "--force",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert (entry.output_root / "sample.txt").read_text(encoding="utf-8") == "1"
 
     assert (
-        main(["show", "demo", "--branch", "quick", "--root", str(tmp_path), "--include-temp"]) == 0
-    )
-    detail = capsys.readouterr().out
-    assert "Status: error" in detail
-    assert "Error: import:" in detail
-
-
-def test_ls_returns_nonzero_for_empty_scan_root(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    assert main(["ls", "--root", str(tmp_path / "missing")]) == 1
-
-    captured = capsys.readouterr()
-    assert "No pipelines found" in captured.err
-    assert captured.out == ""
-
-
-def test_show_returns_nonzero_and_lists_known_ids_for_unknown_pipeline(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    Store(tmp_path / "alpha" / "out" / "main").ensure_initialized(
-        "Alpha",
-        module="varve.no_such_alpha",
-    )
-    Store(tmp_path / "beta" / "out" / "main").ensure_initialized(
-        "Beta",
-        module="varve.no_such_beta",
-    )
-
-    assert main(["show", "missing", "--root", str(tmp_path)]) == 1
-
-    captured = capsys.readouterr()
-    assert "Unknown pipeline: missing" in captured.err
-    assert "alpha --branch main" in captured.err
-    assert "beta --branch main" in captured.err
-
-
-def test_no_subcommand_defaults_to_ls(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _run_demo(tmp_path / "default" / "out")
-    monkeypatch.chdir(tmp_path)
-
-    assert main([]) == 0
-
-    captured = capsys.readouterr()
-    assert "default" in captured.out
-
-
-def test_refresh_runs_executable_entries_in_discovery_order(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    entries = [
-        PipelineEntry(
-            output_root=tmp_path / "stale" / "out" / "main",
-            pipeline_id="stale",
-            pipeline_name="Stale",
-            branch="main",
-            module="tests.demo",
-        ),
-        PipelineEntry(
-            output_root=tmp_path / "dirty" / "out" / "main",
-            pipeline_id="dirty",
-            pipeline_name="Dirty",
-            branch="main",
-            module="tests.demo",
-        ),
-        PipelineEntry(
-            output_root=tmp_path / "no-cache" / "out" / "main",
-            pipeline_id="no-cache",
-            pipeline_name="NoCache",
-            branch="main",
-            module="tests.demo",
-        ),
-        PipelineEntry(
-            output_root=tmp_path / "resume" / "out" / "main",
-            pipeline_id="resume",
-            pipeline_name="Resume",
-            branch="main",
-            module="tests.demo",
-        ),
-        PipelineEntry(
-            output_root=tmp_path / "artifact-missing" / "out" / "main",
-            pipeline_id="artifact-missing",
-            pipeline_name="ArtifactMissing",
-            branch="main",
-            module="tests.demo",
-        ),
-        PipelineEntry(
-            output_root=tmp_path / "hit" / "out" / "main",
-            pipeline_id="hit",
-            pipeline_name="Hit",
-            branch="main",
-            module="tests.demo",
-        ),
-    ]
-
-    def fake_discover(root: Path, *, include_temporary: bool = False):
-        assert root == tmp_path
-        assert include_temporary is True
-        return entries
-
-    state_reads: dict[str, int] = {}
-
-    def fake_state(entry: PipelineEntry, _session):
-        reads = state_reads.get(entry.pipeline_id, 0)
-        state_reads[entry.pipeline_id] = reads + 1
-        if entry.pipeline_id == "hit" or reads:
-            status = "hit"
-        elif entry.pipeline_id == "resume":
-            status = "resume"
-        elif entry.pipeline_id == "dirty":
-            status = "failed"
-        else:
-            status = "needs-run"
-        return PipelineState(entry=entry, stages=[], status=status, error=None)
-
-    refreshed: list[tuple[str, str]] = []
-    monkeypatch.setattr("varve.dashboard.cli.discover_pipelines", fake_discover)
-    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
-    monkeypatch.setattr(
-        "varve.dashboard.cli._run_entry",
-        lambda entry: refreshed.append((entry.pipeline_id, entry.branch)),
-    )
-
-    assert main(["refresh", "--root", str(tmp_path), "--include-temp"]) == 0
-
-    captured = capsys.readouterr()
-    assert refreshed == [
-        ("stale", "main"),
-        ("dirty", "main"),
-        ("no-cache", "main"),
-        ("resume", "main"),
-        ("artifact-missing", "main"),
-    ]
-    assert "refresh stale --branch main" in captured.err
-    assert "refresh dirty --branch main" in captured.err
-
-
-def test_refresh_prefix_filters_entries_by_module(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    entries = [
-        PipelineEntry(
-            output_root=tmp_path / "match" / "out" / "main",
-            pipeline_id="match",
-            pipeline_name="Match",
-            branch="main",
-            module="studies.exp.analysis.match",
-        ),
-        PipelineEntry(
-            output_root=tmp_path / "other" / "out" / "main",
-            pipeline_id="other",
-            pipeline_name="Other",
-            branch="main",
-            module="studies.exp.audit.other",
-        ),
-        PipelineEntry(
-            output_root=tmp_path / "legacy" / "out" / "main",
-            pipeline_id="legacy",
-            pipeline_name="Legacy",
-            branch="main",
-            module=None,
-        ),
-    ]
-
-    monkeypatch.setattr(
-        "varve.dashboard.cli.discover_pipelines",
-        lambda root, *, include_temporary=False: entries,
-    )
-    checked: list[str] = []
-
-    def fake_state(entry: PipelineEntry, _session):
-        checked.append(entry.pipeline_id)
-        status = "needs-run" if checked.count(entry.pipeline_id) == 1 else "hit"
-        return PipelineState(entry=entry, stages=[], status=status, error=None)
-
-    refreshed: list[str] = []
-    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
-    monkeypatch.setattr(
-        "varve.dashboard.cli._run_entry",
-        lambda entry: refreshed.append(entry.pipeline_id),
-    )
-
-    assert main(["refresh", "--root", str(tmp_path), "--prefix", "studies.exp.analysis"]) == 0
-
-    assert checked == ["match", "match"]
-    assert refreshed == ["match"]
-
-
-def test_refresh_initializes_cli_logging(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    entry = PipelineEntry(
-        output_root=tmp_path / "stale" / "out" / "main",
-        pipeline_id="stale",
-        pipeline_name="Stale",
-        branch="main",
-        module="tests.demo",
-    )
-    monkeypatch.setattr(
-        "varve.dashboard.cli.discover_pipelines",
-        lambda root, *, include_temporary=False: [entry],
-    )
-    reads = 0
-
-    def fake_state(item, _session):
-        nonlocal reads
-        reads += 1
-        return PipelineState(
-            entry=item, stages=[], status="needs-run" if reads == 1 else "hit", error=None
-        )
-
-    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
-    calls: list[bool] = []
-    monkeypatch.setattr(
-        "varve.dashboard.cli.configure_cli_logging",
-        lambda verbose=False: calls.append(verbose),
-        raising=False,
-    )
-    monkeypatch.setattr("varve.dashboard.cli._run_entry", lambda item: None)
-
-    assert main(["refresh", "--root", str(tmp_path)]) == 0
-
-    assert calls == [False]
-
-
-def test_refresh_noops_when_no_entries_are_executable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    entry = PipelineEntry(
-        output_root=tmp_path / "hit" / "out" / "main",
-        pipeline_id="hit",
-        pipeline_name="Hit",
-        branch="main",
-        module="tests.demo",
-    )
-
-    monkeypatch.setattr(
-        "varve.dashboard.cli.discover_pipelines",
-        lambda root, *, include_temporary=False: [entry],
-    )
-    monkeypatch.setattr(
-        "varve.dashboard.cli.load_state",
-        lambda item, _session: PipelineState(entry=item, stages=[], status="hit", error=None),
-    )
-    monkeypatch.setattr(
-        "varve.dashboard.cli._run_entry",
-        lambda item: pytest.fail("refresh should skip non-executable entries"),
-    )
-
-    assert main(["refresh", "--root", str(tmp_path)]) == 0
-
-    captured = capsys.readouterr()
-    assert captured.out == "All selected pipelines are complete.\n"
-
-
-def test_refresh_review_only_returns_two_and_skips_pipeline(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    entry = PipelineEntry(
-        output_root=tmp_path / "review" / "out" / "main",
-        pipeline_id="review",
-        pipeline_name="Review",
-        branch="main",
-        module="tests.demo",
-    )
-    state = PipelineState(
-        entry=entry,
-        stages=[
-            StageState(
-                name="build",
-                status="hit",
-                reason="hit",
-                source_review="pending",
-                artifacts=[],
-                committed_at=None,
-                upstreams=[],
-            )
-        ],
-        status="hit",
-    )
-    monkeypatch.setattr(
-        "varve.dashboard.cli.discover_pipelines",
-        lambda root, *, include_temporary=False: [entry],
-    )
-    monkeypatch.setattr("varve.dashboard.cli.load_state", lambda item, session: state)
-    monkeypatch.setattr(
-        "varve.dashboard.cli._run_entry",
-        lambda item: pytest.fail("pending review must block refresh"),
-    )
-
-    assert main(["refresh", "--root", str(tmp_path)]) == 2
-    output = capsys.readouterr().out
-    assert "REVIEW REQUIRED" in output
-    assert "review  main  build" in output
-
-
-def test_refresh_reports_review_failure_error_and_pending_together(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    entries = [
-        PipelineEntry(
-            output_root=tmp_path / name / "out" / "main",
-            pipeline_id=name,
-            pipeline_name=name.title(),
-            branch="main",
-            module="tests.demo",
-        )
-        for name in ("review", "failed", "broken", "pending")
-    ]
-
-    def stage_state(
-        name: str,
-        status: str,
-        reason: str,
-        *,
-        review: str = "confirmed",
-        failure: str | None = None,
-    ):
-        return StageState(
-            name=name,
-            status=status,
-            reason=reason,
-            failure=failure,
-            source_review=review,
-            artifacts=[],
-            committed_at=None,
-            upstreams=[],
-        )
-
-    def fake_state(entry: PipelineEntry, _session):
-        if entry.pipeline_id == "review":
-            stages = [stage_state("build", "hit", "hit", review="pending")]
-            return PipelineState(entry=entry, stages=stages, status="hit")
-        if entry.pipeline_id == "failed":
-            stages = [
-                stage_state(
-                    "render",
-                    "failed",
-                    "stage-failed",
-                    failure="RuntimeError: Chromium exited",
-                )
+        main(
+            [
+                "run",
+                CliDemo.__module__,
+                "--root",
+                str(tmp_path),
+                "--workers",
+                "5",
+                "--force",
             ]
-            return PipelineState(entry=entry, stages=stages, status="failed")
-        if entry.pipeline_id == "broken":
-            return PipelineState(
-                entry=entry,
-                stages=[],
-                status="error",
-                error=StateError(phase="import", message="No module named demo"),
-            )
-        stages = [stage_state("aggregate", "resume", "81/100")]
-        return PipelineState(entry=entry, stages=stages, status="resume")
-
-    monkeypatch.setattr(
-        "varve.dashboard.cli.discover_pipelines",
-        lambda root, *, include_temporary=False: entries,
+        )
+        == 0
     )
-    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_state)
-    refreshed: list[str] = []
+    assert (entry.output_root / "sample.txt").read_text(encoding="utf-8") == "5"
+
+
+def test_illegal_option_operand_is_not_imported_as_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _run_demo(tmp_path / "demo" / "out")
+    imported = []
     monkeypatch.setattr(
-        "varve.dashboard.cli._run_entry",
-        lambda entry: refreshed.append(entry.pipeline_id),
+        "varve.dashboard.cli.import_entry_pipeline",
+        lambda entry: imported.append(entry) or CliDemo,
     )
 
-    assert main(["refresh", "--root", str(tmp_path)]) == 1
+    with pytest.raises(SystemExit) as exc_info:
+        main(["run", "--bogus", "4", "--root", str(tmp_path)])
+    assert exc_info.value.code == 2
+    assert imported == []
+    assert "Unknown module: 4" not in capsys.readouterr().err
 
+
+def test_dynamic_value_matching_existing_module_and_typo_target_execute_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entry = _run_demo(tmp_path / "demo" / "out")
+    executed = []
+    monkeypatch.setattr(
+        "varve.dashboard.cli.run_command",
+        lambda *args, **kwargs: executed.append((args, kwargs)) or 0,
+    )
+
+    with pytest.raises(SystemExit) as ordering_error:
+        main(
+            [
+                "run",
+                "--label",
+                CliDemo.__module__,
+                "typo.module",
+                "--root",
+                str(tmp_path),
+            ]
+        )
+    assert ordering_error.value.code == 2
+    assert executed == []
+
+    assert (
+        main(
+            [
+                "run",
+                "typo.module",
+                "--root",
+                str(tmp_path),
+                "--label",
+                CliDemo.__module__,
+            ]
+        )
+        == 1
+    )
+    assert executed == []
+    assert (entry.output_root / "sample.txt").read_text(encoding="utf-8") == "1"
+    error = capsys.readouterr().err
+    assert "Unknown module: typo.module" in error
+
+
+def test_top_level_plan_does_not_construct_required_pipeline_args(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output_base = tmp_path / "required" / "out"
+    run(
+        RequiredArgsDemo,
+        Config(),
+        args=RequiredArgs(workers=2),
+        cli_out=output_base,
+    )
+    capsys.readouterr()
+
+    assert RequiredArgsDemo.cli(["plan", "--out", str(output_base), "--only", "sample"]) == 0
+    generated = capsys.readouterr().out.strip()
+    assert (
+        main(
+            [
+                "plan",
+                RequiredArgsDemo.__module__,
+                "--root",
+                str(tmp_path),
+                "--only",
+                "sample",
+            ]
+        )
+        == 0
+    )
+    top_level = capsys.readouterr().out.strip()
+    assert generated == top_level == "sample"
+
+
+def test_partial_matrix_summary_heading_matches_generated_and_top_level_status(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output_base = tmp_path / "matrix" / "out"
+    run(MatrixCliDemo, Config(), args=Args(), cli_out=output_base)
+    capsys.readouterr()
+
+    assert MatrixCliDemo.cli(["status", "score@model=y", "--out", str(output_base)]) == 0
+    generated = capsys.readouterr().out
+    assert (
+        main(
+            [
+                "status",
+                MatrixCliDemo.__module__,
+                "--root",
+                str(tmp_path),
+                "--stage",
+                "score@model=y",
+            ]
+        )
+        == 0
+    )
+    top_level = capsys.readouterr().out
+    assert "score@model=y  2 cells" in generated
+    assert "score@model=y  2 cells" in top_level
+
+
+def test_bulk_run_rejects_stage_force_and_pipeline_args(tmp_path: Path) -> None:
+    for extra in (
+        ["--only", "sample"],
+        ["--force"],
+        ["--workers", "4"],
+    ):
+        with pytest.raises(SystemExit):
+            main(["run", "--all", "--root", str(tmp_path), *extra])
+
+
+def test_top_level_rejects_identity_changing_options(tmp_path: Path) -> None:
+    for option in ("--out", "--override", "--slice"):
+        with pytest.raises(SystemExit):
+            main(["run", CliDemo.__module__, "--root", str(tmp_path), option, "value"])
+
+
+def test_overview_filters_before_exact_evaluation_and_status_after(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entries = [
+        PipelineEntry(
+            output_root=tmp_path / name,
+            pipeline_id=name,
+            pipeline_name="CliDemo",
+            branch="main",
+            module=f"pkg.{name}",
+        )
+        for name in ("hit", "review", "other")
+    ]
+    selected = entries[:2]
+    checked = []
+    monkeypatch.setattr(commands, "discover_scope", lambda *args, **kwargs: selected)
+
+    def fake_load(entry, session):
+        checked.append((entry.module, session))
+        return _state(entry, "needs-review" if entry.module == "pkg.review" else "hit")
+
+    monkeypatch.setattr(commands, "load_state", fake_load)
+    assert (
+        commands.overview_command(
+            tmp_path,
+            prefix="pkg.",
+            branch="main",
+            include_temp=False,
+            rehash=False,
+            statuses=("needs-review",),
+        )
+        == 0
+    )
+    assert [item[0] for item in checked] == ["pkg.hit", "pkg.review"]
+    assert checked[0][1] is checked[1][1]
     output = capsys.readouterr().out
-    assert refreshed == ["failed", "pending"]
-    assert "REVIEW REQUIRED" in output
-    assert "review  main  build" in output
+    assert "pkg.review" in output
+    assert "pkg.hit" not in output
+
+
+def test_overview_empty_discovery_is_failure_but_empty_status_is_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(commands, "discover_scope", lambda *args, **kwargs: [])
+    assert (
+        commands.overview_command(
+            tmp_path,
+            prefix="pkg",
+            branch="main",
+            include_temp=False,
+            rehash=False,
+            statuses=(),
+        )
+        == 1
+    )
+    assert "root=" in capsys.readouterr().err
+
+    entry = PipelineEntry(
+        output_root=tmp_path,
+        pipeline_id="demo",
+        pipeline_name="Demo",
+        branch="main",
+        module="pkg.demo",
+    )
+    monkeypatch.setattr(commands, "discover_scope", lambda *args, **kwargs: [entry])
+    monkeypatch.setattr(commands, "load_state", lambda entry, session: _state(entry, "hit"))
+    assert (
+        commands.overview_command(
+            tmp_path,
+            prefix=None,
+            branch=None,
+            include_temp=False,
+            rehash=False,
+            statuses=("failed",),
+        )
+        == 0
+    )
+    assert "No pipelines match the selected statuses." in capsys.readouterr().out
+
+
+def test_narrow_overview_keeps_complete_module_on_its_own_line(tmp_path: Path) -> None:
+    module = "studies.exp.metric_eval.benchmark_misjudgment.run"
+    entry = PipelineEntry(
+        output_root=tmp_path,
+        pipeline_id="short",
+        pipeline_name="Demo",
+        branch="main",
+        module=module,
+    )
+    buffer = StringIO()
+    console = Console(file=buffer, width=45, force_terminal=False)
+    render_overview([_state(entry, "needs-review")], console=console)
+    output = buffer.getvalue()
+    assert module in output
+    assert "…" not in output
+    assert "needs-review" in output
+
+
+def test_overview_error_row_does_not_hide_later_pipeline(tmp_path: Path) -> None:
+    first = PipelineEntry(
+        output_root=tmp_path / "broken",
+        pipeline_id="broken",
+        pipeline_name="Broken",
+        branch="main",
+        module="pkg.broken",
+    )
+    second = first.model_copy(
+        update={"output_root": tmp_path / "good", "pipeline_id": "good", "module": "pkg.good"}
+    )
+    buffer = StringIO()
+    render_overview(
+        [_state(first, "error", reason="cannot import"), _state(second, "hit")],
+        console=Console(file=buffer, width=120, force_terminal=False),
+    )
+    output = buffer.getvalue()
+    assert "pkg.broken" in output and "error" in output
+    assert "pkg.good" in output and "hit" in output
+
+
+def test_non_tty_loading_emits_no_spinner() -> None:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=False)
+    with commands._loading(console, "Discovering pipelines…") as loading:
+        assert loading is None
+    assert buffer.getvalue() == ""
+
+
+def test_bulk_review_continues_after_entry_failure_and_uses_default_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entries = [
+        PipelineEntry(
+            output_root=tmp_path / name,
+            pipeline_id=name,
+            pipeline_name="CliDemo",
+            branch="main",
+            module=f"pkg.{name}",
+        )
+        for name in ("good", "other", "bad")
+    ]
+    monkeypatch.setattr(commands, "discover_scope", lambda *args, **kwargs: entries)
+
+    def fake_import(entry):
+        if entry.pipeline_id == "bad":
+            raise RuntimeError("locked")
+        return CliDemo
+
+    monkeypatch.setattr("varve.dashboard.state.import_entry_pipeline", fake_import)
+    seen_args = []
+
+    def fake_context(entry, pipeline, args):
+        seen_args.append(args)
+        return type(
+            "Context",
+            (),
+            {
+                "config": Config(),
+                "args": args,
+                "output_base": tmp_path,
+                "branch": "main",
+                "is_temporary": False,
+                "axes": None,
+                "graph": pipeline.graph(),
+            },
+        )()
+
+    monkeypatch.setattr(commands, "resolve_entry_context", fake_context)
+    refreshes = []
+    created_sessions = []
+
+    class Session:
+        def __init__(self):
+            created_sessions.append(self)
+
+        def refresh_observations(self):
+            refreshes.append(True)
+
+    monkeypatch.setattr(commands, "_KeyingSession", Session)
+    result = SourceReviewResult(
+        decision="accept",
+        groups=(),
+        matched_cells=(),
+        source_changed_cells=(),
+        recorded=(),
+        already_decided=(),
+        did_not_need_review=(),
+    )
+    backend_sessions = []
+
+    def fake_review(*args, **kwargs):
+        backend_sessions.append(kwargs["_keying_session"])
+        return result
+
+    monkeypatch.setattr(commands, "record_source_review", fake_review)
+
+    assert (
+        commands.bulk_review_command(
+            tmp_path,
+            prefix=None,
+            branch=None,
+            include_temp=False,
+            decision="accept",
+        )
+        == 1
+    )
+    assert seen_args == [Args(), Args()]
+    assert len(created_sessions) == 1
+    assert backend_sessions == [created_sessions[0], created_sessions[0]]
+    assert len(refreshes) == 3
+    assert "pkg.bad" in capsys.readouterr().out
+
+
+def test_bulk_run_skips_hit_and_review_runs_eligible_then_rechecks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    entries = [
+        PipelineEntry(
+            output_root=tmp_path / name,
+            pipeline_id=name,
+            pipeline_name="CliDemo",
+            branch="main",
+            module=f"pkg.{name}",
+        )
+        for name in ("hit", "review", "stale")
+    ]
+    monkeypatch.setattr(commands, "discover_scope", lambda *args, **kwargs: entries)
+    reads: dict[str, int] = {}
+
+    def fake_load(entry, session):
+        reads[entry.pipeline_id] = reads.get(entry.pipeline_id, 0) + 1
+        if entry.pipeline_id == "hit":
+            return _state(entry, "hit")
+        if entry.pipeline_id == "review":
+            return _state(entry, "needs-review")
+        return _state(entry, "needs-run" if reads[entry.pipeline_id] == 1 else "hit")
+
+    monkeypatch.setattr(commands, "load_state", fake_load)
+    monkeypatch.setattr("varve.dashboard.state.import_entry_pipeline", lambda entry: CliDemo)
+    monkeypatch.setattr(commands, "resolve_entry_context", lambda *args: object())
+    ran = []
+    monkeypatch.setattr(commands, "_run_context", lambda context, rehash: ran.append(context))
+    refreshes = []
+
+    class Session:
+        def __init__(self, **kwargs):
+            pass
+
+        def refresh_observations(self):
+            refreshes.append(True)
+
+    monkeypatch.setattr(commands, "_KeyingSession", Session)
+
+    assert (
+        commands.bulk_run_command(
+            tmp_path,
+            prefix=None,
+            branch=None,
+            include_temp=False,
+            rehash=False,
+        )
+        == 2
+    )
+    assert len(ran) == 1
+    assert reads == {"hit": 1, "review": 1, "stale": 2}
+    assert len(refreshes) == 2
+    output = capsys.readouterr().out
+    assert "TO REVIEW" in output
+    assert "pkg.review" in output
+
+
+def test_bulk_run_mixed_failure_returns_one_and_preserves_all_groups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    review = PipelineEntry(
+        output_root=tmp_path / "review",
+        pipeline_id="review",
+        pipeline_name="CliDemo",
+        branch="main",
+        module="pkg.review",
+    )
+    failed = review.model_copy(
+        update={"output_root": tmp_path / "failed", "pipeline_id": "failed", "module": "pkg.failed"}
+    )
+    monkeypatch.setattr(commands, "discover_scope", lambda *args, **kwargs: [review, failed])
+    monkeypatch.setattr(
+        commands,
+        "load_state",
+        lambda entry, session: _state(
+            entry, "needs-review" if entry.pipeline_id == "review" else "failed"
+        ),
+    )
+    monkeypatch.setattr("varve.dashboard.state.import_entry_pipeline", lambda entry: CliDemo)
+    monkeypatch.setattr(commands, "resolve_entry_context", lambda *args: object())
+    monkeypatch.setattr(commands, "_run_context", lambda *args, **kwargs: None)
+
+    assert (
+        commands.bulk_run_command(
+            tmp_path,
+            prefix=None,
+            branch=None,
+            include_temp=False,
+            rehash=False,
+        )
+        == 1
+    )
+    output = capsys.readouterr().out
+    assert "TO REVIEW" in output
     assert "FAILED" in output
-    assert "failed  main  render  RuntimeError: Chromium exited" in output
-    assert "ERROR" in output
-    assert "broken  main  import  No module named demo" in output
-    assert "STILL PENDING" in output
-    assert "pending  main  aggregate  resume  81/100" in output
-
-
-def test_render_detail_styles_status(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    buffer = StringIO()
-
-    def console_factory(**kwargs):
-        return Console(
-            file=buffer,
-            force_terminal=True,
-            color_system="standard",
-            no_color=False,
-            width=120,
-            **kwargs,
-        )
-
-    monkeypatch.setattr(render, "make_console", console_factory)
-    state = PipelineState(
-        entry=PipelineEntry(
-            output_root=tmp_path,
-            pipeline_id="demo",
-            pipeline_name="Demo",
-            branch="main",
-        ),
-        stages=[],
-        status="error",
-        error=StateError(phase="import", message="missing"),
-    )
-
-    render_detail(state)
-
-    assert "Status: \x1b[31merror\x1b[0m" in buffer.getvalue()
-    assert "Error: import: missing" in buffer.getvalue()
-
-
-def test_render_overview_groups_repeated_pipeline_names(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    buffer = StringIO()
-
-    def console_factory(**kwargs):
-        return Console(
-            file=buffer,
-            force_terminal=False,
-            width=120,
-            **kwargs,
-        )
-
-    monkeypatch.setattr(render, "make_console", console_factory)
-    states = [
-        PipelineState(
-            entry=PipelineEntry(
-                output_root=tmp_path / "demo" / "out" / "main",
-                pipeline_id="demo",
-                pipeline_name="Demo",
-                branch="main",
-            ),
-            stages=[],
-            status="hit",
-            error=None,
-        ),
-        PipelineState(
-            entry=PipelineEntry(
-                output_root=tmp_path / "demo" / "out" / ".tmp" / "quick",
-                pipeline_id="demo",
-                pipeline_name="Demo",
-                branch="quick",
-            ),
-            stages=[],
-            status="hit",
-            error=None,
-        ),
-    ]
-
-    render_overview(states)
-
-    output = buffer.getvalue()
-    assert output.count("demo") == 1
-    assert "main" in output
-    assert "quick" in output
-
-
-def test_render_overview_shows_total_stage_elapsed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    buffer = StringIO()
-
-    def console_factory(**kwargs):
-        return Console(
-            file=buffer,
-            force_terminal=False,
-            width=120,
-            **kwargs,
-        )
-
-    monkeypatch.setattr(render, "make_console", console_factory)
-    state = PipelineState(
-        entry=PipelineEntry(
-            output_root=tmp_path / "demo" / "out" / "main",
-            pipeline_id="demo",
-            pipeline_name="Demo",
-            branch="main",
-        ),
-        stages=[
-            StageState(
-                name="sample",
-                status="hit",
-                reason="hit",
-                artifacts=[],
-                committed_at=None,
-                upstreams=[],
-                elapsed=1.25,
-            ),
-            StageState(
-                name="summary",
-                status="hit",
-                reason="hit",
-                artifacts=[],
-                committed_at=None,
-                upstreams=["sample"],
-                elapsed=2.5,
-            ),
-        ],
-        status="hit",
-        error=None,
-    )
-
-    render_overview([state])
-
-    output = buffer.getvalue()
-    assert "DURATION" in output
-    assert "3.75s" in output
-
-
-def test_ls_shares_one_keying_session_across_pipeline_loop(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    entries = [
-        PipelineEntry(
-            output_root=tmp_path / name / "out" / "main",
-            pipeline_id=name,
-            pipeline_name="Demo",
-            branch="main",
-            module="tests.demo",
-        )
-        for name in ("first", "second")
-    ]
-    sessions = []
-    monkeypatch.setattr(
-        "varve.dashboard.cli.discover_pipelines",
-        lambda root, *, include_temporary=False: entries,
-    )
-
-    def fake_load(entry, session):
-        sessions.append(session)
-        return PipelineState(entry=entry, stages=[], status="hit", error=None)
-
-    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_load)
-    monkeypatch.setattr("varve.dashboard.cli.render_overview", lambda states: None)
-
-    assert main(["ls", "--root", str(tmp_path)]) == 0
-    assert sessions[0] is sessions[1]
-
-
-def test_refresh_discards_dashboard_observations_after_failed_run(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    entries = [
-        PipelineEntry(
-            output_root=tmp_path / name / "out" / "main",
-            pipeline_id=name,
-            pipeline_name="Demo",
-            branch="main",
-            module="tests.demo",
-        )
-        for name in ("first", "second")
-    ]
-    observed_record_counts = []
-    monkeypatch.setattr(
-        "varve.dashboard.cli.discover_pipelines",
-        lambda root, *, include_temporary=False: entries,
-    )
-
-    def fake_load(entry, session):
-        observed_record_counts.append(len(session.records))
-        session.records[(entry.output_root, "stage")] = object()
-        return PipelineState(entry=entry, stages=[], status="needs-run", error=None)
-
-    monkeypatch.setattr("varve.dashboard.cli.load_state", fake_load)
-    calls = 0
-
-    def fake_run(_entry):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RuntimeError("failed after side effect")
-
-    monkeypatch.setattr("varve.dashboard.cli._run_entry", fake_run)
-
-    assert main(["refresh", "--root", str(tmp_path)]) == 1
-    assert observed_record_counts == [0, 0, 0, 0]
-
-
-def test_loading_status_is_tty_only_and_transient(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("TERM", "xterm-256color")
-    tty_buffer = StringIO()
-    tty_console = Console(file=tty_buffer, force_terminal=True, force_interactive=True)
-    with _loading(tty_console, "Discovering pipelines…") as status:
-        assert status is not None
-        assert status.status == "Discovering pipelines…"
-        sleep(0.12)
-    assert "Discovering pipelines…" in tty_buffer.getvalue()
-
-    redirected_buffer = StringIO()
-    redirected_console = Console(file=redirected_buffer, force_terminal=False)
-    with _loading(redirected_console, "Discovering pipelines…"):
-        pass
-    assert redirected_buffer.getvalue() == ""

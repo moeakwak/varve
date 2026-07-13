@@ -10,15 +10,19 @@ import pytest
 from pydantic import BaseModel
 from rich.console import Console
 
-from varve import Pipeline, stage
+from varve import Axis, Pipeline, matrix, stage
+from varve.branch_config import ResolvedBranch
+from varve.cli.review import render_source_review
 from varve.cli.status import reason_text, render_status
-from varve.engine.runner import run
+from varve.command import resolved_command_context
+from varve.engine.runner import record_source_review, run
 from varve.status import (
     CellCoordinate,
     collect_pipeline_status,
     source_component_changes,
 )
 from varve.store.store import Store
+from varve.style import _THEME
 
 
 class Config(BaseModel):
@@ -65,6 +69,52 @@ class DownstreamPipeline(Pipeline):
         (ctx.out / "finish.txt").write_text(value, encoding="utf-8")
 
 
+BENCH = Axis("bench", ["a", "b"])
+MODEL = Axis("model", ["x", "y"])
+
+
+class MatrixStatusPipeline(Pipeline):
+    Config = Config
+
+    @matrix(BENCH, MODEL)
+    @stage(produces="score.txt")
+    def score(self, ctx, *, bench: str, model: str):
+        ctx.cell_out.mkdir(parents=True, exist_ok=True)
+        (ctx.cell_out / "score.txt").write_text(f"{bench}:{model}", encoding="utf-8")
+
+
+HIGH_ROW = Axis("row", [f"r{index}" for index in range(10)])
+HIGH_COLUMN = Axis("column", [f"c{index}" for index in range(12)])
+
+
+class HighCardinalityStatusPipeline(Pipeline):
+    Config = Config
+
+    @matrix(HIGH_ROW, HIGH_COLUMN)
+    @stage(produces="score.txt")
+    def score(self, ctx, *, row: str, column: str):
+        ctx.cell_out.mkdir(parents=True, exist_ok=True)
+        (ctx.cell_out / "score.txt").write_text(f"{row}:{column}", encoding="utf-8")
+
+
+def collect_status(
+    pipeline,
+    config,
+    *,
+    out: Path,
+    branch: str = "main",
+    selector: str | None = None,
+):
+    resolved = ResolvedBranch(
+        config=config,
+        branch=branch,
+        is_temporary=False,
+        output_base=out.parent,
+    )
+    context = resolved_command_context(pipeline, resolved, pipeline.Args())
+    return collect_pipeline_status(context, selector=selector)
+
+
 def test_collect_status_reads_previous_record(tmp_path: Path) -> None:
     run(SharedDependencyPipeline, Config(), cli_out=tmp_path)
     store = Store(tmp_path / "main")
@@ -72,15 +122,16 @@ def test_collect_status_reads_previous_record(tmp_path: Path) -> None:
     assert previous is not None
     store.write_success(previous.model_copy(update={"elapsed": 1.25}))
 
-    stage_status = collect_pipeline_status(
+    stage_status = collect_status(
         SharedDependencyPipeline,
         Config(),
-        args=SharedDependencyPipeline.Args(),
         out=tmp_path / "main",
-        branch="main",
     ).stages[0]
 
     assert stage_status.status == "hit"
+    assert stage_status.execution_status == "hit"
+    assert stage_status.source_relationship == "current"
+    assert stage_status.review_decision == "none"
     assert stage_status.decision_key is not None
     assert stage_status.stored_key is not None
     assert stage_status.duration == 1.25
@@ -94,13 +145,11 @@ def test_collect_status_keeps_previous_duration_when_upstream_record_is_missing(
     store = Store(tmp_path / "main")
     (store.root / "stages" / "prepare.json").unlink()
 
-    downstream = collect_pipeline_status(
+    downstream = collect_status(
         DownstreamPipeline,
         Config(),
-        args=DownstreamPipeline.Args(),
         out=tmp_path / "main",
-        branch="main",
-        stage="finish",
+        selector="finish",
     ).stages[0]
 
     assert downstream.status == "needs-run"
@@ -123,12 +172,10 @@ def test_source_component_changes_classifies_changed_added_and_removed() -> None
 def test_collect_status_marks_inputs_unavailable_after_missing_upstream(
     tmp_path: Path,
 ) -> None:
-    status = collect_pipeline_status(
+    status = collect_status(
         DownstreamPipeline,
         Config(),
-        args=DownstreamPipeline.Args(),
         out=tmp_path / "main",
-        branch="main",
     )
 
     assert [stage.name for stage in status.stages] == ["prepare", "finish"]
@@ -139,13 +186,12 @@ def test_collect_status_marks_inputs_unavailable_after_missing_upstream(
 
 
 def test_collect_status_filters_after_whole_pipeline_probe(tmp_path: Path) -> None:
-    status = collect_pipeline_status(
+    status = collect_status(
         DownstreamPipeline,
         Config(),
-        args=DownstreamPipeline.Args(),
         out=tmp_path / "main",
         branch="experiment",
-        stage="finish",
+        selector="finish",
     )
 
     assert status.pipeline == "DownstreamPipeline"
@@ -154,25 +200,21 @@ def test_collect_status_filters_after_whole_pipeline_probe(tmp_path: Path) -> No
 
 
 def test_collect_status_rejects_unknown_stage_before_probing(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="Unknown varve stage: missing"):
-        collect_pipeline_status(
+    with pytest.raises(ValueError, match="Unknown varve stage: 'missing'"):
+        collect_status(
             DownstreamPipeline,
             Config(),
-            args=DownstreamPipeline.Args(),
             out=tmp_path / "main",
-            branch="main",
-            stage="missing",
+            selector="missing",
         )
 
 
 @pytest.fixture
 def pipeline_status(tmp_path: Path):
-    return collect_pipeline_status(
+    return collect_status(
         SharedDependencyPipeline,
         Config(),
-        args=SharedDependencyPipeline.Args(),
         out=tmp_path / "main",
-        branch="main",
     )
 
 
@@ -231,7 +273,7 @@ def test_summary_shows_duration_folds_needs_and_omits_key(pipeline_status) -> No
     assert "DURATION" in output
     assert "1.25s" in output
     assert "extract, text_arm · +4 more" in output
-    assert "confirmed" in output
+    assert "REVIEW" not in output
     assert "test_status.shared_helper" not in output
     assert "KEY" not in output
 
@@ -252,6 +294,7 @@ def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
             cell=coordinate("a"),
             logical_needs=("prepare",),
             status="hit",
+            execution_status="hit",
             reason="hit",
             summary_reason="hit",
             duration=1.0,
@@ -263,6 +306,7 @@ def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
             cell=coordinate("b"),
             logical_needs=("prepare",),
             status="needs-run",
+            execution_status="needs-run",
             reason="inputs-changed",
             summary_reason="inputs-changed",
             duration=2.0,
@@ -274,6 +318,7 @@ def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
             cell=coordinate("c"),
             logical_needs=("prepare",),
             status="failed",
+            execution_status="failed",
             reason="stage-failed",
             summary_reason="stage-failed",
             duration=None,
@@ -353,7 +398,7 @@ def test_stage_detail_shows_keys_and_source_review(pipeline_status) -> None:
 
     assert "Decision key" in folded
     assert "Stored key" in folded
-    assert "Source review" in folded
+    assert "Source" in folded
     assert "Decision key" in expanded
     assert "Stored key" in expanded
     assert "Decision key" in full
@@ -361,16 +406,26 @@ def test_stage_detail_shows_keys_and_source_review(pipeline_status) -> None:
     assert folded == expanded == full
 
 
-def test_pending_review_renders_as_source_changed(pipeline_status) -> None:
-    stage = replace(pipeline_status.stages[0], source_review="pending")
+def test_required_review_renders_as_effective_needs_review(pipeline_status) -> None:
+    stage = replace(
+        pipeline_status.stages[0],
+        status="needs-review",
+        reason="source-changed",
+        summary_reason="source-changed",
+        source_relationship="changed",
+        review_decision="none",
+    )
     status = replace(pipeline_status, stages=(stage,))
 
     summary = render_to_text(status, stage=None, depth=0)
     detail = render_to_text(status, stage="normalize", depth=0)
 
-    assert "1 source-changed" in summary
-    assert "Source review" in detail
-    assert "source-changed" in detail
+    assert "needs-review" in summary
+    assert "REVIEW" not in summary
+    assert "Source" in detail
+    assert "changed" in detail
+    assert "Review" in detail
+    assert "required" in detail
 
 
 def test_expanded_stage_preserves_complete_keys_on_narrow_terminals(
@@ -396,14 +451,180 @@ def test_expanded_stage_preserves_complete_keys_on_narrow_terminals(
 
 
 def test_stage_with_missing_upstream_explains_unavailable_inputs(tmp_path: Path) -> None:
-    status = collect_pipeline_status(
+    status = collect_status(
         DownstreamPipeline,
         Config(),
-        args=DownstreamPipeline.Args(),
         out=tmp_path / "main",
-        branch="main",
-        stage="finish",
+        selector="finish",
     )
     folded = render_to_text(status, stage="finish", depth=0)
     assert "Key inputs unavailable: upstream prepare has no success record" in folded
-    assert "Source review" in folded
+    assert "Source" in folded
+
+
+def test_partial_matrix_status_keeps_canonical_selector_and_full_probe_subset(
+    tmp_path: Path,
+) -> None:
+    status = collect_status(
+        MatrixStatusPipeline,
+        Config(),
+        out=tmp_path / "main",
+        selector="score@model=y",
+    )
+
+    assert status.selector is not None
+    assert status.selector.canonical == "score@model=y"
+    assert status.selector.matched_count == 2
+    assert [stage.name for stage in status.stages] == [
+        "score@bench=a,model=y",
+        "score@bench=b,model=y",
+    ]
+
+    summary_buffer = StringIO()
+    render_status(
+        Console(file=summary_buffer, width=100, color_system=None),
+        status,
+        view="summary",
+    )
+    summary = summary_buffer.getvalue()
+    assert "score@model=y  2 cells" in summary
+    assert "score@bench=" not in summary
+
+    buffer = StringIO()
+    render_status(
+        Console(file=buffer, width=100, color_system=None),
+        status,
+        view="cells",
+    )
+    output = buffer.getvalue()
+    assert "score@model=y  2 cells" in output
+    assert "BENCH" in output and "MODEL" in output
+    assert "REVIEW" not in output
+
+
+def test_matrix_effective_status_prioritizes_needs_review(pipeline_status) -> None:
+    original = pipeline_status.stages[0]
+    hit = replace(
+        original,
+        name="score@model=x",
+        base_name="score",
+        cell=(CellCoordinate(axis="model", value_id="x"),),
+        status="hit",
+        execution_status="hit",
+    )
+    required = replace(
+        original,
+        name="score@model=y",
+        base_name="score",
+        cell=(CellCoordinate(axis="model", value_id="y"),),
+        status="needs-review",
+        reason="source-changed",
+        summary_reason="source-changed",
+        execution_status="error",
+        execution_reason="cannot evaluate input",
+        source_relationship="changed",
+        review_decision="none",
+    )
+    status = replace(pipeline_status, stages=(hit, required))
+
+    assert status.status == "needs-review"
+    assert status.complete is False
+    assert status.groups[0].status == "needs-review"
+    assert status.groups[0].status_counts == (("needs-review", 1), ("hit", 1))
+
+
+def test_high_cardinality_status_probes_once_and_review_stays_folded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_base = tmp_path / "out"
+    output_root = output_base / "main"
+    run(HighCardinalityStatusPipeline, Config(), cli_out=output_base)
+    store = Store(output_root)
+    graph = HighCardinalityStatusPipeline.graph()
+    changed_stage = graph.base_cells["score"][0]
+    previous = store.read_success(changed_stage)
+    assert previous is not None
+    changed_source = previous.executed_source_fingerprint.model_copy(
+        update={"fingerprint": "changed-source-fingerprint"}
+    )
+    store.write_success(previous.model_copy(update={"executed_source_fingerprint": changed_source}))
+
+    from varve import status as status_module
+
+    real_probe = status_module.probe_pipeline
+    probe_calls = 0
+
+    def counting_probe(*args, **kwargs):
+        nonlocal probe_calls
+        probe_calls += 1
+        return real_probe(*args, **kwargs)
+
+    monkeypatch.setattr(status_module, "probe_pipeline", counting_probe)
+    status = collect_status(
+        HighCardinalityStatusPipeline,
+        Config(),
+        out=output_root,
+    )
+    assert probe_calls == 1
+    assert len(status.stages) == 120
+    assert status.status == "needs-review"
+    assert status.groups[0].status_counts == (("needs-review", 1), ("hit", 119))
+
+    status_buffer = StringIO()
+    render_status(
+        Console(file=status_buffer, width=180, color_system=None),
+        status,
+        view="summary",
+    )
+    rendered_status = status_buffer.getvalue()
+    assert "1 needs-review" in rendered_status
+    assert "119 hit" in rendered_status
+    assert "score@row=" not in rendered_status
+
+    result = record_source_review(
+        HighCardinalityStatusPipeline,
+        Config(),
+        decision="accept",
+        targets=("score",),
+        cli_out=output_base,
+    )
+    review_buffer = StringIO()
+    render_source_review(
+        Console(file=review_buffer, width=100, color_system=None, theme=_THEME),
+        result,
+    )
+    rendered_review = review_buffer.getvalue()
+    assert "1 decision recorded" in rendered_review
+    assert "119 cells did not need review" in rendered_review
+    assert "score@row=" not in rendered_review
+
+
+@pytest.mark.parametrize(
+    ("decision", "label", "effective"),
+    [("accept", "accepted", "hit"), ("reject", "rejected", "needs-run")],
+)
+def test_changed_source_detail_preserves_review_decision_and_files(
+    pipeline_status,
+    decision: str,
+    label: str,
+    effective: str,
+) -> None:
+    original = pipeline_status.stages[0]
+    stage = replace(
+        original,
+        status=effective,
+        reason="source-changed" if decision == "reject" else "hit",
+        summary_reason="source-changed" if decision == "reject" else "hit",
+        source_relationship="changed",
+        review_decision=decision,
+        source_changes={"pipeline.py": "changed"},
+    )
+    output = render_to_text(
+        replace(pipeline_status, stages=(stage,)),
+        stage=stage.name,
+        depth=0,
+    )
+    assert "Source" in output and "changed" in output
+    assert "Review" in output and label in output
+    assert "pipeline.py" in output

@@ -7,31 +7,21 @@ from pydantic import BaseModel
 
 from varve import Pipeline, stage
 from varve.dashboard.models import PipelineEntry
-from varve.dashboard.state import load_state
-from varve.engine.runner import StageProbe, run
-from varve.engine.state import Decision, SourceReviewState
-from varve.models import (
-    ArtifactFingerprint,
-    KeyComponents,
-    ProducedPath,
-    SourceFingerprint,
-    SuccessRecord,
+from varve.dashboard.state import (
+    load_state,
+    resolve_module_entry,
+    resolve_structure_pipeline,
 )
-from varve.status import legacy_source_review
-from varve.store.store import Store
+from varve.engine.runner import _KeyingSession, run
+from varve.status import PipelineStatus
 
 
 class Config(BaseModel):
     pass
 
 
-class Args(BaseModel):
-    pass
-
-
 class Demo(Pipeline):
     Config = Config
-    Args = Args
 
     @stage(produces="sample.txt")
     def sample(self, ctx):
@@ -42,212 +32,144 @@ class Demo(Pipeline):
         (ctx.out / "summary.txt").write_text("summary", encoding="utf-8")
 
 
-def _entry(output_root: Path, *, module: str | None = None) -> PipelineEntry:
+def _entry(
+    output_root: Path,
+    *,
+    module: str | None = None,
+    pipeline_name: str | None = "Demo",
+    branch: str = "main",
+    temporary: bool = False,
+) -> PipelineEntry:
     return PipelineEntry(
         output_root=output_root,
         pipeline_id="demo",
-        pipeline_name="Demo",
-        branch="main",
-        module=module if module is not None else Demo.__module__,
+        pipeline_name=pipeline_name,
+        branch=branch,
+        module=Demo.__module__ if module is None else module,
+        temporary=temporary,
     )
 
 
-def _components() -> KeyComponents:
-    return KeyComponents(config={}, inputs={}, values={}, upstreams={})
+def test_load_state_wraps_shared_pipeline_status(tmp_path: Path) -> None:
+    output_base = tmp_path / "demo" / "out"
+    run(Demo, Config(), cli_out=output_base)
+
+    state = load_state(_entry(output_base / "main"))
+
+    assert isinstance(state.pipeline_status, PipelineStatus)
+    assert state.status == "hit"
+    assert state.complete is True
+    assert [stage.name for stage in state.stages] == ["sample", "summary"]
+    assert all(stage.execution_status == "hit" for stage in state.stages)
 
 
-def _artifact(path: str) -> ArtifactFingerprint:
-    return ArtifactFingerprint(root=path, kind="file", manifest=[], fingerprint=f"hash:{path}")
+def test_load_state_passes_shared_command_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _KeyingSession()
+    seen = []
 
+    def fake_collect(context, *, session=None, **kwargs):
+        seen.append(session)
+        return PipelineStatus(
+            pipeline="Demo",
+            module=Demo.__module__,
+            branch="main",
+            output_root=context.output_root,
+            stages=(),
+        )
 
-def _single(stage_name: str, *, elapsed: float | None = None) -> SuccessRecord:
-    return SuccessRecord(
-        pipeline="Demo",
-        stage=stage_name,
-        kind="single",
-        input_key=f"sha256:{stage_name}",
-        key_components=_components(),
-        executed_source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
-        artifact_fingerprint="artifacts",
-        produces=[
-            ProducedPath(
-                path=f"{stage_name}.txt", kind="file", artifact=_artifact(f"{stage_name}.txt")
-            )
-        ],
-        committed_at="2026-06-24T10:00:00+00:00",
-        elapsed=elapsed,
-    )
-
-
-def _probe(stage: str, decision: Decision, previous: SuccessRecord | None) -> StageProbe:
-    return StageProbe(
-        stage=stage,
-        decision=decision,
-        decision_key=None,
-        components=None,
-        previous=previous,
-        source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
-        source_review=SourceReviewState("current"),
-    )
+    monkeypatch.setattr("varve.dashboard.state.collect_pipeline_status", fake_collect)
+    load_state(_entry(tmp_path / "demo" / "out" / "main"), session)
+    assert seen == [session]
 
 
 @pytest.mark.parametrize(
-    ("state", "legacy"),
+    ("entry", "phase"),
     [
-        (SourceReviewState("not-applicable"), "confirmed"),
-        (SourceReviewState("current"), "confirmed"),
-        (SourceReviewState("changed"), "pending"),
-        (SourceReviewState("changed", "accept"), "accepted"),
-        (SourceReviewState("changed", "reject"), "rerun-required"),
+        (
+            PipelineEntry(
+                output_root=Path("/tmp/bad"),
+                pipeline_id="bad",
+                pipeline_name=None,
+                branch="main",
+                manifest_error="bad json",
+            ),
+            "manifest",
+        ),
+        (_entry(Path("/tmp/import"), module="varve.no_such_module"), "import"),
+        (_entry(Path("/tmp/resolve"), branch="missing"), "resolve"),
     ],
 )
-def test_legacy_source_review_is_converted_only_at_the_view_boundary(
-    state: SourceReviewState,
-    legacy: str,
-) -> None:
-    assert legacy_source_review(state) == legacy
-
-
-def test_load_state_uses_engine_outcomes_and_topo_order(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    output_root = tmp_path / "demo" / "out" / "main"
-    store = Store(output_root)
-    store.ensure_initialized("Demo", module=Demo.__module__)
-    (output_root / "sample.txt").parent.mkdir(parents=True, exist_ok=True)
-    (output_root / "sample.txt").write_text("sample", encoding="utf-8")
-    store.write_success(_single("sample"))
-
-    def fake_probe_pipeline(*args, **kwargs):
-        del args, kwargs
-        return [
-            _probe("sample", Decision("hit", "hit"), store.read_success("sample")),
-            _probe("summary", Decision("needs-run", "inputs-changed"), None),
-        ]
-
-    monkeypatch.setattr("varve.dashboard.state.probe_pipeline", fake_probe_pipeline)
-
-    state = load_state(_entry(output_root))
-
-    assert state.status == "needs-run"
-    assert state.error is None
-    assert [stage.name for stage in state.stages] == ["sample", "summary"]
-    assert [stage.status for stage in state.stages] == ["hit", "needs-run"]
-    assert [stage.reason for stage in state.stages] == ["hit", "inputs-changed"]
-    assert state.stages[0].artifacts[0].path == Path("sample.txt")
-    assert state.stages[0].artifacts[0].exists is True
-    assert state.stages[0].committed_at is not None
-    assert state.stages[1].upstreams == ["sample"]
-
-
-def test_load_state_reads_stage_elapsed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    output_root = tmp_path / "demo" / "out" / "main"
-    store = Store(output_root)
-    store.ensure_initialized("Demo", module=Demo.__module__)
-    store.write_success(_single("sample", elapsed=1.25))
-
-    def fake_probe_pipeline(*args, **kwargs):
-        del args, kwargs
-        return [
-            _probe("sample", Decision("hit", "hit"), store.read_success("sample")),
-            _probe("summary", Decision("needs-run", "no-cache"), None),
-        ]
-
-    monkeypatch.setattr("varve.dashboard.state.probe_pipeline", fake_probe_pipeline)
-
-    state = load_state(_entry(output_root))
-
-    assert state.stages[0].elapsed == 1.25
-    assert state.stages[1].elapsed is None
-
-
-def test_load_state_matches_engine_status_for_real_run(tmp_path: Path) -> None:
-    output_base = tmp_path / "real" / "out"
-    output_root = output_base / "main"
-
-    run(Demo, Config(), args=Args(), cli_out=output_base)
-
-    state = load_state(_entry(output_root))
-
-    assert state.status == "hit"
-    assert [(stage.name, stage.status, stage.reason) for stage in state.stages] == [
-        ("sample", "hit", "hit"),
-        ("summary", "hit", "hit"),
-    ]
-
-
-def test_load_state_reports_manifest_phase_for_manifest_errors(tmp_path: Path) -> None:
-    state = load_state(
-        PipelineEntry(
-            output_root=tmp_path,
-            pipeline_id="demo",
-            pipeline_name="Demo",
-            branch="main",
-            module=Demo.__module__,
-            manifest_error="bad json",
-        )
-    )
-
-    assert state.status == "error"
-    assert state.error is not None
-    assert state.error.phase == "manifest"
-    assert state.stages == []
-
-
-def test_load_state_reports_manifest_phase_for_missing_module(tmp_path: Path) -> None:
-    state = load_state(
-        PipelineEntry(
-            output_root=tmp_path,
-            pipeline_id="demo",
-            pipeline_name="Demo",
-            branch="main",
-            module=None,
-        )
-    )
-
-    assert state.status == "error"
-    assert state.error is not None
-    assert state.error.phase == "manifest"
-    assert state.stages == []
-
-
-def test_load_state_reports_import_phase(tmp_path: Path) -> None:
-    state = load_state(_entry(tmp_path, module="varve.no_such_module"))
-
-    assert state.status == "error"
-    assert state.error is not None
-    assert state.error.phase == "import"
-
-
-def test_load_state_reports_resolve_phase(tmp_path: Path) -> None:
-    entry = _entry(tmp_path / "demo" / "out" / "missing")
-    entry.branch = "missing"
-
+def test_load_state_reports_pre_evaluation_error_phases(entry: PipelineEntry, phase: str) -> None:
     state = load_state(entry)
-
     assert state.status == "error"
+    assert state.complete is False
     assert state.error is not None
-    assert state.error.phase == "resolve"
+    assert state.error.phase == phase
+    assert state.pipeline_status is None
 
 
 def test_load_state_reports_evaluate_phase(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    output_root = tmp_path / "demo" / "out" / "main"
-
-    def fail_probe_pipeline(*args, **kwargs):
+    def fail_collect(*args, **kwargs):
         raise RuntimeError("engine failed")
 
-    monkeypatch.setattr("varve.dashboard.state.probe_pipeline", fail_probe_pipeline)
-
-    state = load_state(_entry(output_root))
-
+    monkeypatch.setattr("varve.dashboard.state.collect_pipeline_status", fail_collect)
+    state = load_state(_entry(tmp_path / "demo" / "out" / "main"))
     assert state.status == "error"
     assert state.error is not None
     assert state.error.phase == "evaluate"
-    assert "engine failed" in state.error.message
+    assert state.error.message == "engine failed"
+
+
+def test_resolve_module_entry_defaults_to_exact_main_and_lists_modules(tmp_path: Path) -> None:
+    entries = [
+        _entry(tmp_path / "main", module="pkg.demo"),
+        _entry(tmp_path / "alt", module="pkg.demo", branch="alt"),
+        _entry(tmp_path / "other", module="pkg.other"),
+    ]
+    assert resolve_module_entry(entries, "pkg.demo").output_root == tmp_path / "main"
+    assert resolve_module_entry(entries, "pkg.demo", branch="alt").output_root == tmp_path / "alt"
+    with pytest.raises(ValueError, match=r"Available modules: pkg.demo, pkg.other"):
+        resolve_module_entry(entries, "pkg.missing")
+
+
+def test_resolve_module_entry_reports_every_ambiguous_candidate(tmp_path: Path) -> None:
+    entries = [
+        _entry(tmp_path / "first", module="pkg.demo"),
+        _entry(tmp_path / "second", module="pkg.demo"),
+    ]
+    with pytest.raises(ValueError) as exc_info:
+        resolve_module_entry(entries, "pkg.demo")
+    message = str(exc_info.value)
+    assert "Ambiguous module" in message
+    assert "class=Demo" in message
+    assert str(tmp_path / "first") in message
+    assert str(tmp_path / "second") in message
+
+
+def test_structure_resolution_deduplicates_branches_but_rejects_classes(
+    tmp_path: Path,
+) -> None:
+    entries = [
+        _entry(tmp_path / "main", module=Demo.__module__),
+        _entry(tmp_path / "alt", module=Demo.__module__, branch="alt"),
+    ]
+    pipeline, matched = resolve_structure_pipeline(entries, Demo.__module__)
+    assert pipeline is Demo
+    assert len(matched) == 2
+
+    entries.append(
+        _entry(
+            tmp_path / "other",
+            module=Demo.__module__,
+            pipeline_name="OtherDemo",
+            branch="other",
+        )
+    )
+    with pytest.raises(ValueError, match="Ambiguous module"):
+        resolve_structure_pipeline(entries, Demo.__module__)

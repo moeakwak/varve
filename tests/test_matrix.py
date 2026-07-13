@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from varve import Axis, Ctx, Pipeline, batch_stage, matrix, stage
 from varve.branch_config import resolve_branch
 from varve.cli.clean import clean
+from varve.command import resolved_command_context
 from varve.engine import runner as runner_module
 from varve.engine.runner import probe_pipeline, run, selected_stages
 from varve.keying.keys import input_key
@@ -194,6 +195,7 @@ def test_matrix_run_injects_coordinates_fans_in_and_isolates_outputs(tmp_path: P
     record = Store(out).read_success("score@bench=a,model=small")
     assert record is not None
     assert record.stage == "score@bench=a,model=small"
+    assert record.produces is not None
     assert [(item.path, item.kind) for item in record.produces] == [
         (".matrix/score/bench=a/model=small/score.txt", "file")
     ]
@@ -215,6 +217,7 @@ def test_matrix_callable_produces_records_the_cell_output_path(tmp_path: Path) -
     record = Store(tmp_path / "main").read_success("write@item=one")
 
     assert record is not None
+    assert record.produces is not None
     assert [(item.path, item.kind) for item in record.produces] == [
         (".matrix/write/item=one/result.txt", "file")
     ]
@@ -423,13 +426,19 @@ def test_default_status_folds_every_matrix_template(tmp_path: Path, capsys) -> N
 
 def test_structured_status_groups_cells_without_skipping_exact_probes(tmp_path: Path) -> None:
     graph = build_graph(MatrixPipeline)
-    status = collect_pipeline_status(
+    resolved = resolve_branch(
         MatrixPipeline,
-        Config(),
-        args=MatrixPipeline.Args(),
-        out=tmp_path / "main",
         branch="main",
-        graph=graph,
+        override_json=None,
+        cli_out=tmp_path,
+    )
+    status = collect_pipeline_status(
+        resolved_command_context(
+            MatrixPipeline,
+            resolved,
+            MatrixPipeline.Args(),
+            graph=graph,
+        )
     )
 
     assert len(status.stages) == len(graph.stages) == 7
@@ -478,13 +487,13 @@ def test_status_concrete_cell_expands_details(tmp_path: Path, capsys) -> None:
 
     assert MatrixPipeline.cli(["status", cell, "--out", str(tmp_path), "--expand"]) == 0
 
-    assert "Source review" in capsys.readouterr().out
+    assert "Source" in capsys.readouterr().out
 
 
 def test_status_ordinary_stage_in_matrix_pipeline_retains_expand(tmp_path: Path, capsys) -> None:
     assert MatrixPipeline.cli(["status", "finish", "--out", str(tmp_path), "--expand"]) == 0
 
-    assert "Source review" in capsys.readouterr().out
+    assert "Source" in capsys.readouterr().out
 
 
 def test_status_concrete_cell_keeps_detailed_stage_view(tmp_path: Path, capsys) -> None:
@@ -496,7 +505,7 @@ def test_status_concrete_cell_keeps_detailed_stage_view(tmp_path: Path, capsys) 
     output = capsys.readouterr().out
     assert cell in output
     assert "Key inputs" in output
-    assert "Source review" in output
+    assert "Source" in output
 
 
 def test_same_axis_name_on_distinct_objects_is_rejected() -> None:

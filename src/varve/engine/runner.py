@@ -156,7 +156,7 @@ _RECORD_MISSING = object()
 
 
 class ReviewRequiredError(Exception):
-    """Raised before execution when selected stages have pending source reviews."""
+    """Raised before execution when selected stages have undecided source changes."""
 
     def __init__(self, stages: list[str]) -> None:
         self.stages = stages
@@ -1369,6 +1369,7 @@ def record_source_review(
     is_temporary: bool = False,
     axes: dict[str, tuple[str, ...]] | None = None,
     graph: PipelineGraph | None = None,
+    _keying_session: _KeyingSession | None = None,
 ) -> SourceReviewResult:
     """Atomically validate and record accept/reject decisions for source changes."""
 
@@ -1379,7 +1380,14 @@ def record_source_review(
     out = pipeline.output_root(config, cli_out=cli_out, branch=branch, is_temporary=is_temporary)
     store = Store(out)
     with OutputLock(store.root):
-        probes = probe_pipeline(pipeline, config, args=args, out=out, graph=graph)
+        probes = probe_pipeline(
+            pipeline,
+            config,
+            args=args,
+            out=out,
+            graph=graph,
+            _keying_session=_keying_session,
+        )
         resolved_selectors = tuple(graph.resolve_selector(target) for target in targets)
         candidates = tuple(
             ReviewCandidate(

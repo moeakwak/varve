@@ -6,7 +6,7 @@ Varve runs Python pipelines and caches their outputs, so re-running only re-exec
 
 A varve is an annual layer of lake sediment — thin, ordered, and datable. Varve treats pipeline outputs the same way: each stage writes a materialized layer whose input key records config, external inputs, explicit values, and upstream artifact contents. When nothing changes, nothing re-runs; when something does, `status` tells you exactly what and why.
 
-It runs on a single machine — no daemon, no database, no pipeline DSL. Stages are ordinary Python methods, and the `run` / `status` / `accept` / `reject` / `plan` / `list` / `clean` CLI is generated from your pipeline class. Varve is built for local experiments, evaluations, dataset preparation, render/compare jobs, and report generation, where Python is already the source of truth. It is not a distributed scheduler, a deployment platform, a data-version-control system, or a remote artifact store.
+It runs on a single machine — no daemon, no database, no pipeline DSL. Stages are ordinary Python methods, and the `run` / `status` / `accept` / `reject` / `plan` / `ls` / `clean` CLI is generated from your pipeline class. Varve is built for local experiments, evaluations, dataset preparation, render/compare jobs, and report generation, where Python is already the source of truth. It is not a distributed scheduler, a deployment platform, a data-version-control system, or a remote artifact store.
 
 ## Install
 
@@ -71,7 +71,7 @@ Inside a stage, `ctx.input("prepare")` returns the single artifact of an upstrea
 
 ### Source review and deterministic inputs
 
-Varve observes the Python files that define the pipeline and stage, plus paths declared with `Dependencies.sources`. A source change opens a review gate: use `accept` when existing artifacts remain valid or `reject` when the stage must rerun. Varve does not infer call graphs. External data and explicit values belong in `Dependencies.inputs` and `Dependencies.values`.
+Varve observes the Python files that define the pipeline and stage, plus paths declared with `Dependencies.sources`. A source change opens a `needs-review` gate: use `accept` when existing artifacts remain valid or `reject` when the stage must rerun. The relationship remains `changed`; the decision determines whether the effective status is reusable or `needs-run · source-changed`. Varve does not infer call graphs. External data and explicit values belong in `Dependencies.inputs` and `Dependencies.values`.
 
 ### Resumable batch stages
 
@@ -98,13 +98,13 @@ class Evaluation(Pipeline):
         evaluate(bench, model, ctx.cell_out / "score.json")
 ```
 
-Each cell gets a concrete identity like `score@bench=unimer,model=large` and its own artifact directory under `.matrix/score/bench=unimer/model=large/`. Large matrices fold to one line per base stage in `run` and `status` output — keeping concrete failures and slow cells visible — and `--expand` shows every cell.
+Each cell gets a concrete identity like `score@bench=unimer,model=large` and its own artifact directory under `.matrix/score/bench=unimer/model=large/`. A StageSelector may name the base, a partial subset such as `score@bench=unimer`, or one concrete cell; omitted axes are wildcards and canonical output follows declaration order. Large matrices fold to one line per base stage in `run` and `status` output — keeping concrete failures and slow cells visible — and `--expand` shows every cell.
 
 ### Branches and temporary runs
 
-An optional `varve.yaml` splits a branch's semantic `config` from its active matrix `axes`. Persistent branches materialize under `out/<branch>/`. `run --override JSON` spins up an isolated throwaway branch under `out/.tmp/<branch>/`, snapshotting both the validated Config and the active axes so `status`, `clean`, and `refresh` can find it later.
+An optional `varve.yaml` splits a branch's semantic `config` from its active matrix `axes`. Persistent branches materialize under `out/<branch>/`. `run --override JSON` spins up an isolated throwaway branch under `out/.tmp/<branch>/`, snapshotting both the validated Config and the active axes so generated commands and top-level commands with `--include-temp` can find it later.
 
-### Generated CLI and store dashboard
+### Generated and top-level CLIs
 
 Every `Pipeline` gets seven commands:
 
@@ -113,12 +113,16 @@ Every `Pipeline` gets seven commands:
 | `run` | Evaluate cache decisions and execute the selected stages. |
 | `status` | Explain each stage's input key, materialization, artifact, and source-review state. |
 | `plan` | Print the selected concrete topology without executing it. |
-| `list` | Show branch-independent stage templates and matrix axes. |
+| `ls` | Show branch-independent stage templates and matrix axes. |
 | `clean` | Safely remove a whole output root or a recorded downstream closure. |
 | `accept` | Mark current source changes as not requiring a rerun. |
 | `reject` | Mark current source changes as requiring a rerun. |
 
-The top-level `varve` command finds existing stores without wiring up an entrypoint. `varve ls`, `varve show`, and `varve refresh` import the stored pipeline module and evaluate its exact graph, keys, artifacts, and source reviews. `varve accept` and `varve reject` record review decisions for a discovered pipeline branch without executing it.
+Generated `accept` and `reject` default to every source-changed stage in the pipeline; repeat `--stage STAGE_SELECTOR` for a narrower union. A normal `run` stops before executing any stage when its selection or required external upstreams contain `needs-review`. `run --force` validates the complete preflight, records `reject` for source-changed stages inside the execution selection, and then runs them; source-current stages in the force plan do not gain a persisted force intent.
+
+The top-level `varve` command finds existing stores by manifest exact module. `varve ls` exact-evaluates the discovered branches and reports `MODULE`, `BRANCH`, and effective `STATUS`; it does not expose separate review or stage-count columns. `varve ls MODULE`, `status MODULE`, `run MODULE`, `accept MODULE`, `reject MODULE`, `plan MODULE`, and `clean MODULE` reuse the generated command backends and renderers. Single dynamic commands use `COMMAND MODULE [OPTIONS]`, so MODULE precedes pipeline-specific Args flags.
+
+`varve run --all`, `accept --all`, and `reject --all` operate on entries selected by `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run also accepts `--rehash`. Bulk review uses each pipeline's default Args and records each store independently. Bulk run skips hits and `needs-review`, executes eligible branches, refreshes observations after every attempt, and reports exact final state. Use repeatable `varve ls --status STATUS` to filter evaluated rows.
 
 ## Documentation
 

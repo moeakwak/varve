@@ -13,7 +13,7 @@ from varve.models import Manifest
 
 
 def discover_pipelines(root: Path, *, include_temporary: bool = False) -> list[PipelineEntry]:
-    """Return all discovered varve stores under root, sorted by stable id."""
+    """Return all discovered varve stores under root without importing pipelines."""
     root = Path(root).resolve()
     if not root.exists():
         return []
@@ -44,9 +44,47 @@ def discover_pipelines(root: Path, *, include_temporary: bool = False) -> list[P
                 branch=branch,
                 module=manifest.module if manifest is not None else None,
                 manifest_error=manifest_error,
+                temporary=_is_temporary_output_root(output_root),
             )
         )
-    return sorted(entries, key=lambda entry: (entry.pipeline_id, entry.branch))
+    return sort_entries(entries)
+
+
+def sort_entries(entries: list[PipelineEntry]) -> list[PipelineEntry]:
+    """Sort entries by their manifest identities rather than path-derived ids."""
+
+    return sorted(
+        entries,
+        key=lambda entry: (
+            entry.module or "",
+            entry.branch,
+            entry.pipeline_name or "",
+            str(entry.output_root),
+        ),
+    )
+
+
+def filter_entries(
+    entries: list[PipelineEntry],
+    *,
+    prefix: str | None = None,
+    branch: str | None = None,
+    include_temporary: bool = False,
+) -> list[PipelineEntry]:
+    """Apply the discovery scope shared by overview and bulk commands."""
+
+    return sort_entries(
+        [
+            entry
+            for entry in entries
+            if (
+                include_temporary
+                or not (entry.temporary or entry.output_root.parent.name == ".tmp")
+            )
+            and (branch is None or entry.branch == branch)
+            and (prefix is None or (entry.module or "").startswith(prefix))
+        ]
+    )
 
 
 def _relative_parts(root: Path, output_root: Path) -> tuple[str, ...]:

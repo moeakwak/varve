@@ -1,119 +1,134 @@
-"""Rich renderers for dashboard states."""
+"""Rich renderers for exact overview and bulk run states."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 
+from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
-from varve.dashboard.models import PipelineState, StageState
+from varve.dashboard.models import PipelineState
 from varve.style import format_elapsed, make_console, status_text
 
 
-def render_overview(states: list[PipelineState]) -> None:
-    console = make_console()
+def render_overview(
+    states: Sequence[PipelineState],
+    *,
+    console: Console | None = None,
+) -> None:
+    """Render complete manifest modules in a wide table or narrow stacked rows."""
+
+    console = console or make_console()
+    modules = [_module(state) for state in states]
+    wide = console.width >= max(100, max((len(module) for module in modules), default=0) + 48)
+    if not wide:
+        for index, state in enumerate(states):
+            if index:
+                console.print()
+            console.print(_module(state), style="blue", soft_wrap=True)
+            metadata = Text("  ")
+            metadata.append(state.entry.branch, style="dim")
+            metadata.append("  ")
+            metadata.append_text(status_text(state.status))
+            if state.duration is not None:
+                metadata.append(f"  {format_elapsed(state.duration)}", style="dim")
+            if state.last_run is not None:
+                metadata.append(f"  {_format_datetime(state.last_run)}", style="dim")
+            console.print(metadata)
+        return
+
     table = Table(box=None)
-    table.add_column("PIPELINE")
+    table.add_column("MODULE", no_wrap=True, overflow="ignore")
     table.add_column("BRANCH")
     table.add_column("STATUS")
-    table.add_column("REVIEW")
-    table.add_column("STAGES")
-    table.add_column("DURATION")
+    table.add_column("DURATION", justify="right")
     table.add_column("LAST RUN")
-
-    previous_pipeline_id: str | None = None
-    for state in sorted(states, key=lambda item: (item.entry.pipeline_id, item.entry.branch)):
-        hit_count = sum(1 for stage in state.stages if stage.status == "hit")
-        pipeline_id = (
-            state.entry.pipeline_id if state.entry.pipeline_id != previous_pipeline_id else ""
-        )
+    for state in states:
         table.add_row(
-            pipeline_id,
+            _module(state),
             state.entry.branch,
             status_text(state.status),
-            str(state.pending_reviews) if state.pending_reviews else "-",
-            f"{hit_count}/{len(state.stages)}",
-            format_elapsed(_total_elapsed(state.stages)),
-            _format_datetime(_last_run(state.stages)),
+            format_elapsed(state.duration, missing="-"),
+            _format_datetime(state.last_run),
         )
-        previous_pipeline_id = state.entry.pipeline_id
     console.print(table)
 
 
-def render_detail(state: PipelineState) -> None:
-    console = make_console()
-    pipeline_name = state.entry.pipeline_name or state.entry.pipeline_id
-    console.print(f"Pipeline: {state.entry.pipeline_id}")
-    # soft_wrap keeps long output-root paths on one line; rich would otherwise
-    # hard-wrap them at the console width and split the path mid-string.
-    console.print(f"Output root: {state.entry.output_root}", soft_wrap=True)
-    console.print(f"Name: {pipeline_name}")
-    console.print("Status: ", status_text(state.status), sep="")
-    if state.error is not None:
-        console.print(f"Error: {state.error.phase}: {state.error.message}")
-    console.print()
+def render_no_status_matches(console: Console | None = None) -> None:
+    (console or make_console()).print("No pipelines match the selected statuses.")
 
-    stage_table = Table(title="Stages", box=None)
-    stage_table.add_column("STAGE")
-    stage_table.add_column("STATUS")
-    stage_table.add_column("REASON")
-    stage_table.add_column("REVIEW")
-    stage_table.add_column("ARTIFACTS")
-    stage_table.add_column("COMMITTED")
-    stage_table.add_column("UPSTREAMS")
-    for stage in state.stages:
-        stage_table.add_row(
-            stage.name,
-            status_text(stage.status),
-            stage.failure or stage.reason,
-            stage.source_review,
-            _format_artifacts(stage),
-            _format_datetime(stage.committed_at),
-            ", ".join(stage.upstreams) if stage.upstreams else "-",
-        )
-    console.print(stage_table)
-    console.print()
 
-    console.print("Plan")
-    if not state.stages:
-        console.print("  No recorded stages.")
+def render_bulk_run(
+    states: Sequence[PipelineState],
+    *,
+    console: Console | None = None,
+) -> None:
+    """Render every final incomplete category from fresh exact states."""
+
+    console = console or make_console()
+    incomplete = [state for state in states if not state.complete]
+    if not incomplete:
+        console.print("All selected pipelines are complete.")
         return
-    nodes = {stage.name for stage in state.stages}
-    printed_any = False
-    for stage in state.stages:
-        upstreams = [upstream for upstream in stage.upstreams if upstream in nodes]
-        if not upstreams:
-            console.print(f"  root: {stage.name}")
-            printed_any = True
-            continue
-        for upstream in upstreams:
-            console.print(f"  {upstream} -> {stage.name}")
-            printed_any = True
-    if not printed_any:
-        console.print("  No recorded dependencies.")
+    console.print("Run incomplete")
+
+    reviews = [
+        (state, stage)
+        for state in incomplete
+        for stage in state.stages
+        if stage.status == "needs-review"
+    ]
+    failures = [
+        (state, stage) for state in incomplete for stage in state.stages if stage.status == "failed"
+    ]
+    pipeline_errors = [state for state in incomplete if state.error is not None]
+    stage_errors = [
+        (state, stage) for state in incomplete for stage in state.stages if stage.status == "error"
+    ]
+    to_run = [
+        (state, stage)
+        for state in incomplete
+        for stage in state.stages
+        if stage.status in {"needs-run", "resume"}
+    ]
+
+    if reviews:
+        console.print("\nTO REVIEW", style="bold yellow")
+        for state, stage in reviews:
+            console.print(f"{_module(state)}  {state.entry.branch}  {stage.name}")
+    if failures:
+        console.print("\nFAILED", style="bold red")
+        for state, stage in failures:
+            console.print(
+                f"{_module(state)}  {state.entry.branch}  {stage.name}  "
+                f"{stage.failure or stage.reason}"
+            )
+    if pipeline_errors or stage_errors:
+        console.print("\nERROR", style="bold red")
+        for state in pipeline_errors:
+            assert state.error is not None
+            console.print(
+                f"{_module(state)}  {state.entry.branch}  "
+                f"{state.error.phase}  {state.error.message}"
+            )
+        for state, stage in stage_errors:
+            console.print(
+                f"{_module(state)}  {state.entry.branch}  evaluate  {stage.name}: {stage.reason}"
+            )
+    if to_run:
+        console.print("\nTO RUN", style="bold yellow")
+        for state, stage in to_run:
+            console.print(
+                f"{_module(state)}  {state.entry.branch}  {stage.name}  "
+                f"{stage.status}  {stage.reason}"
+            )
 
 
-def _format_artifacts(stage: StageState) -> str:
-    if not stage.artifacts:
-        return "-"
-    return ", ".join(
-        f"{artifact.path} ({'ok' if artifact.exists else 'missing'})"
-        for artifact in stage.artifacts
-    )
+def _module(state: PipelineState) -> str:
+    return state.entry.module or f"<manifest error: {state.entry.pipeline_id}>"
 
 
 def _format_datetime(value: datetime | None) -> str:
-    return value.strftime("%Y-%m-%d %H:%M") if value is not None else ""
-
-
-def _total_elapsed(stages: list[StageState]) -> float | None:
-    if not stages or any(stage.elapsed is None for stage in stages):
-        return None
-    return sum(stage.elapsed for stage in stages if stage.elapsed is not None)
-
-
-def _last_run(stages: list[StageState]) -> datetime | None:
-    return max(
-        (stage.committed_at for stage in stages if stage.committed_at is not None),
-        default=None,
-    )
+    return value.strftime("%Y-%m-%d %H:%M") if value is not None else "-"

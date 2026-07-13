@@ -4,32 +4,26 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from varve.engine.runner import probe_pipeline
+from varve.command import ResolvedCommandContext
+from varve.engine.runner import _KeyingSession, probe_pipeline
 from varve.engine.state import (
-    STATUS_SEVERITY,
-    SourceReviewState,
-    Status,
-    aggregate_status,
+    EFFECTIVE_STATUS_SEVERITY,
+    EffectiveStatus,
+    ExecutionStatus,
+    ReviewDecision,
+    SourceRelationship,
+    aggregate_effective_status,
+    effective_reason,
+    effective_status,
 )
-from varve.matrix import PipelineGraph, build_graph
+from varve.matrix import ResolvedStageSelector
 from varve.models import FileFingerprint
-from varve.pipeline import Pipeline
 
 SourceChange = Literal["changed", "added", "removed"]
-LegacySourceReview = Literal["confirmed", "pending", "accepted", "rerun-required"]
-
-
-def legacy_source_review(state: SourceReviewState) -> LegacySourceReview:
-    """Adapt engine review state for the pre-Phase-3 status/dashboard views."""
-
-    if state.relationship != "changed":
-        return "confirmed"
-    if state.decision == "none":
-        return "pending"
-    return "accepted" if state.decision == "accept" else "rerun-required"
 
 
 @dataclass(frozen=True)
@@ -54,17 +48,21 @@ class StageStatus:
     kind: str
     needs: tuple[str, ...]
     logical_needs: tuple[str, ...]
-    status: Status
+    status: EffectiveStatus
     reason: str
     summary_reason: str
+    execution_status: ExecutionStatus
+    execution_reason: str
+    source_relationship: SourceRelationship
+    review_decision: ReviewDecision
     duration: float | None
+    committed_at: datetime | None
     decision_key: str | None
     stored_key: str | None
     key_inputs: KeyInputs | None
     source_changes: dict[str, SourceChange]
     unavailable_reason: str | None
     failure: str | None = None
-    source_review: LegacySourceReview = "confirmed"
 
 
 @dataclass(frozen=True)
@@ -79,16 +77,17 @@ class StageStatusGroup:
         return bool(self.axes)
 
     @property
-    def status(self) -> Status:
-        statuses: tuple[Status, ...] = tuple(cell.status for cell in self.cells)
-        return aggregate_status(statuses)
+    def status(self) -> EffectiveStatus:
+        return aggregate_effective_status(tuple(cell.status for cell in self.cells))
 
     @property
-    def status_counts(self) -> tuple[tuple[Status, int], ...]:
-        counts = {status: 0 for status in STATUS_SEVERITY}
+    def status_counts(self) -> tuple[tuple[EffectiveStatus, int], ...]:
+        counts = {status: 0 for status in EFFECTIVE_STATUS_SEVERITY}
+        counts["needs-review"] = 0
         for cell in self.cells:
             counts[cell.status] += 1
-        return tuple((status, counts[status]) for status in STATUS_SEVERITY if counts[status])
+        order = ("needs-review", "hit", "needs-run", "resume", "failed", "error")
+        return tuple((status, counts[status]) for status in order if counts[status])
 
     @property
     def duration(self) -> float | None:
@@ -98,14 +97,6 @@ class StageStatusGroup:
     @property
     def recorded_duration_count(self) -> int:
         return sum(cell.duration is not None for cell in self.cells)
-
-    @property
-    def review(self) -> str:
-        pending = sum(cell.source_review == "pending" for cell in self.cells)
-        if pending:
-            return f"{pending} source-changed"
-        states = {cell.source_review for cell in self.cells}
-        return next(iter(states)) if len(states) == 1 else "mixed"
 
     @property
     def reason(self) -> str:
@@ -120,9 +111,11 @@ class StageStatusGroup:
 @dataclass(frozen=True)
 class PipelineStatus:
     pipeline: str
+    module: str
     branch: str
     output_root: Path
     stages: tuple[StageStatus, ...]
+    selector: ResolvedStageSelector | None = None
 
     @property
     def groups(self) -> tuple[StageStatusGroup, ...]:
@@ -137,6 +130,27 @@ class PipelineStatus:
                 cells=tuple(cells),
             )
             for base_name, cells in grouped.items()
+        )
+
+    @property
+    def status(self) -> EffectiveStatus:
+        return aggregate_effective_status(tuple(stage.status for stage in self.stages))
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.stages) and all(stage.status == "hit" for stage in self.stages)
+
+    @property
+    def duration(self) -> float | None:
+        if not self.stages or any(stage.duration is None for stage in self.stages):
+            return None
+        return sum(stage.duration for stage in self.stages if stage.duration is not None)
+
+    @property
+    def last_run(self) -> datetime | None:
+        return max(
+            (stage.committed_at for stage in self.stages if stage.committed_at is not None),
+            default=None,
         )
 
 
@@ -166,28 +180,36 @@ def _summary_reason(reason: str, need_cells: dict[str, tuple[str, ...]] | None) 
     return reason
 
 
-def collect_pipeline_status(
-    pipeline: type[Pipeline],
-    config: Any,
-    *,
-    args: Any,
-    out: Path,
-    branch: str,
-    stage: str | None = None,
-    graph: PipelineGraph | None = None,
-    rehash: bool = False,
-) -> PipelineStatus:
-    """Collect decision keys and dependency descriptions without executing stages."""
+def _committed_at(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
-    graph = graph or build_graph(pipeline)
-    selected_names = None if stage is None else set(graph.names_for(stage))
+
+def collect_pipeline_status(
+    context: ResolvedCommandContext,
+    *,
+    selector: str | ResolvedStageSelector | None = None,
+    rehash: bool = False,
+    session: _KeyingSession | None = None,
+) -> PipelineStatus:
+    """Probe one complete graph once, then apply an optional display selector."""
+
+    resolved_selector = (
+        context.graph.resolve_selector(selector) if isinstance(selector, str) else selector
+    )
+    selected_names = None if resolved_selector is None else set(resolved_selector.concrete_stages)
     probes = probe_pipeline(
-        pipeline,
-        config,
-        args=args,
-        out=out,
-        graph=graph,
+        context.pipeline,
+        context.config,
+        args=context.args,
+        out=context.output_root,
+        graph=context.graph,
         force_rehash=rehash,
+        _keying_session=session,
     )
     selected_probes = (
         probes
@@ -196,8 +218,7 @@ def collect_pipeline_status(
     )
     stages: list[StageStatus] = []
     for probe in selected_probes:
-        legacy_review = legacy_source_review(probe.source_review)
-        spec = graph.stages[probe.stage]
+        spec = context.graph.stages[probe.stage]
         components = probe.components
         key_inputs = (
             None
@@ -211,12 +232,15 @@ def collect_pipeline_status(
         )
         previous = probe.previous
         source_changes: dict[str, SourceChange] = {}
-        if legacy_review == "pending" and previous is not None:
+        if probe.source_review.relationship == "changed" and previous is not None:
             old_files = {
                 item.path: item.digest for item in previous.executed_source_fingerprint.files
             }
             new_files = {item.path: item.digest for item in probe.source_fingerprint.files}
             source_changes = source_component_changes(old_files, new_files)
+        execution_reason = probe.decision.display_reason
+        status = effective_status(probe.decision.status, probe.source_review)
+        reason = effective_reason(execution_reason, probe.source_review)
         stages.append(
             StageStatus(
                 name=probe.stage,
@@ -228,10 +252,15 @@ def collect_pipeline_status(
                 kind=spec.kind,
                 needs=spec.needs,
                 logical_needs=spec.logical_needs,
-                status=probe.decision.status,
-                reason=probe.decision.display_reason,
-                summary_reason=_summary_reason(probe.decision.display_reason, spec.need_cells),
-                duration=(None if previous is None else previous.elapsed),
+                status=status,
+                reason=reason,
+                summary_reason=_summary_reason(reason, spec.need_cells),
+                execution_status=probe.decision.status,
+                execution_reason=execution_reason,
+                source_relationship=probe.source_review.relationship,
+                review_decision=probe.source_review.decision,
+                duration=None if previous is None else previous.elapsed,
+                committed_at=_committed_at(None if previous is None else previous.committed_at),
                 decision_key=probe.decision_key,
                 stored_key=previous.input_key if previous is not None else None,
                 key_inputs=key_inputs,
@@ -242,12 +271,13 @@ def collect_pipeline_status(
                     if probe.failure is None
                     else f"{probe.failure.exception_type}: {probe.failure.message}"
                 ),
-                source_review=legacy_review,
             )
         )
     return PipelineStatus(
-        pipeline=pipeline.__name__,
-        branch=branch,
-        output_root=out,
+        pipeline=context.pipeline.__name__,
+        module=context.pipeline.import_module_name(),
+        branch=context.branch,
+        output_root=context.output_root,
         stages=tuple(stages),
+        selector=resolved_selector,
     )

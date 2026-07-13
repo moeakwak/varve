@@ -162,7 +162,7 @@ def evaluate(self, ctx: Ctx) -> None:
 
 Varve snapshots normalized paths, sizes, and mtimes so unchanged files do not need to be rehashed repeatedly within a command. The durable file key component uses the sorted content hashes evaluated under each declared name. A missing declared file is a strict error. Values must be JSON-compatible.
 
-Dependency resolvers receive a stable context with `config`, `out`, `cell`, and `cell_out`; runtime `args` are deliberately unavailable. This keeps dashboard evaluation and refresh reproducible without persisting command-line execution controls.
+Dependency resolvers receive a stable context with `config`, `out`, `cell`, and `cell_out`; runtime `args` are deliberately unavailable. This keeps exact status evaluation and bulk execution reproducible without persisting command-line execution controls.
 
 ### Status values
 
@@ -171,12 +171,15 @@ Varve reports these stage states:
 | Status | Meaning |
 | --- | --- |
 | `hit` | The current key matches a successful record and all artifacts exist. |
+| `needs-review` | Source differs from the successful materialization and no decision is bound to the current fingerprint. |
 | `needs-run` | A run is required; the reason names changed inputs, source rejection, artifact damage, or interruption. |
 | `resume` | A matching batch has resumable partial indexes. |
 | `failed` | The last stage attempt raised an exception. |
 | `error` | Varve could not evaluate the stage reliably. |
 
-Source review is displayed independently as `confirmed`, `pending`, `accepted`, or `rerun-required`. A pending review blocks the selected run before any stage starts. `status` is read-only: it does not initialize a store, execute stages, establish a source baseline, or rewrite an older store schema.
+Execution status remains one of `hit`, `needs-run`, `resume`, `failed`, or `error`. Source review adds two orthogonal facts: relationship is `not-applicable`, `current`, or `changed`, and a changed fingerprint has decision `none`, `accept`, or `reject`. The effective overlay maps changed plus none to `needs-review · source-changed`, changed plus reject to `needs-run · source-changed`, and changed plus accept back to the execution result. No baseline is not-applicable and does not require review; a current source ignores unrelated old review records.
+
+A normal run validates its selected stages and required external upstreams before any stage body starts. Any changed source with decision none returns exit code 2 and prints the complete review targets. `run --force` first validates selectors, external upstreams, and exact probes, then records reject for source-changed stages inside the execution selection and starts execution. It never decides for external upstreams that it will only reuse. Successful stages replace their executed-source fingerprint and clear the decision; failed, interrupted, and not-yet-started stages retain reject so a later normal run can continue from `needs-run` without another review. Forced or rejected batch stages discard old partial state before the attempt. `status` is read-only: it does not initialize a store, execute stages, establish a source baseline, or rewrite schema 5 stores.
 
 ## Resumable batch stages
 
@@ -271,13 +274,15 @@ Branches may activate a subset of each Axis by canonical id. Omitted axes use th
 
 ### Matrix selection and display
 
-`run --only score` selects every active score cell without automatically running its upstreams; external upstreams must already be current. `--upto`, `--downstream`, and `--only` are mutually exclusive. `--slice axis=id` narrows selected coordinates plus their aligned upstream closure and is allowed only for temporary branches.
+Every stage-targeting option uses `STAGE` or `STAGE@AXIS=VALUE[,AXIS=VALUE...]`. A bare Matrix base selects all active cells, a partial selector filters the named axes and treats omitted axes as wildcards, and full coordinates select one cell. Axis input order does not matter, but canonical selectors always follow declaration order. Duplicate or unknown axes, unknown or inactive values, coordinates on an ordinary stage, and selectors matching no active cell fail before execution, review writes, confirmation, or cleaning.
+
+`run --only score@bench=a` selects the matching active score cells without automatically running their upstreams; external upstreams must already be current. `--upto`, `--downstream`, and `--only` are mutually exclusive and apply their respective closure after the shared resolver returns concrete seeds. `clean --downstream` applies descendant closure, while status and review do not expand upstream or downstream. `--slice axis=id` remains a separate temporary-run constraint across selected stages and their aligned upstream closure.
 
 Run display uses one policy for the plan, lifecycle log, and outcome table. In automatic mode, large matrix groups fold to a single summary line, while small groups and groups with known slow cells stay expanded. `run --expand` always shows concrete cells and `run --compact` always folds matrix groups; failures and slow cells keep their concrete identities, and `-v` keeps concrete lifecycle and key diagnostics. The exact fold thresholds live in [Matrix graph expansion](ARCHITECTURE.md#matrix-graph-expansion).
 
 Matrix batch progress defaults to canonical coordinate values in axis declaration order instead of the full concrete stage name. An explicit `ctx.resume(desc=...)` remains authoritative.
 
-`status` folds cells by base stage by default, including status counts, review counts, logical needs, and recorded durations. Select a base with `status score --expand` to render axis columns, or select a concrete cell to inspect its individual input, artifact, and source-review state.
+`status` probes the complete graph and then folds cells by base stage, including effective-status counts, logical needs, and recorded durations. A single changed plus undecided cell promotes its Matrix group and pipeline to `needs-review`. A partial selector heading shows its canonical selector and matched count; add `--expand` to render axis columns, or select a concrete cell to inspect its individual input, artifact, execution, source relationship, review decision, and changed source files. Review actions fold broad results by base rather than printing hundreds of cells.
 
 ## Branches and output roots
 
@@ -308,7 +313,7 @@ Varve resolves the output base from `--out` or `Pipeline.default_output_root(con
 
 `run --override '{"bootstrap": 200}'` deep-merges JSON over `main` and creates a temporary branch whose generated name hashes the complete Config snapshot and active axes. Supplying a new `--branch NAME` with an override gives the temporary branch an explicit name; it cannot collide with another named `varve.yaml` branch. Reusing that temporary name with different Config or axes fails rather than mixing materializations.
 
-Temporary manifests snapshot Config and axes so later `status`, `clean`, `show`, and `refresh` reconstruct the same graph. Use `--include-temp` on dashboard commands when temporary stores should be discovered.
+Temporary manifests snapshot Config and axes so later generated commands reconstruct the same graph. Top-level commands exclude temporary stores unless `--include-temp` is explicit.
 
 ## Generated pipeline CLI
 
@@ -320,7 +325,7 @@ python pipeline.py status
 python pipeline.py accept
 python pipeline.py reject
 python pipeline.py plan
-python pipeline.py list
+python pipeline.py ls
 python pipeline.py clean
 ```
 
@@ -328,62 +333,68 @@ python pipeline.py clean
 
 ```text
 run [--branch NAME] [--override JSON]
-    [--only STAGE | --upto STAGE | --downstream STAGE]
+    [--only STAGE_SELECTOR | --upto STAGE_SELECTOR | --downstream STAGE_SELECTOR]
     [--slice AXIS=ID] [--force] [--rehash] [--expand | --compact] [--out PATH]
 ```
 
-`--upto` selects a stage or base and its upstream closure. `--downstream` selects it and its descendants. `--only` selects exactly the named ordinary stage, concrete cell, or every cell of a base stage. Before a scoped execution, upstream stages outside the selection must have current successful records and artifacts. `--force` ignores cache decisions for selected stages but preserves topology and store safety. `--rehash` ignores persisted stat shortcuts while evaluating inputs and existing artifacts.
+`--upto` selects resolved seeds and their upstream closure. `--downstream` selects seeds and descendants. `--only` selects exactly the resolved ordinary stage, Matrix base, partial subset, or concrete cell. Before a scoped execution, upstream stages outside the selection must have current successful records and artifacts and must not require review. `--force` reruns selected stages and records reject for their source changes only after the complete preflight succeeds. `--rehash` ignores persisted stat shortcuts while evaluating inputs and existing artifacts.
 
 ### status
 
 ```text
-status [STAGE] [--branch NAME]
+status [STAGE_SELECTOR] [--branch NAME]
     [--expand] [--rehash] [--out PATH]
 ```
 
-The default is a concise pipeline summary. For an ordinary stage or concrete matrix cell, `--expand` shows detailed input, artifact, attempt, failure, and source-review state. For a matrix base, `--expand` shows its concrete cells.
+The default is a concise effective-status summary with no separate review column. For an ordinary stage or concrete Matrix cell, `--expand` shows detailed input, artifact, attempt, failure, execution reason, source relationship, review decision, and changed source files. For a Matrix base or partial subset, `--expand` shows the selected cells.
 
 ### accept and reject
 
 ```text
-accept [STAGE ...] [--branch NAME] [--out PATH]
-reject [STAGE ...] [--branch NAME] [--out PATH]
+accept [--stage STAGE_SELECTOR]... [--branch NAME] [--out PATH]
+reject [--stage STAGE_SELECTOR]... [--branch NAME] [--out PATH]
 ```
 
-Without targets, these commands process every pending source review. A base matrix stage selects all active cells, while a concrete cell selects only itself. `accept` keeps the existing materialization reusable; `reject` marks it `needs-run · source-change`. Both commands only record a decision bound to the current source fingerprint and never execute a stage or rewrite a success record. A later source change opens a new pending review.
+Without `--stage`, these commands process every source-changed active stage in the pipeline, including stages with an earlier accept or reject decision. Repeated selectors form a stable union; broad selectors skip current and not-applicable cells, while any invalid selector makes the command fail before the first write. `accept` keeps an otherwise current materialization reusable; `reject` produces `needs-run · source-changed`. Repeating the same decision is an idempotent success that preserves `decided_at`, and the output distinguishes `No source changes require review.` from `No review decisions changed.`. Both commands only record decisions bound to the exact current source fingerprint and never execute a stage or rewrite a success record.
 
-### plan and list
+### plan and ls
 
 ```text
-plan [--branch NAME] [--only STAGE | --upto STAGE | --downstream STAGE] [--out PATH]
-list
+plan [--branch NAME] [--only STAGE_SELECTOR | --upto STAGE_SELECTOR | --downstream STAGE_SELECTOR] [--out PATH]
+ls
 ```
 
-`plan` resolves the selected branch and prints concrete topological order without evaluating keys or executing stages. `list` shows the branch-independent template structure and declared matrix axes.
+`plan` resolves the selected branch and prints concrete topological order without evaluating keys or executing stages. `ls` shows branch-independent stage templates with `STAGE`, `KIND`, `NEEDS`, and `MATRIX` and does not probe the store.
 
 ### clean
 
 ```text
-clean [--branch NAME] [--downstream STAGE] [--out PATH] [--yes]
+clean [--branch NAME] [--downstream STAGE_SELECTOR] [--out PATH] [--yes]
 ```
 
-Without `--downstream`, clean removes the complete selected output root after confirmation. With a stage, it deletes the recorded artifacts and store state for that concrete downstream closure. Clean does not infer ownership from filenames; it relies on manifest anchors and recorded paths.
+Without `--downstream`, clean removes the complete selected output root after confirmation. With a selector, it deletes recorded artifacts and store state for the concrete seeds and their descendants. Clean does not infer ownership from filenames; it relies on manifest anchors and recorded paths.
 
 All commands accept the global `-v` or `--verbose` flag before the command. Generated Args flags are available on `run`, `status`, `accept`, `reject`, and `clean`.
 
-## Dashboard CLI
+## Top-level CLI
 
-The installed `varve` command discovers branch stores from manifests:
+The installed `varve` command discovers existing branch stores from manifests. MODULE is the exact persisted Python module shown by the first column of `varve ls`. Single commands with dynamic Args require MODULE immediately after the command: `COMMAND MODULE [OPTIONS]`.
 
 ```bash
-varve ls [--root DIR] [--include-temp] [--rehash]
-varve show <pipeline_id> [--root DIR] [--branch NAME] [--include-temp] [--rehash]
-varve refresh [--root DIR] [--prefix MODULE_PREFIX] [--include-temp] [--rehash]
-varve accept <pipeline_id> [STAGE ...] [--root DIR] [--branch NAME]
-varve reject <pipeline_id> [STAGE ...] [--root DIR] [--branch NAME]
+varve ls [MODULE]
+varve status MODULE [--stage STAGE_SELECTOR]
+varve run MODULE | varve run --all
+varve accept MODULE | varve accept --all
+varve reject MODULE | varve reject --all
+varve plan MODULE
+varve clean MODULE
 ```
 
-`varve ls` imports each pipeline, resolves its branch, builds the concrete graph, fingerprints current inputs, and probes artifacts before reporting exact state. `show` provides the same exact state in detail for one store. `refresh` skips an entire pipeline when it has pending source reviews, continues evaluating later pipelines, executes eligible `needs-run`, `resume`, or `failed` pipelines, and then reloads exact state after every attempt. Its final report preserves review-required, failed, evaluation-error, and still-pending categories together. It returns 0 only when every selected pipeline is complete, 2 when pending review is the only incomplete reason, and 1 for every other incomplete result.
+`varve ls` exact-evaluates each selected entry through the shared status collector and one command observation session. `--prefix`, `--branch`, and `--include-temp` filter discovery before import and evaluation; repeatable `--status` filters effective rows afterward. A discovery scope with no entries returns 1, while a successful evaluation whose status filter matches no rows returns 0. The overview displays complete MODULE selectors with `BRANCH` and effective `STATUS`; wide terminals add duration and last run, while narrow terminals use stacked rows instead of truncating MODULE. Manifest, import, resolve, and evaluate errors occupy rows without stopping later entries.
+
+`varve ls MODULE` is branch-independent and shares the generated `ls` renderer. `status MODULE`, `run MODULE`, `accept MODULE`, `reject MODULE`, `plan MODULE`, and `clean MODULE` restore the existing manifest output identity and call the same single-pipeline services as generated commands. They do not accept `--out`, `--override`, or `--slice`. Top-level status supports one `--stage`; top-level accept and reject intentionally remain pipeline-wide. Run, status, clean, accept, and reject register the selected pipeline's Args after resolving MODULE; plan and structure listing do not instantiate Args.
+
+`run --all`, `accept --all`, and `reject --all` accept `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run additionally accepts `--rehash`. Bulk commands use each pipeline's default Args and reject pipeline-specific flags. Bulk review gives each store its own lock and commit, continues after failures, refreshes command observations after every entry, and returns 1 if any entry failed. Bulk run exact-evaluates each entry, skips hits and complete pipelines blocked only by `needs-review`, runs `needs-run`, `resume`, or `failed` entries, refreshes observations after each attempt, and exact-evaluates final state. It returns 0 when all entries are complete, 2 when `needs-review` is the only incomplete reason, and 1 for failed, error, needs-run, resume, or mixed incomplete results.
 
 ## Clean safety and recovery
 

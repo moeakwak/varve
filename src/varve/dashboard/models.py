@@ -1,4 +1,4 @@
-"""Dashboard-only models assembled from varve store snapshots."""
+"""Discovery metadata and shared-status wrappers for the dashboard."""
 
 from __future__ import annotations
 
@@ -6,11 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
-from varve.engine.state import Status
+from varve.engine.state import EffectiveStatus
+from varve.status import PipelineStatus
 
-PipelineStatus = Status
 ErrorPhase = Literal["manifest", "import", "resolve", "evaluate"]
 
 
@@ -26,35 +26,40 @@ class PipelineEntry(BaseModel):
     branch: str
     module: str | None = None
     manifest_error: str | None = None
-
-
-class ArtifactState(BaseModel):
-    path: Path
-    exists: bool
-
-
-class StageState(BaseModel):
-    name: str
-    status: Status
-    reason: str
-    artifacts: list[ArtifactState]
-    committed_at: datetime | None
-    upstreams: list[str]
-    elapsed: float | None = None
-    failure: str | None = None
-    source_review: Literal["confirmed", "pending", "accepted", "rerun-required"] = "confirmed"
+    temporary: bool = False
 
 
 class PipelineState(BaseModel):
+    """Discovery metadata around the canonical shared pipeline status."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     entry: PipelineEntry
-    stages: list[StageState]
-    status: PipelineStatus
+    pipeline_status: PipelineStatus | None = None
     error: StateError | None = None
 
     @property
-    def pending_reviews(self) -> int:
-        return sum(stage.source_review == "pending" for stage in self.stages)
+    def stages(self):
+        return () if self.pipeline_status is None else self.pipeline_status.stages
+
+    @property
+    def status(self) -> EffectiveStatus:
+        return "error" if self.error is not None else self._status.status
 
     @property
     def complete(self) -> bool:
-        return self.status == "hit" and self.pending_reviews == 0
+        return self.error is None and self._status.complete
+
+    @property
+    def duration(self) -> float | None:
+        return None if self.pipeline_status is None else self.pipeline_status.duration
+
+    @property
+    def last_run(self) -> datetime | None:
+        return None if self.pipeline_status is None else self.pipeline_status.last_run
+
+    @property
+    def _status(self) -> PipelineStatus:
+        if self.pipeline_status is None:
+            raise RuntimeError("Pipeline state has no exact status")
+        return self.pipeline_status

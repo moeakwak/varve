@@ -78,12 +78,12 @@ def test_highlighter_marks_stage_name() -> None:
     assert spans["done"] == "varve.done"
 
 
-def test_highlighter_accents_refresh_header() -> None:
+def test_highlighter_accents_bulk_run_header() -> None:
     highlighter = VarveStatusHighlighter()
-    text = Text("▸ refresh studies.exp.demo --branch main")
+    text = Text("▸ run studies.exp.demo --branch main")
     highlighter.highlight(text)
     spans = {text.plain[span.start : span.end]: span.style for span in text.spans}
-    assert spans["▸ refresh studies.exp.demo --branch main"] == "varve.refresh"
+    assert spans["▸ run studies.exp.demo --branch main"] == "varve.bulk_run"
 
 
 def test_themed_console_renders_status_color() -> None:

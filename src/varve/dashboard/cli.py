@@ -1,309 +1,375 @@
-"""Top-level varve dashboard CLI."""
+"""Top-level varve CLI over discovered pipeline stores."""
 
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
-from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
+from pydantic import BaseModel
+
+from varve.cli import argmap
+from varve.dashboard.commands import (
+    bulk_review_command,
+    bulk_run_command,
+    clean_command,
+    overview_command,
+    plan_command,
+    render_structure_command,
+    review_command,
+    run_command,
+    status_command,
+)
 from varve.dashboard.discovery import discover_pipelines
 from varve.dashboard.models import PipelineEntry
-from varve.dashboard.render import render_detail, render_overview
-from varve.dashboard.state import import_entry_pipeline, load_state, resolve_entry_branch
-from varve.engine.runner import _KeyingSession, record_source_review, run
-from varve.keying.fingerprint import FingerprintSession
-from varve.log import configure_cli_logging
-from varve.matrix import build_graph
-from varve.style import REFRESH_MARKER, make_console
+from varve.dashboard.state import import_entry_pipeline, resolve_module_entry
+from varve.pipeline import Pipeline
 
-_EXECUTABLE_STATUSES = {"needs-run", "resume", "failed"}
+_DYNAMIC_COMMANDS = {"run", "status", "clean", "accept", "reject"}
+_SELECTOR_HELP = (
+    "Base selects all active cells; omitted axes are wildcards; full coordinates select one cell."
+)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _parser()
-    args = parser.parse_args(argv)
-    if args.command == "show":
-        return _show(args.root, args.pipeline, args.branch, args.include_temp, args.rehash)
-    if args.command == "refresh":
-        return _refresh(args.root, args.include_temp, args.prefix, args.rehash)
-    if args.command in {"accept", "reject"}:
-        return _review(args.root, args.pipeline, args.branch, tuple(args.stages), args.command)
-    root = args.root if args.command == "ls" else Path.cwd()
-    return _ls(root, getattr(args, "include_temp", False), getattr(args, "rehash", False))
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    if not raw_argv:
+        raw_argv = ["ls"]
+    if raw_argv == ["--help"] or raw_argv == ["-h"]:
+        parser, _ = _parser()
+        parser.parse_args(raw_argv)
+        raise AssertionError("argparse did not exit after help")
+
+    preliminary, _ = _parser(add_help=False)
+    try:
+        first, _unknown = preliminary.parse_known_args(raw_argv)
+    except SystemExit:
+        parser, _ = _parser()
+        parser.parse_args(raw_argv)
+        raise AssertionError("argparse did not exit")
+
+    if any(token.split("=", 1)[0] in {"--out", "--override", "--slice"} for token in raw_argv):
+        parser, _ = _parser()
+        parser.parse_args(raw_argv)
+        raise AssertionError("argparse accepted an identity-changing option")
+
+    pipeline: type[Pipeline] | None = None
+    entry: PipelineEntry | None = None
+    entries: list[PipelineEntry] = []
+    scope = first
+    module: str | None = None
+    wants_all = False
+    if first.command in _DYNAMIC_COMMANDS:
+        target = raw_argv[1] if len(raw_argv) > 1 else None
+        if target in {"-h", "--help"}:
+            parser, _ = _parser()
+            parser.parse_args(raw_argv)
+            raise AssertionError("argparse did not exit after help")
+        if target == "--all" and first.command in {"run", "accept", "reject"}:
+            wants_all = True
+            scope, _ = _dynamic_scope(first.command, raw_argv[1:])
+        else:
+            if target is None or target.startswith("-"):
+                _missing_target_error(first.command)
+            module = target
+            if first.command in {"run", "accept", "reject"} and "--all" in raw_argv[2:]:
+                parser, _ = _parser()
+                parser.error(f"varve {first.command} requires exactly one of MODULE or --all")
+            scope, _ = _dynamic_scope(first.command, raw_argv[2:])
+            entries = discover_pipelines(scope.root, include_temporary=scope.include_temp)
+
+    if first.command in _DYNAMIC_COMMANDS and module is not None and not wants_all:
+        try:
+            entry = resolve_module_entry(entries, module, branch=scope.branch or "main")
+            pipeline = import_entry_pipeline(entry)
+        except Exception as error:  # noqa: BLE001 - target resolution is a command failure.
+            print(str(error), file=sys.stderr)
+            return 1
+
+    parser, _ = _parser(pipeline=pipeline, dynamic_command=first.command)
+    namespace = parser.parse_args(raw_argv)
+    _validate_surface(parser, namespace)
+    if module is not None and namespace.module != module:
+        parser.error("parsed MODULE does not match the resolved target")
+
+    try:
+        if namespace.command == "ls":
+            if namespace.module is None:
+                return overview_command(
+                    namespace.root,
+                    prefix=namespace.prefix,
+                    branch=namespace.branch,
+                    include_temp=namespace.include_temp,
+                    rehash=namespace.rehash,
+                    statuses=tuple(namespace.status),
+                )
+            entries = discover_pipelines(
+                namespace.root,
+                include_temporary=namespace.include_temp,
+            )
+            return render_structure_command(entries, namespace.module)
+
+        all_targets = getattr(namespace, "all", False)
+        assert namespace.module is not None or all_targets
+        if all_targets:
+            if namespace.command == "run":
+                return bulk_run_command(
+                    namespace.root,
+                    prefix=namespace.prefix,
+                    branch=namespace.branch,
+                    include_temp=namespace.include_temp,
+                    rehash=namespace.rehash,
+                )
+            return bulk_review_command(
+                namespace.root,
+                prefix=namespace.prefix,
+                branch=namespace.branch,
+                include_temp=namespace.include_temp,
+                decision=namespace.command,
+            )
+
+        if entry is None or pipeline is None:
+            assert namespace.module is not None
+            entries = discover_pipelines(
+                namespace.root,
+                include_temporary=namespace.include_temp,
+            )
+            entry = resolve_module_entry(
+                entries,
+                namespace.module,
+                branch=namespace.branch or "main",
+            )
+            pipeline = import_entry_pipeline(entry)
+        if namespace.command == "plan":
+            return plan_command(
+                entry,
+                pipeline,
+                upto=namespace.upto,
+                downstream=namespace.downstream,
+                only=namespace.only,
+            )
+        pipeline_args = _pipeline_args(pipeline, namespace)
+        if namespace.command == "status":
+            return status_command(
+                entry,
+                pipeline,
+                pipeline_args,
+                selector=namespace.stage,
+                expand=namespace.expand,
+                rehash=namespace.rehash,
+            )
+        if namespace.command == "run":
+            display_mode = (
+                "expand" if namespace.expand else "compact" if namespace.compact else "auto"
+            )
+            return run_command(
+                entry,
+                pipeline,
+                pipeline_args,
+                upto=namespace.upto,
+                downstream=namespace.downstream,
+                only=namespace.only,
+                force=namespace.force,
+                rehash=namespace.rehash,
+                display_mode=display_mode,
+            )
+        if namespace.command in {"accept", "reject"}:
+            return review_command(
+                entry,
+                pipeline,
+                pipeline_args,
+                decision=namespace.command,
+            )
+        if namespace.command == "clean":
+            return clean_command(
+                entry,
+                pipeline,
+                pipeline_args,
+                downstream=namespace.downstream,
+                yes=namespace.yes,
+                confirm=_default_confirm,
+            )
+    except Exception as error:  # noqa: BLE001 - CLI reports backend diagnostics as exit 1.
+        print(str(error), file=sys.stderr)
+        return 1
+    parser.error(f"Unknown command: {namespace.command}")
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="varve")
-    subparsers = parser.add_subparsers(dest="command")
+def _parser(
+    *,
+    add_help: bool = True,
+    pipeline: type[Pipeline] | None = None,
+    dynamic_command: str | None = None,
+) -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
+    parser = argparse.ArgumentParser(prog="varve", add_help=add_help)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    commands: dict[str, argparse.ArgumentParser] = {}
 
-    ls_parser = subparsers.add_parser("ls", help="list discovered pipeline stores")
-    ls_parser.add_argument("--root", type=Path, default=Path.cwd())
+    def command(name: str, help_text: str) -> argparse.ArgumentParser:
+        value = subparsers.add_parser(name, help=help_text, add_help=add_help)
+        commands[name] = value
+        return value
+
+    ls_parser = command("ls", "show exact pipeline overview or one pipeline structure")
+    ls_parser.add_argument("module", nargs="?", metavar="MODULE")
+    _add_root(ls_parser)
+    ls_parser.add_argument("--prefix", metavar="MODULE_PREFIX")
+    ls_parser.add_argument("--branch", metavar="NAME")
     _add_include_temp(ls_parser)
     _add_rehash(ls_parser)
-
-    show_parser = subparsers.add_parser("show", help="show one pipeline store")
-    show_parser.add_argument("pipeline")
-    show_parser.add_argument("--root", type=Path, default=Path.cwd())
-    show_parser.add_argument("--branch", default="main")
-    _add_include_temp(show_parser)
-    _add_rehash(show_parser)
-
-    refresh_parser = subparsers.add_parser("refresh", help="run executable discovered pipelines")
-    refresh_parser.add_argument("--root", type=Path, default=Path.cwd())
-    refresh_parser.add_argument(
-        "--prefix",
-        help="only refresh pipelines whose module starts with this prefix",
+    ls_parser.add_argument(
+        "--status",
+        action="append",
+        default=[],
+        choices=("hit", "needs-review", "needs-run", "resume", "failed", "error"),
+        metavar="STATUS",
     )
-    _add_include_temp(refresh_parser)
-    _add_rehash(refresh_parser)
-    for command, help_text in (
-        ("accept", "mark source changes as not requiring a rerun"),
-        ("reject", "mark source changes as requiring a rerun"),
-    ):
-        review_parser = subparsers.add_parser(command, help=help_text)
-        review_parser.add_argument("pipeline")
-        review_parser.add_argument("stages", nargs="*", metavar="STAGE")
-        review_parser.add_argument("--root", type=Path, default=Path.cwd())
-        review_parser.add_argument("--branch", default="main")
-    return parser
+
+    status_parser = command("status", "show exact status for one pipeline store")
+    status_parser.usage = "varve status MODULE [OPTIONS]"
+    status_parser.add_argument("module", nargs="?", metavar="MODULE")
+    _add_single_target_options(status_parser)
+    status_parser.add_argument("--stage", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
+    status_parser.add_argument("--expand", action="store_true")
+    _add_rehash(status_parser)
+
+    run_parser = command("run", "run one pipeline store or every filtered store")
+    run_parser.usage = "varve run (MODULE [OPTIONS] | --all [OPTIONS])"
+    _add_bulk_target(run_parser)
+    run_selection = run_parser.add_mutually_exclusive_group()
+    run_selection.add_argument("--upto", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
+    run_selection.add_argument("--downstream", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
+    run_selection.add_argument("--only", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
+    run_parser.add_argument("--force", "-f", action="store_true")
+    _add_rehash(run_parser)
+    run_display = run_parser.add_mutually_exclusive_group()
+    run_display.add_argument("--expand", action="store_true")
+    run_display.add_argument("--compact", action="store_true")
+
+    for name in ("accept", "reject"):
+        review_parser = command(name, f"{name} source changes for one or all pipeline stores")
+        review_parser.usage = f"varve {name} (MODULE [OPTIONS] | --all [OPTIONS])"
+        _add_bulk_target(review_parser)
+
+    plan_parser = command("plan", "print selected stage order for one pipeline store")
+    plan_parser.add_argument("module", nargs="?", metavar="MODULE")
+    _add_single_target_options(plan_parser)
+    plan_selection = plan_parser.add_mutually_exclusive_group()
+    plan_selection.add_argument("--upto", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
+    plan_selection.add_argument("--downstream", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
+    plan_selection.add_argument("--only", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
+
+    clean_parser = command("clean", "clean one pipeline store")
+    clean_parser.usage = "varve clean MODULE [OPTIONS]"
+    clean_parser.add_argument("module", nargs="?", metavar="MODULE")
+    _add_single_target_options(clean_parser)
+    clean_parser.add_argument("--downstream", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
+    clean_parser.add_argument("--yes", "-y", action="store_true")
+
+    if pipeline is not None and dynamic_command in _DYNAMIC_COMMANDS:
+        argmap.register_args(commands[dynamic_command], pipeline.Args)
+    return parser, commands
+
+
+def _dynamic_scope(
+    command: str,
+    argv: list[str],
+) -> tuple[argparse.Namespace, list[str]]:
+    """Parse discovery and static options without assigning a positional MODULE."""
+
+    parser = argparse.ArgumentParser(add_help=False)
+    _add_single_target_options(parser)
+    if command in {"run", "accept", "reject"}:
+        parser.add_argument("--all", action="store_true")
+        parser.add_argument("--prefix", metavar="MODULE_PREFIX")
+    if command == "run":
+        selection = parser.add_mutually_exclusive_group()
+        selection.add_argument("--upto", metavar="STAGE_SELECTOR")
+        selection.add_argument("--downstream", metavar="STAGE_SELECTOR")
+        selection.add_argument("--only", metavar="STAGE_SELECTOR")
+        parser.add_argument("--force", "-f", action="store_true")
+        _add_rehash(parser)
+        display = parser.add_mutually_exclusive_group()
+        display.add_argument("--expand", action="store_true")
+        display.add_argument("--compact", action="store_true")
+    elif command == "status":
+        parser.add_argument("--stage", metavar="STAGE_SELECTOR")
+        parser.add_argument("--expand", action="store_true")
+        _add_rehash(parser)
+    elif command == "clean":
+        parser.add_argument("--downstream", metavar="STAGE_SELECTOR")
+        parser.add_argument("--yes", "-y", action="store_true")
+    return parser.parse_known_args(argv)
+
+
+def _missing_target_error(command: str) -> None:
+    parser, _ = _parser()
+    if command == "status":
+        parser.error("varve status requires MODULE; use 'varve ls' for the overview")
+    if command == "clean":
+        parser.error("varve clean requires MODULE")
+    parser.error(f"varve {command} requires exactly one of MODULE or --all")
+
+
+def _add_root(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--root", type=Path, default=Path.cwd())
 
 
 def _add_include_temp(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--include-temp",
-        action="store_true",
-        help="include temporary override branches under out/.tmp",
-    )
+    parser.add_argument("--include-temp", action="store_true")
 
 
 def _add_rehash(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--rehash",
-        action="store_true",
-        help="ignore persisted stat shortcuts while evaluating fingerprints",
-    )
+    parser.add_argument("--rehash", action="store_true")
 
 
-def _ls(root: Path, include_temp: bool, rehash: bool = False) -> int:
-    console = make_console()
-    with _loading(console, "Discovering pipelines…") as loading:
-        entries = discover_pipelines(root, include_temporary=include_temp)
-        session = _KeyingSession(fingerprints=FingerprintSession(force_rehash=rehash))
-        states = []
-        for index, entry in enumerate(entries, start=1):
-            if loading is not None:
-                loading.update(f"Evaluating pipeline state {index}/{len(entries)}…")
-            states.append(load_state(entry, session))
-    if not entries:
-        print(f"No pipelines found under {root}", file=sys.stderr)
-        return 1
-    render_overview(states)
-    return 0
+def _add_single_target_options(parser: argparse.ArgumentParser) -> None:
+    _add_root(parser)
+    parser.add_argument("--branch", metavar="NAME")
+    _add_include_temp(parser)
 
 
-def _show(
-    root: Path,
-    pipeline_id: str,
-    branch: str,
-    include_temp: bool,
-    rehash: bool = False,
-) -> int:
-    console = make_console()
-    with _loading(console, "Discovering pipelines…") as loading:
-        entries = discover_pipelines(root, include_temporary=include_temp)
-        by_key = {(entry.pipeline_id, entry.branch): entry for entry in entries}
-        entry = by_key.get((pipeline_id, branch))
-        if entry is not None:
-            if loading is not None:
-                loading.update("Evaluating pipeline state 1/1…")
-            state = load_state(
-                entry,
-                _KeyingSession(fingerprints=FingerprintSession(force_rehash=rehash)),
-            )
-    if entry is None:
-        print(f"Unknown pipeline: {pipeline_id} (branch {branch})", file=sys.stderr)
-        if by_key:
-            print("Available pipelines:", file=sys.stderr)
-            for known_id, known_branch in sorted(by_key):
-                print(f"  {known_id} --branch {known_branch}", file=sys.stderr)
-        else:
-            print(f"No pipelines found under {root}", file=sys.stderr)
-        return 1
-    render_detail(state)
-    return 0
+def _add_bulk_target(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("module", nargs="?", metavar="MODULE")
+    parser.add_argument("--all", action="store_true")
+    _add_single_target_options(parser)
+    parser.add_argument("--prefix", metavar="MODULE_PREFIX")
 
 
-def _review(
-    root: Path,
-    pipeline_id: str,
-    branch: str,
-    stages: tuple[str, ...],
-    decision: str,
-) -> int:
-    entries = discover_pipelines(root, include_temporary=True)
-    entry = next(
-        (item for item in entries if item.pipeline_id == pipeline_id and item.branch == branch),
-        None,
-    )
-    if entry is None:
-        print(f"Unknown pipeline: {pipeline_id} (branch {branch})", file=sys.stderr)
-        return 1
-    pipeline = import_entry_pipeline(entry)
-    resolved = resolve_entry_branch(entry, pipeline)
-    graph = build_graph(pipeline, resolved.axes)
-    changed = record_source_review(
-        pipeline,
-        resolved.config,
-        decision=decision,
-        args=pipeline.Args(),
-        targets=stages,
-        cli_out=resolved.output_base,
-        branch=resolved.branch,
-        is_temporary=resolved.is_temporary,
-        axes=resolved.axes,
-        graph=graph,
-    )
-    print(f"{decision.title()}ed source changes for {len(changed)} stage(s).")
-    return 0
+def _validate_surface(parser: argparse.ArgumentParser, namespace: argparse.Namespace) -> None:
+    command = namespace.command
+    module = getattr(namespace, "module", None)
+    all_targets = getattr(namespace, "all", False)
+    if command in {"run", "accept", "reject"}:
+        if bool(module) == bool(all_targets):
+            parser.error(f"varve {command} requires exactly one of MODULE or --all")
+        if module is not None and namespace.prefix is not None:
+            parser.error("--prefix is only available with --all")
+    if command in {"status", "plan", "clean"} and module is None:
+        if command == "status":
+            parser.error("varve status requires MODULE; use 'varve ls' for the overview")
+        parser.error(f"varve {command} requires MODULE")
+    if command == "ls" and module is not None:
+        if namespace.prefix is not None or namespace.branch is not None or namespace.status:
+            parser.error("varve ls MODULE accepts only --root and --include-temp")
+        if namespace.rehash:
+            parser.error("varve ls MODULE does not evaluate store state")
+    if command == "run" and all_targets:
+        if any((namespace.upto, namespace.downstream, namespace.only)):
+            parser.error("varve run --all does not accept stage selection")
+        if namespace.force or namespace.expand or namespace.compact:
+            parser.error("varve run --all does not accept --force or display selection")
 
 
-def _refresh(
-    root: Path,
-    include_temp: bool,
-    prefix: str | None = None,
-    rehash: bool = False,
-) -> int:
-    console = make_console()
-    with _loading(console, "Discovering pipelines…"):
-        entries = discover_pipelines(root, include_temporary=include_temp)
-    if prefix is not None:
-        entries = [
-            entry
-            for entry in entries
-            if entry.module is not None and entry.module.startswith(prefix)
-        ]
-    if not entries:
-        print(f"No pipelines found under {root}", file=sys.stderr)
-        return 1
-
-    logger = logging.getLogger("varve")
-    logging_configured = False
-    session = _KeyingSession(fingerprints=FingerprintSession(force_rehash=rehash))
-    final_states = []
-    for index, entry in enumerate(entries, start=1):
-        with _loading(console, f"Evaluating pipeline state {index}/{len(entries)}…"):
-            state = load_state(entry, session)
-        if state.error is not None or state.pending_reviews:
-            final_states.append(state)
-            continue
-        if state.status not in _EXECUTABLE_STATUSES:
-            final_states.append(state)
-            continue
-        if not logging_configured:
-            configure_cli_logging()
-            logging_configured = True
-        # Route the per-pipeline header through the varve logger so it shares the
-        # timestamp column and styling with the stage lines that _run_entry emits.
-        # The leading marker lets the highlighter accent the whole header line.
-        logger.info("%s refresh %s --branch %s", REFRESH_MARKER, entry.pipeline_id, entry.branch)
-        try:
-            if rehash:
-                _run_entry(entry, rehash=True)
-            else:
-                _run_entry(entry)
-        except Exception as error:  # noqa: BLE001 - refresh should continue with later stores.
-            logger.error(
-                "failed to refresh %s --branch %s: %s",
-                entry.pipeline_id,
-                entry.branch,
-                error,
-            )
-        finally:
-            session.refresh_observations()
-        final_states.append(load_state(entry, session))
-        session.refresh_observations()
-
-    incomplete = [state for state in final_states if not state.complete]
-    if not incomplete:
-        print("All selected pipelines are complete.")
-        return 0
-
-    print("Refresh incomplete")
-    reviews = [state for state in incomplete if state.pending_reviews]
-    failures = [
-        (state, stage) for state in incomplete for stage in state.stages if stage.status == "failed"
-    ]
-    errors = [state for state in incomplete if state.error is not None]
-    stage_errors = [
-        (state, stage) for state in incomplete for stage in state.stages if stage.status == "error"
-    ]
-    pending = [
-        (state, stage)
-        for state in incomplete
-        for stage in state.stages
-        if stage.status in {"needs-run", "resume"}
-    ]
-    if reviews:
-        print("\nREVIEW REQUIRED")
-        for state in reviews:
-            for stage in state.stages:
-                if stage.source_review == "pending":
-                    print(f"{state.entry.pipeline_id}  {state.entry.branch}  {stage.name}")
-    if failures:
-        print("\nFAILED")
-        for state, stage in failures:
-            print(
-                f"{state.entry.pipeline_id}  {state.entry.branch}  {stage.name}  "
-                f"{stage.failure or stage.reason}"
-            )
-    if errors or stage_errors:
-        print("\nERROR")
-        for state in errors:
-            assert state.error is not None
-            print(
-                f"{state.entry.pipeline_id}  {state.entry.branch}  "
-                f"{state.error.phase}  {state.error.message}"
-            )
-        for state, stage in stage_errors:
-            print(
-                f"{state.entry.pipeline_id}  {state.entry.branch}  "
-                f"evaluate  {stage.name}: {stage.reason}"
-            )
-    if pending:
-        print("\nSTILL PENDING")
-        for state, stage in pending:
-            print(
-                f"{state.entry.pipeline_id}  {state.entry.branch}  {stage.name}  "
-                f"{stage.status}  {stage.reason}"
-            )
-    only_reviews = (
-        bool(reviews) and not failures and not errors and not stage_errors and not pending
-    )
-    return 2 if only_reviews else 1
+def _pipeline_args(pipeline: type[Pipeline], namespace: argparse.Namespace) -> BaseModel:
+    values: dict[str, Any] = argmap.collect_cli_args_namespace(namespace, pipeline.Args)
+    return pipeline.Args.model_validate(values)
 
 
-def _run_entry(entry: PipelineEntry, *, rehash: bool = False) -> None:
-    pipeline = import_entry_pipeline(entry)
-    resolved = resolve_entry_branch(entry, pipeline)
-    graph = build_graph(pipeline, resolved.axes)
-    run(
-        pipeline,
-        resolved.config,
-        args=pipeline.Args(),
-        cli_out=resolved.output_base,
-        branch=resolved.branch,
-        is_temporary=resolved.is_temporary,
-        temporary_config=resolved.temporary_config,
-        axes=resolved.axes,
-        temporary_axes=resolved.temporary_axes,
-        graph=graph,
-        rehash=rehash,
-    )
-
-
-def _loading(console, message: str):
-    if not console.is_terminal:
-        return nullcontext(None)
-    return console.status(message, spinner="dots")
+def _default_confirm(message: str) -> bool:
+    try:
+        answer = input(f"{message} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}

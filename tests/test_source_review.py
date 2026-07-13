@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 
 from varve.dashboard.cli import main as dashboard_main
-from varve.engine.runner import ReviewRequiredError, probe_pipeline, record_source_review, run
+from varve.engine import runner as runner_module
+from varve.engine.runner import (
+    ReviewRequiredError,
+    _KeyingSession,
+    probe_pipeline,
+    record_source_review,
+    run,
+)
 from varve.engine.state import SourceReviewState
 from varve.keying import source as source_module
 from varve.models import SourceManifestEntry
@@ -325,6 +332,33 @@ def test_pipeline_review_without_source_changes_is_a_successful_noop(tmp_path: P
     assert result.source_changed_cells == ()
     assert result.recorded == ()
     assert result.groups == ()
+
+
+def test_record_source_review_passes_shared_session_to_exact_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_path = tmp_path / "shared_session.py"
+    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("same")'))
+    pipeline = _load_pipeline(module_path, "shared_review_session_demo")
+    session = _KeyingSession()
+    original_probe = runner_module.probe_pipeline
+    observed_sessions = []
+
+    def tracking_probe(*args, **kwargs):
+        observed_sessions.append(kwargs.get("_keying_session"))
+        return original_probe(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "probe_pipeline", tracking_probe)
+    record_source_review(
+        pipeline,
+        pipeline.Config(),
+        decision="accept",
+        cli_out=tmp_path / "out",
+        _keying_session=session,
+    )
+
+    assert observed_sessions == [session]
 
 
 def test_docstring_change_opens_source_review(tmp_path: Path) -> None:
@@ -1051,7 +1085,7 @@ def test_dashboard_accept_route_records_review_without_running(tmp_path: Path) -
     module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("two")'))
     _load_pipeline(module_path, "dashboard_review_demo")
 
-    assert dashboard_main(["accept", "demo", "--root", str(tmp_path)]) == 0
+    assert dashboard_main(["accept", "dashboard_review_demo", "--root", str(tmp_path)]) == 0
 
     review = Store(output_root).read_review("build")
     assert review is not None

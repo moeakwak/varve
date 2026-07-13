@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from varve.dashboard.discovery import discover_pipelines
+from varve.dashboard.discovery import discover_pipelines, filter_entries
+from varve.dashboard.models import PipelineEntry
 from varve.store.store import Store
 
 
@@ -164,3 +165,48 @@ def test_discovery_stops_at_valid_output_root_but_not_invalid_varve_dir(
         ("ordinary.nested", "main"),
         ("outer", "main"),
     ]
+
+
+def test_discovery_sorts_by_exact_module_branch_class_and_output(tmp_path: Path) -> None:
+    Store(tmp_path / "z" / "out" / "main").ensure_initialized("A", module="pkg.z")
+    Store(tmp_path / "a" / "out" / "alt").ensure_initialized("B", module="pkg.a")
+    Store(tmp_path / "b" / "out" / "main").ensure_initialized("B", module="pkg.a")
+
+    entries = discover_pipelines(tmp_path)
+
+    assert [(entry.module, entry.branch) for entry in entries] == [
+        ("pkg.a", "alt"),
+        ("pkg.a", "main"),
+        ("pkg.z", "main"),
+    ]
+
+
+def test_filter_entries_shares_prefix_branch_and_temporary_scope(tmp_path: Path) -> None:
+    entries = [
+        PipelineEntry(
+            output_root=tmp_path / name,
+            pipeline_id=name,
+            pipeline_name="Demo",
+            branch=branch,
+            module=module,
+            temporary=temporary,
+        )
+        for name, module, branch, temporary in (
+            ("main", "pkg.match", "main", False),
+            ("alt", "pkg.match", "alt", False),
+            ("tmp", "pkg.match", "quick", True),
+            ("other", "other.demo", "main", False),
+        )
+    ]
+
+    assert [entry.pipeline_id for entry in filter_entries(entries, prefix="pkg.")] == [
+        "alt",
+        "main",
+    ]
+    assert [
+        entry.pipeline_id for entry in filter_entries(entries, prefix="pkg.", branch="alt")
+    ] == ["alt"]
+    assert [
+        entry.pipeline_id
+        for entry in filter_entries(entries, prefix="pkg.", include_temporary=True)
+    ] == ["alt", "main", "tmp"]

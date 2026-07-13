@@ -1,31 +1,33 @@
-"""Load read-only dashboard state using the engine state evaluator."""
+"""Resolve discovered targets and load their canonical exact status."""
 
 from __future__ import annotations
 
 import importlib
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from varve.branch_config import ResolvedBranch, resolve_branch
-from varve.dashboard.models import (
-    ArtifactState,
-    ErrorPhase,
-    PipelineEntry,
-    PipelineState,
-    StageState,
-    StateError,
-)
-from varve.engine.runner import _KeyingSession, probe_pipeline
-from varve.engine.state import Status, aggregate_status
-from varve.matrix import build_graph
-from varve.models import SuccessRecord
+from varve.command import ResolvedCommandContext, resolved_command_context
+from varve.dashboard.models import ErrorPhase, PipelineEntry, PipelineState, StateError
+from varve.engine.runner import _KeyingSession
+from varve.matrix import PipelineGraph, build_graph
 from varve.pipeline import Pipeline
-from varve.status import legacy_source_review
+from varve.status import collect_pipeline_status
+
+
+@dataclass(frozen=True)
+class ResolvedEntryTarget:
+    """A discovered branch and graph without operational Args."""
+
+    resolved: ResolvedBranch
+    output_root: Path
+    graph: PipelineGraph
 
 
 def load_state(entry: PipelineEntry, session: _KeyingSession | None = None) -> PipelineState:
-    """Load one pipeline branch's current cache state."""
-    session = session or _KeyingSession()
+    """Load one branch through the shared exact status collector."""
+
     if entry.manifest_error:
         return _error(entry, "manifest", entry.manifest_error)
     if entry.pipeline_name is None:
@@ -35,60 +37,65 @@ def load_state(entry: PipelineEntry, session: _KeyingSession | None = None) -> P
 
     try:
         pipeline = import_entry_pipeline(entry)
-    except Exception as error:  # noqa: BLE001 - dashboard must keep scanning after import failures.
+    except Exception as error:  # noqa: BLE001 - overview continues after entry failures.
         return _error(entry, "import", str(error))
-
     try:
-        resolved = resolve_entry_branch(entry, pipeline)
-    except Exception as error:  # noqa: BLE001 - dashboard reports resolver diagnostics.
+        context = resolve_entry_context(entry, pipeline, pipeline.Args())
+    except Exception as error:  # noqa: BLE001 - expose branch-resolution diagnostics.
         return _error(entry, "resolve", str(error))
-
     try:
-        graph = build_graph(pipeline, resolved.axes)
-        probes = probe_pipeline(
-            pipeline,
-            resolved.config,
-            args=pipeline.Args(),
-            out=entry.output_root,
-            axes=resolved.axes,
-            graph=graph,
-            _keying_session=session,
-        )
-    except Exception as error:  # noqa: BLE001 - dashboard reports evaluator diagnostics.
+        status = collect_pipeline_status(context, session=session)
+    except Exception as error:  # noqa: BLE001 - overview continues after evaluation failures.
         return _error(entry, "evaluate", str(error))
+    return PipelineState(entry=entry, pipeline_status=status)
 
-    probes_by_stage = {probe.stage: probe for probe in probes}
-    stages: list[StageState] = []
-    for name in graph.topo_order():
-        probe = probes_by_stage[name]
-        success = probe.previous
-        artifacts = _artifacts(entry, success) if success is not None else []
-        committed_at = _parse_datetime(success.committed_at) if success is not None else None
-        elapsed = success.elapsed if success is not None else None
-        stages.append(
-            StageState(
-                name=name,
-                status=probe.decision.status,
-                reason=probe.decision.display_reason,
-                artifacts=artifacts,
-                committed_at=committed_at,
-                elapsed=elapsed,
-                failure=(
-                    None
-                    if probe.failure is None
-                    else f"{probe.failure.exception_type}: {probe.failure.message}"
-                ),
-                upstreams=list(graph.stages[name].needs),
-                source_review=legacy_source_review(probe.source_review),
+
+def resolve_module_entry(
+    entries: list[PipelineEntry],
+    module: str,
+    *,
+    branch: str = "main",
+) -> PipelineEntry:
+    """Resolve one exact manifest MODULE and branch without importing candidates."""
+
+    module_entries = [entry for entry in entries if entry.module == module]
+    candidates = [entry for entry in module_entries if entry.branch == branch]
+    if not candidates:
+        available = sorted({entry.module for entry in entries if entry.module is not None})
+        if module_entries:
+            branches = sorted({entry.branch for entry in module_entries})
+            raise ValueError(
+                f"Unknown branch {branch!r} for module {module!r}. "
+                f"Available branches: {', '.join(branches) or '(none)'}"
             )
+        raise ValueError(
+            f"Unknown module: {module}. Available modules: {', '.join(available) or '(none)'}"
         )
+    if len(candidates) != 1:
+        raise ValueError(_ambiguity(module, branch, candidates))
+    entry = candidates[0]
+    if entry.pipeline_name is None or entry.manifest_error is not None:
+        raise ValueError(_ambiguity(module, branch, candidates))
+    return entry
 
-    return PipelineState(
-        entry=entry,
-        stages=stages,
-        status=_aggregate_status(stages),
-        error=None,
-    )
+
+def resolve_structure_pipeline(
+    entries: list[PipelineEntry],
+    module: str,
+) -> tuple[type[Pipeline], tuple[PipelineEntry, ...]]:
+    """Resolve one branch-independent MODULE, deduplicating identical classes."""
+
+    candidates = [entry for entry in entries if entry.module == module]
+    if not candidates:
+        available = sorted({entry.module for entry in entries if entry.module is not None})
+        raise ValueError(
+            f"Unknown module: {module}. Available modules: {', '.join(available) or '(none)'}"
+        )
+    class_names = {entry.pipeline_name for entry in candidates if entry.pipeline_name is not None}
+    if len(class_names) != 1 or any(entry.manifest_error for entry in candidates):
+        raise ValueError(_ambiguity(module, "all branches", candidates))
+    representative = candidates[0]
+    return import_entry_pipeline(representative), tuple(candidates)
 
 
 def import_entry_pipeline(entry: PipelineEntry) -> type[Pipeline]:
@@ -101,15 +108,53 @@ def import_entry_pipeline(entry: PipelineEntry) -> type[Pipeline]:
     return _import_pipeline(entry.module, entry.pipeline_name)
 
 
-def resolve_entry_branch(
-    entry: PipelineEntry,
-    pipeline: type[Pipeline],
-) -> ResolvedBranch:
+def resolve_entry_branch(entry: PipelineEntry, pipeline: type[Pipeline]) -> ResolvedBranch:
     return resolve_branch(
         pipeline,
         branch=entry.branch,
         override_json=None,
         cli_out=_output_base(entry),
+    )
+
+
+def resolve_entry_context(
+    entry: PipelineEntry,
+    pipeline: type[Pipeline],
+    args: Any,
+) -> ResolvedCommandContext:
+    """Restore a discovered store's exact output identity as a shared context."""
+
+    target = resolve_entry_target(entry, pipeline)
+    context = resolved_command_context(
+        pipeline,
+        target.resolved,
+        args,
+        graph=target.graph,
+    )
+    return context
+
+
+def resolve_entry_target(
+    entry: PipelineEntry,
+    pipeline: type[Pipeline],
+) -> ResolvedEntryTarget:
+    """Resolve only the branch, exact output identity, and graph."""
+
+    resolved = resolve_entry_branch(entry, pipeline)
+    output_root = pipeline.output_root(
+        resolved.config,
+        cli_out=resolved.output_base,
+        branch=resolved.branch,
+        is_temporary=resolved.is_temporary,
+    )
+    if output_root.resolve() != entry.output_root.resolve():
+        raise ValueError(
+            f"Resolved output root {output_root} does not match manifest anchor {entry.output_root}"
+        )
+    return ResolvedEntryTarget(
+        resolved=resolved,
+        output_root=output_root,
+        graph=build_graph(pipeline, resolved.axes),
     )
 
 
@@ -127,35 +172,14 @@ def _output_base(entry: PipelineEntry) -> Path:
     return entry.output_root.parent
 
 
-def _artifacts(entry: PipelineEntry, success: SuccessRecord) -> list[ArtifactState]:
-    if success.kind == "single":
-        assert success.produces is not None
-        paths = [Path(produced.path) for produced in success.produces]
-    else:
-        assert success.outputs is not None
-        paths = [Path(output.path) for output in success.outputs]
-    return [ArtifactState(path=path, exists=(entry.output_root / path).exists()) for path in paths]
-
-
-def _parse_datetime(value: str) -> datetime | None:
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
-def _aggregate_status(stages: list[StageState]) -> Status:
-    return aggregate_status([stage.status for stage in stages])
-
-
-def _error(
-    entry: PipelineEntry,
-    phase: ErrorPhase,
-    message: str,
-) -> PipelineState:
-    return PipelineState(
-        entry=entry,
-        stages=[],
-        status="error",
-        error=StateError(phase=phase, message=message),
+def _ambiguity(module: str, branch: str, candidates: list[PipelineEntry]) -> str:
+    details = "; ".join(
+        f"class={entry.pipeline_name or '(unknown)'}, branch={entry.branch}, "
+        f"output={entry.output_root}"
+        for entry in candidates
     )
+    return f"Ambiguous module {module!r} ({branch}): {details}"
+
+
+def _error(entry: PipelineEntry, phase: ErrorPhase, message: str) -> PipelineState:
+    return PipelineState(entry=entry, error=StateError(phase=phase, message=message))
