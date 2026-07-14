@@ -34,6 +34,7 @@ from varve.models import (
     KeyComponents,
     ProducedPath,
     SourceFingerprint,
+    SourceObservation,
     SuccessRecord,
 )
 from varve.store.store import Store
@@ -58,16 +59,16 @@ class LargeMatrix(Pipeline):
 
 def test_execution_and_effective_statuses_are_orthogonal() -> None:
     assert get_type_hints(StageOutcome)["status"] == ExecutionStatus
-    assert SourceReviewState("current", "accept") == SourceReviewState("current")
+    assert SourceReviewState("current", "reuse") == SourceReviewState("current")
     assert aggregate_execution_status(("hit", "failed", "needs-run")) == "failed"
     assert aggregate_effective_status(("error", "needs-review")) == "needs-review"
     assert effective_status("error", SourceReviewState("changed")) == "needs-review"
     assert effective_reason("artifact-missing", SourceReviewState("changed")) == "source-changed"
-    assert effective_status("hit", SourceReviewState("changed", "accept")) == "hit"
-    assert effective_reason("artifact-missing", SourceReviewState("changed", "accept")) == (
+    assert effective_status("hit", SourceReviewState("changed", "reuse")) == "hit"
+    assert effective_reason("artifact-missing", SourceReviewState("changed", "reuse")) == (
         "artifact-missing"
     )
-    assert effective_status("failed", SourceReviewState("changed", "reject")) == "needs-run"
+    assert effective_status("failed", SourceReviewState("changed", "invalidate")) == "needs-run"
 
 
 def _record(stage: str, *, elapsed: float) -> SuccessRecord:
@@ -80,7 +81,10 @@ def _record(stage: str, *, elapsed: float) -> SuccessRecord:
         kind="single",
         input_key="key",
         key_components=KeyComponents(config={}, inputs={}, values={}, upstreams={}),
-        executed_source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
+        executed_source=SourceObservation(
+            rerun=SourceFingerprint(fingerprint="source", files=[]),
+            review=SourceFingerprint(fingerprint="source", files=[]),
+        ),
         artifact_fingerprint="artifacts",
         produces=[ProducedPath(path="artifact", kind="file", artifact=artifact)],
         committed_at="now",

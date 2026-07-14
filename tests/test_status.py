@@ -131,7 +131,6 @@ def test_collect_status_reads_previous_record(tmp_path: Path) -> None:
     assert stage_status.status == "hit"
     assert stage_status.execution_status == "hit"
     assert stage_status.source_relationship == "current"
-    assert stage_status.review_decision == "none"
     assert stage_status.decision_key is not None
     assert stage_status.stored_key is not None
     assert stage_status.duration == 1.25
@@ -273,7 +272,7 @@ def test_summary_shows_duration_folds_needs_and_omits_key(pipeline_status) -> No
     assert "DURATION" in output
     assert "1.25s" in output
     assert "extract, text_arm · +4 more" in output
-    assert "REVIEW" not in output
+    assert "REVIEW" in output
     assert "test_status.shared_helper" not in output
     assert "KEY" not in output
 
@@ -413,7 +412,7 @@ def test_required_review_renders_as_effective_needs_review(pipeline_status) -> N
         reason="source-changed",
         summary_reason="source-changed",
         source_relationship="changed",
-        review_decision="none",
+        source_changes={"review/pipeline.py": "changed"},
     )
     status = replace(pipeline_status, stages=(stage,))
 
@@ -421,11 +420,13 @@ def test_required_review_renders_as_effective_needs_review(pipeline_status) -> N
     detail = render_to_text(status, stage="normalize", depth=0)
 
     assert "needs-review" in summary
-    assert "REVIEW" not in summary
+    assert "REVIEW" in summary
+    assert "required" in summary
     assert "Source" in detail
     assert "changed" in detail
-    assert "Review" in detail
+    assert "Stage review" in detail
     assert "required" in detail
+    assert status.groups[0].review.decision == "none"
 
 
 def test_expanded_stage_preserves_complete_keys_on_narrow_terminals(
@@ -499,7 +500,7 @@ def test_partial_matrix_status_keeps_canonical_selector_and_full_probe_subset(
     output = buffer.getvalue()
     assert "score@model=y  2 cells" in output
     assert "BENCH" in output and "MODEL" in output
-    assert "REVIEW" not in output
+    assert " · review " not in output
 
 
 def test_matrix_effective_status_prioritizes_needs_review(pipeline_status) -> None:
@@ -523,7 +524,6 @@ def test_matrix_effective_status_prioritizes_needs_review(pipeline_status) -> No
         execution_status="error",
         execution_reason="cannot evaluate input",
         source_relationship="changed",
-        review_decision="none",
     )
     status = replace(pipeline_status, stages=(hit, required))
 
@@ -545,10 +545,14 @@ def test_high_cardinality_status_probes_once_and_review_stays_folded(
     changed_stage = graph.base_cells["score"][0]
     previous = store.read_success(changed_stage)
     assert previous is not None
-    changed_source = previous.executed_source_fingerprint.model_copy(
-        update={"fingerprint": "changed-source-fingerprint"}
+    changed_source = previous.executed_source.model_copy(
+        update={
+            "review": previous.executed_source.review.model_copy(
+                update={"fingerprint": "changed-source-fingerprint"}
+            )
+        }
     )
-    store.write_success(previous.model_copy(update={"executed_source_fingerprint": changed_source}))
+    store.write_success(previous.model_copy(update={"executed_source": changed_source}))
 
     from varve import status as status_module
 
@@ -580,12 +584,13 @@ def test_high_cardinality_status_probes_once_and_review_stays_folded(
     rendered_status = status_buffer.getvalue()
     assert "1 needs-review" in rendered_status
     assert "119 hit" in rendered_status
+    assert "required" in rendered_status
     assert "score@row=" not in rendered_status
 
     result = record_source_review(
         HighCardinalityStatusPipeline,
         Config(),
-        decision="accept",
+        decision="reuse",
         targets=("score",),
         cli_out=output_base,
     )
@@ -596,13 +601,12 @@ def test_high_cardinality_status_probes_once_and_review_stays_folded(
     )
     rendered_review = review_buffer.getvalue()
     assert "1 decision recorded" in rendered_review
-    assert "119 cells did not need review" in rendered_review
     assert "score@row=" not in rendered_review
 
 
 @pytest.mark.parametrize(
     ("decision", "label", "effective"),
-    [("accept", "accepted", "hit"), ("reject", "rejected", "needs-run")],
+    [("reuse", "reuse", "hit"), ("invalidate", "invalidate", "needs-run")],
 )
 def test_changed_source_detail_preserves_review_decision_and_files(
     pipeline_status,
@@ -614,17 +618,14 @@ def test_changed_source_detail_preserves_review_decision_and_files(
     stage = replace(
         original,
         status=effective,
-        reason="source-changed" if decision == "reject" else "hit",
-        summary_reason="source-changed" if decision == "reject" else "hit",
+        reason="source-changed" if decision == "invalidate" else "hit",
+        summary_reason="source-changed" if decision == "invalidate" else "hit",
         source_relationship="changed",
-        review_decision=decision,
-        source_changes={"pipeline.py": "changed"},
+        source_changes={"review/pipeline.py": "changed"},
     )
-    output = render_to_text(
-        replace(pipeline_status, stages=(stage,)),
-        stage=stage.name,
-        depth=0,
-    )
+    status = replace(pipeline_status, stages=(stage,))
+    output = render_to_text(status, stage=stage.name, depth=0)
     assert "Source" in output and "changed" in output
-    assert "Review" in output and label in output
-    assert "pipeline.py" in output
+    assert "Stage review" in output and label in output
+    assert "review/pipeline.py" in output
+    assert status.groups[0].review.decision == decision

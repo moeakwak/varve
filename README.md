@@ -2,11 +2,11 @@
 
 [![PyPI](https://img.shields.io/pypi/v/varve.svg)](https://pypi.org/project/varve/) [![License](https://img.shields.io/pypi/l/varve.svg)](LICENSE)
 
-Varve runs Python pipelines and caches their outputs, so re-running only re-executes stages whose deterministic inputs or managed artifacts require it. Python source changes open an explicit review gate instead of silently choosing whether to rerun.
+Varve runs Python pipelines and caches their outputs, so re-running only re-executes stages whose deterministic inputs, deterministic source dependencies, or managed artifacts require it. Source changes that Varve cannot classify safely open an explicit Stage-level review gate.
 
 A varve is an annual layer of lake sediment — thin, ordered, and datable. Varve treats pipeline outputs the same way: each stage writes a materialized layer whose input key records config, external inputs, explicit values, and upstream artifact contents. When nothing changes, nothing re-runs; when something does, `status` tells you exactly what and why.
 
-It runs on a single machine — no daemon, no database, no pipeline DSL. Stages are ordinary Python methods, and the `run` / `status` / `accept` / `reject` / `plan` / `ls` / `clean` CLI is generated from your pipeline class. Varve is built for local experiments, evaluations, dataset preparation, render/compare jobs, and report generation, where Python is already the source of truth. It is not a distributed scheduler, a deployment platform, a data-version-control system, or a remote artifact store.
+It runs on a single machine — no daemon, no database, no pipeline DSL. Stages are ordinary Python methods, and the `run` / `status` / `reuse` / `invalidate` / `plan` / `ls` / `clean` CLI is generated from your pipeline class. Varve is built for local experiments, evaluations, dataset preparation, render/compare jobs, and report generation, where Python is already the source of truth. It is not a distributed scheduler, a deployment platform, a data-version-control system, or a remote artifact store.
 
 ## Install
 
@@ -57,7 +57,7 @@ python demo.py status
 python demo.py plan
 ```
 
-The first run executes both stages and records their keys and artifacts under `out/main/`. The second run is a straight cache hit. Changing `prefix`, changing a declared external input, or deleting `result.txt` makes the affected stage non-current for a reason `status` will name. Editing Python source opens a review gate that must be resolved with `accept` or `reject` before execution.
+The first run executes both stages and records their keys and artifacts under `out/main/`. The second run is a straight cache hit. Changing `prefix`, changing a declared external input, changing a Stage callable, or deleting `result.txt` makes the affected stage non-current for a reason `status` will name. Changes to surrounding pipeline code may instead open a Stage-level review gate that must be resolved with `reuse` or `invalidate` before a normal run.
 
 ## How it works
 
@@ -69,9 +69,9 @@ Inside a stage, `ctx.input("prepare")` returns the single artifact of an upstrea
 
 ## Core capabilities
 
-### Source review and deterministic inputs
+### Deterministic source invalidation and review
 
-Varve observes the Python files that define the pipeline and stage, plus paths declared with `Dependencies.sources`. A source change opens a `needs-review` gate: use `accept` when existing artifacts remain valid or `reject` when the stage must rerun. The relationship remains `changed`; the decision determines whether the effective status is reusable or `needs-run · source-changed`. Varve does not infer call graphs. External data and explicit values belong in `Dependencies.inputs` and `Dependencies.values`.
+Varve fingerprints each complete Stage callable AST, including its decorators, signature, docstring, and body. A callable change is part of the input key and produces `needs-run · source-changed` without Review. Python files or directories declared with `Dependencies.sources` have the same deterministic invalidation behavior. The remaining AST in the pipeline and callable definition files, plus paths declared with `Dependencies.review_sources`, forms the Review fingerprint. A changed Review fingerprint opens `needs-review` only when an existing success or validated partial could otherwise be reused: use `reuse` to keep it reusable or `invalidate` to require a rerun. Varve does not infer call graphs, imports, registries, or runtime dispatch. External data and non-Python runtime files belong in `Dependencies.inputs`; explicit values belong in `Dependencies.values`.
 
 ### Resumable batch stages
 
@@ -98,7 +98,7 @@ class Evaluation(Pipeline):
         evaluate(bench, model, ctx.cell_out / "score.json")
 ```
 
-Each cell gets a concrete identity like `score@bench=unimer,model=large` and its own artifact directory under `.matrix/score/bench=unimer/model=large/`. A StageSelector may name the base, a partial subset such as `score@bench=unimer`, or one concrete cell; omitted axes are wildcards and canonical output follows declaration order. Large matrices fold to one line per base stage in `run` and `status` output — keeping concrete failures and slow cells visible — and `--expand` shows every cell.
+Each cell gets a concrete identity like `score@bench=unimer,model=large` and its own input key, attempt, partial state, success record, and artifact directory under `.matrix/score/bench=unimer/model=large/`. Review Decision belongs to the logical `score` Stage and applies to all relevant cells through one base-stage ReviewRecord. A StageSelector may name the base, a partial subset such as `score@bench=unimer`, or one concrete cell for execution and status; Review commands accept only the base Stage name. Large matrices fold to one line per base stage in `run` and `status` output — keeping concrete failures and slow cells visible — and `--expand` shows every cell.
 
 ### Branches and temporary runs
 
@@ -111,18 +111,18 @@ Every `Pipeline` gets seven commands:
 | Command | Purpose |
 | --- | --- |
 | `run` | Evaluate cache decisions and execute the selected stages. |
-| `status` | Explain each stage's input key, materialization, artifact, and source-review state. |
+| `status` | Explain each Stage's input key, materialization, artifact, source relationship, and Review state. |
 | `plan` | Print the selected concrete topology without executing it. |
 | `ls` | Show branch-independent stage templates and matrix axes. |
 | `clean` | Safely remove a whole output root or a recorded downstream closure. |
-| `accept` | Mark current source changes as not requiring a rerun. |
-| `reject` | Mark current source changes as requiring a rerun. |
+| `reuse` | Keep existing materializations reusable after Review-source changes. |
+| `invalidate` | Mark existing materializations as needing a rerun after Review-source changes. |
 
-Generated `accept` and `reject` default to every source-changed stage in the pipeline; repeat `--stage STAGE_SELECTOR` for a narrower union. A normal `run` stops before executing any stage when its selection or required external upstreams contain `needs-review`. `run --force` validates the complete preflight, records `reject` for source-changed stages inside the execution selection, and then runs them; source-current stages in the force plan do not gain a persisted force intent.
+Generated `reuse` and `invalidate` default to every Stage with a current Review candidate; repeat `--stage BASE_STAGE` for a topology-ordered union. They only write fingerprint-bound Stage ReviewRecords: they do not execute Stage bodies, alter success records, or immediately delete partial state. A normal `run` stops before executing any Stage body when its selection or required external upstreams contain `needs-review`. `run --force` reruns selected concrete stages without writing ReviewRecord; external upstreams that are only being reused must still pass the normal Review gate.
 
-The top-level `varve` command finds existing stores by manifest exact module. `varve ls` exact-evaluates the discovered branches and reports `MODULE`, `BRANCH`, and effective `STATUS`; it does not expose separate review or stage-count columns. `varve ls MODULE`, `status MODULE`, `run MODULE`, `accept MODULE`, `reject MODULE`, `plan MODULE`, and `clean MODULE` reuse the generated command backends and renderers. Single dynamic commands use `COMMAND MODULE [OPTIONS]`, so MODULE precedes pipeline-specific Args flags.
+The top-level `varve` command finds existing stores by manifest exact module. `varve ls` exact-evaluates the discovered branches and reports `MODULE`, `BRANCH`, and effective `STATUS`. `varve ls MODULE`, `status MODULE`, `run MODULE`, `reuse MODULE`, `invalidate MODULE`, `plan MODULE`, and `clean MODULE` reuse the generated command backends and renderers. Single dynamic commands use `COMMAND MODULE [OPTIONS]`, so MODULE precedes pipeline-specific Args flags.
 
-`varve run --all`, `accept --all`, and `reject --all` operate on entries selected by `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run also accepts `--rehash`. Bulk review uses each pipeline's default Args and records each store independently. Bulk run skips hits and `needs-review`, executes eligible branches, refreshes observations after every attempt, and reports exact final state. Use repeatable `varve ls --status STATUS` to filter evaluated rows.
+`varve run --all`, `reuse --all`, and `invalidate --all` operate on entries selected by `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run also accepts `--rehash`. Bulk Review uses each pipeline's default Args and records each store independently. Bulk run skips hits and `needs-review`, executes eligible branches, refreshes observations after every attempt, and reports exact final state. Use repeatable `varve ls --status STATUS` to filter evaluated rows.
 
 ## Documentation
 

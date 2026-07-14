@@ -39,6 +39,7 @@ def compute_key_components(
     config_access: list[str] | None = None,
     dependencies: Dependencies | None = None,
     fingerprint_session: FingerprintSession | None = None,
+    rerun_source_fingerprint: str,
 ) -> KeyComponents:
     """Assemble a stage's key components.
 
@@ -85,6 +86,7 @@ def compute_key_components(
         values=values,
         upstreams=upstreams,
         config_access=config_access,
+        rerun_source_fingerprint=rerun_source_fingerprint,
     )
 
 
@@ -94,5 +96,6 @@ def input_key(components: KeyComponents) -> str:
         "inputs": file_digest_view(components.inputs),
         "values": components.values,
         "upstreams": components.upstreams,
+        "rerun_source_fingerprint": components.rerun_source_fingerprint,
     }
     return json_sha256(digest_view)

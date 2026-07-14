@@ -149,16 +149,16 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
 
     review_parsers = {}
     for command, help_text in (
-        ("accept", "Mark source changes as not requiring a rerun."),
-        ("reject", "Mark source changes as requiring a rerun."),
+        ("reuse", "Keep existing materializations reusable after source changes."),
+        ("invalidate", "Mark existing materializations as needing a rerun after source changes."),
     ):
         review_parser = subparsers.add_parser(command, help=help_text)
         review_parser.add_argument(
             "--stage",
             action="append",
             default=[],
-            metavar="STAGE_SELECTOR",
-            help=f"Review this selector; repeat to take a union. {selector_help}",
+            metavar="BASE_STAGE",
+            help="Review this base Stage; repeat to take a union. Coordinates are not accepted.",
         )
         review_parser.add_argument("--branch", default="main", metavar="NAME")
         review_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
@@ -224,10 +224,10 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
             namespace,
             confirm=default_confirm,
             review_targets=(
-                tuple(namespace.stage) if namespace.command in {"accept", "reject"} else ()
+                tuple(namespace.stage) if namespace.command in {"reuse", "invalidate"} else ()
             ),
         )
     except ValueError as error:
-        if namespace.command in {"accept", "reject", "status"}:
+        if namespace.command in {"reuse", "invalidate", "status"}:
             parser.error(str(error))
         raise

@@ -8,6 +8,7 @@ import pytest
 
 from varve.dashboard.cli import main as dashboard_main
 from varve.engine import runner as runner_module
+from varve.engine.review import validate_base_stage_targets
 from varve.engine.runner import (
     ReviewRequiredError,
     _KeyingSession,
@@ -16,8 +17,6 @@ from varve.engine.runner import (
     run,
 )
 from varve.engine.state import SourceReviewState
-from varve.keying import source as source_module
-from varve.models import SourceManifestEntry
 from varve.store.store import Store
 
 
@@ -99,14 +98,14 @@ class Config(BaseModel):
 class Demo(Pipeline):
     Config = Config
 
-    @stage(produces="upstream.txt", depends=Dependencies(sources=[Path("upstream.py")]))
+    @stage(produces="upstream.txt", depends=Dependencies(review_sources=[Path("upstream.py")]))
     def upstream(self, ctx):
         (ctx.out / "upstream.txt").write_text("upstream", encoding="utf-8")
 
     @stage(
         needs="upstream",
         produces="target.txt",
-        depends=Dependencies(sources=[Path("target.py")]),
+        depends=Dependencies(review_sources=[Path("target.py")]),
     )
     def target(self, ctx):
         (ctx.out / "target.txt").write_text("target", encoding="utf-8")
@@ -124,7 +123,7 @@ class Config(BaseModel):
 class Demo(Pipeline):
     Config = Config
 
-    @stage(produces="upstream.txt", depends=Dependencies(sources=[Path("upstream.py")]))
+    @stage(produces="upstream.txt", depends=Dependencies(review_sources=[Path("upstream.py")]))
     def upstream(self, ctx):
         (ctx.out / "upstream.txt").write_text("upstream", encoding="utf-8")
 
@@ -142,7 +141,10 @@ class Demo(Pipeline):
 
 def _forced_failure_source(*, hard_interrupt: bool = False) -> str:
     exception = "raise KeyboardInterrupt()" if hard_interrupt else 'raise RuntimeError("planned")'
-    return _source(exception)
+    return _reviewable_source("2").replace(
+        '(ctx.out / "artifact.txt").write_text("same", encoding="utf-8")',
+        exception,
+    )
 
 
 def _forced_two_stage_source() -> str:
@@ -160,19 +162,54 @@ class Demo(Pipeline):
     Config = Config
     Args = Args
 
-    @stage(produces="one.txt", depends=Dependencies(sources=[Path("shared.py")]))
+    @stage(produces="one.txt", depends=Dependencies(review_sources=[Path("shared.py")]))
     def one(self, ctx):
         if ctx.args.fail:
             raise RuntimeError("planned first-stage failure")
         (ctx.out / "one.txt").write_text("one", encoding="utf-8")
 
-    @stage(needs="one", produces="two.txt", depends=Dependencies(sources=[Path("shared.py")]))
+    @stage(
+        needs="one",
+        produces="two.txt",
+        depends=Dependencies(review_sources=[Path("shared.py")]),
+    )
     def two(self, ctx):
         (ctx.out / "two.txt").write_text("two", encoding="utf-8")
 
     @stage(needs="two", produces="three.txt")
     def three(self, ctx):
         (ctx.out / "three.txt").write_text("three", encoding="utf-8")
+"""
+
+
+def _force_partial_source() -> str:
+    return """from pathlib import Path
+from pydantic import BaseModel
+from varve import Dependencies, Pipeline, batch_stage
+
+class Config(BaseModel):
+    special: str
+    unused: str
+
+class Args(BaseModel):
+    fail: bool = False
+
+class Demo(Pipeline):
+    Config = Config
+    Args = Args
+
+    @batch_stage(depends=Dependencies(review_sources=[Path("helper.py")]))
+    async def build(self, ctx):
+        async for index, item in ctx.resume(range(3), progress=False):
+            if index == 0:
+                _ = ctx.config.special
+            with (ctx.out / "calls.txt").open("a", encoding="utf-8") as stream:
+                stream.write(f"{index}\\n")
+            path = ctx.out / f"part-{index}.txt"
+            path.write_text(str(item), encoding="utf-8")
+            yield path
+            if ctx.args.fail and index == 0:
+                raise RuntimeError("planned")
 """
 
 
@@ -190,7 +227,7 @@ class Demo(Pipeline):
     Config = Config
 
     @matrix(CELL)
-    @stage(produces="artifact.txt", depends=Dependencies(sources=[Path("helper.py")]))
+    @stage(produces="artifact.txt", depends=Dependencies(review_sources=[Path("helper.py")]))
     def build(self, ctx, *, cell):
         ctx.cell_out.mkdir(parents=True, exist_ok=True)
         (ctx.cell_out / "artifact.txt").write_text(cell, encoding="utf-8")
@@ -212,7 +249,7 @@ class Demo(Pipeline):
     Config = Config
 
     @matrix(BENCH, MODEL)
-    @stage(produces="artifact.txt", depends=Dependencies(sources=[Path("helper.py")]))
+    @stage(produces="artifact.txt", depends=Dependencies(review_sources=[Path("helper.py")]))
     def build(self, ctx, *, bench, model):
         ctx.cell_out.mkdir(parents=True, exist_ok=True)
         (ctx.cell_out / "artifact.txt").write_text(f"{bench}:{model}", encoding="utf-8")
@@ -237,7 +274,7 @@ class Demo(Pipeline):
     @batch_stage(
         depends=Dependencies(
             inputs={"input": lambda ctx: ctx.config.input},
-            sources=[Path("helper.py")],
+            review_sources=[Path("helper.py")],
         )
     )
     async def build(self, ctx):
@@ -253,36 +290,49 @@ class Demo(Pipeline):
 """
 
 
-def test_source_change_requires_review_and_accept_does_not_rewrite_success(tmp_path: Path) -> None:
+def _reviewable_source(helper_value: str = "1") -> str:
+    return f"""from pathlib import Path
+from pydantic import BaseModel
+from varve import Pipeline, stage
+
+HELPER = {helper_value}
+
+class Config(BaseModel):
+    pass
+
+class Demo(Pipeline):
+    Config = Config
+    @stage(produces="artifact.txt")
+    def build(self, ctx):
+        (ctx.out / "artifact.txt").write_text("same", encoding="utf-8")
+"""
+
+
+def test_source_change_requires_review_and_reuse_does_not_rewrite_success(tmp_path: Path) -> None:
     module_path = tmp_path / "demo.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("same")'))
+    module_path.write_text(_reviewable_source("1"), encoding="utf-8")
     pipeline = _load_pipeline(module_path, "review_demo")
     run(pipeline, pipeline.Config(), cli_out=tmp_path / "out")
     output_root = tmp_path / "out" / "main"
     before = (output_root / ".varve" / "stages" / "build.json").read_bytes()
 
-    module_path.write_text(
-        _source('value = "same"\n        (ctx.out / "artifact.txt").write_text(value)')
-    )
+    module_path.write_text(_reviewable_source("2"), encoding="utf-8")
     pipeline = _load_pipeline(module_path, "review_demo")
     probe = probe_pipeline(pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root)[0]
     assert probe.source_review == SourceReviewState("changed")
+    assert probe.decision.status == "hit"
     with pytest.raises(ReviewRequiredError) as error:
         run(pipeline, pipeline.Config(), cli_out=tmp_path / "out")
     assert error.value.stages == ["build"]
-    assert str(error.value) == ("Source review required for: build. Run accept or reject first.")
+    assert str(error.value) == ("Source review required for: build. Run reuse or invalidate first.")
     assert pipeline.cli(["run", "--out", str(tmp_path / "out")]) == 2
 
-    assert pipeline.cli(["accept", "--out", str(tmp_path / "out")]) == 0
+    assert pipeline.cli(["reuse", "--out", str(tmp_path / "out")]) == 0
     assert (output_root / ".varve" / "stages" / "build.json").read_bytes() == before
     assert probe_pipeline(pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root)[
         0
-    ].source_review == SourceReviewState("changed", "accept")
-    module_path.write_text(
-        _source(
-            'value = "same"\n        marker = 1\n        (ctx.out / "artifact.txt").write_text(value)'
-        )
-    )
+    ].source_review == SourceReviewState("changed", "reuse")
+    module_path.write_text(_reviewable_source("3"), encoding="utf-8")
     pipeline = _load_pipeline(module_path, "review_demo")
     assert probe_pipeline(pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root)[
         0
@@ -290,30 +340,24 @@ def test_source_change_requires_review_and_accept_does_not_rewrite_success(tmp_p
     record_source_review(
         pipeline,
         pipeline.Config(),
-        decision="reject",
+        decision="invalidate",
         cli_out=tmp_path / "out",
     )
-    rejected = probe_pipeline(pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root)[0]
-    assert rejected.source_review == SourceReviewState("changed", "reject")
-    assert rejected.decision.status == "hit"
-    assert rejected.decision.reason == "hit"
+    invalidated = probe_pipeline(
+        pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root
+    )[0]
+    assert invalidated.source_review == SourceReviewState("changed", "invalidate")
+    assert invalidated.decision.status == "hit"
+    assert invalidated.decision.reason == "hit"
     run(pipeline, pipeline.Config(), cli_out=tmp_path / "out")
-    assert Store(output_root).read_review("build") is None
-
-
-def test_comment_only_source_change_keeps_fingerprint(tmp_path: Path) -> None:
-    module_path = tmp_path / "demo.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("same")'))
-    pipeline = _load_pipeline(module_path, "comment_demo")
-    first = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=tmp_path / "out" / "main"
-    )[0].source_fingerprint.fingerprint
-    module_path.write_text(module_path.read_text() + "\n# formatting-only comment\n")
-    pipeline = _load_pipeline(module_path, "comment_demo")
-    second = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=tmp_path / "out" / "main"
-    )[0].source_fingerprint.fingerprint
-    assert second == first
+    # Successful execution updates the Cell baseline but keeps the Stage ReviewRecord.
+    assert Store(output_root).read_review("build") is not None
+    assert (
+        probe_pipeline(pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root)[
+            0
+        ].source_review.relationship
+        == "current"
+    )
 
 
 def test_pipeline_review_without_source_changes_is_a_successful_noop(tmp_path: Path) -> None:
@@ -324,13 +368,13 @@ def test_pipeline_review_without_source_changes_is_a_successful_noop(tmp_path: P
     result = record_source_review(
         pipeline,
         pipeline.Config(),
-        decision="accept",
+        decision="reuse",
         cli_out=tmp_path / "out",
     )
 
-    assert result.matched_cells == ()
-    assert result.source_changed_cells == ()
     assert result.recorded == ()
+    assert result.already_decided == ()
+    assert result.did_not_need_review == ()
     assert result.groups == ()
 
 
@@ -353,7 +397,7 @@ def test_record_source_review_passes_shared_session_to_exact_probe(
     record_source_review(
         pipeline,
         pipeline.Config(),
-        decision="accept",
+        decision="reuse",
         cli_out=tmp_path / "out",
         _keying_session=session,
     )
@@ -361,7 +405,7 @@ def test_record_source_review_passes_shared_session_to_exact_probe(
     assert observed_sessions == [session]
 
 
-def test_docstring_change_opens_source_review(tmp_path: Path) -> None:
+def test_docstring_change_is_deterministic_rerun(tmp_path: Path) -> None:
     module_path = tmp_path / "docstring_demo.py"
     module_path.write_text(
         _source('"""first"""\n        (ctx.out / "artifact.txt").write_text("same")')
@@ -381,15 +425,36 @@ def test_docstring_change_opens_source_review(tmp_path: Path) -> None:
         out=output_base / "main",
     )[0]
 
-    assert probe.source_review == SourceReviewState("changed")
+    assert probe.decision.status == "needs-run"
+    assert probe.decision.reason == "source-changed"
+    assert probe.source_review.relationship == "current"
 
 
-def test_dependency_error_preserves_pending_source_review(tmp_path: Path) -> None:
+def test_review_dependency_error_fails_before_writing_decision(tmp_path: Path) -> None:
     module_path = tmp_path / "review_error_demo.py"
     input_path = tmp_path / "input.txt"
     input_path.write_text("value", encoding="utf-8")
     module_path.write_text(
-        _source_with_input('(ctx.out / "artifact.txt").write_text("one", encoding="utf-8")'),
+        """from pathlib import Path
+from pydantic import BaseModel
+from varve import Dependencies, Pipeline, stage
+
+HELPER = 1
+
+class Config(BaseModel):
+    profile: str
+    limit: int
+    source: Path
+
+class Demo(Pipeline):
+    Config = Config
+    @stage(
+        produces="artifact.txt",
+        depends=Dependencies(inputs={"source": lambda ctx: ctx.config.source}),
+    )
+    def build(self, ctx):
+        (ctx.out / "artifact.txt").write_text("one", encoding="utf-8")
+""",
         encoding="utf-8",
     )
     pipeline = _load_pipeline(module_path, "review_error_demo")
@@ -398,7 +463,7 @@ def test_dependency_error_preserves_pending_source_review(tmp_path: Path) -> Non
     run(pipeline, config, cli_out=output_base)
 
     module_path.write_text(
-        _source_with_input('(ctx.out / "artifact.txt").write_text("two", encoding="utf-8")'),
+        module_path.read_text(encoding="utf-8").replace("HELPER = 1", "HELPER = 2"),
         encoding="utf-8",
     )
     pipeline = _load_pipeline(module_path, "review_error_demo")
@@ -415,186 +480,17 @@ def test_dependency_error_preserves_pending_source_review(tmp_path: Path) -> Non
     with pytest.raises(ReviewRequiredError):
         run(pipeline, config, cli_out=output_base)
 
-    record_source_review(pipeline, config, decision="accept", cli_out=output_base)
-    accepted = probe_pipeline(
+    with pytest.raises(ValueError, match="Cannot evaluate source review"):
+        record_source_review(pipeline, config, decision="reuse", cli_out=output_base)
+    assert Store(output_base / "main").read_review("build") is None
+    pending = probe_pipeline(
         pipeline,
         config,
         args=pipeline.Args(),
         out=output_base / "main",
     )[0]
-    assert accepted.decision.status == "error"
-    assert accepted.source_review == SourceReviewState("changed", "accept")
-
-
-def test_source_parser_honors_pep_263_encoding(tmp_path: Path) -> None:
-    module_path = tmp_path / "latin1_demo.py"
-    source = "# coding: latin-1\n" + _source(
-        '(ctx.out / "artifact.txt").write_text("é", encoding="utf-8")'
-    )
-    module_path.write_bytes(source.encode("latin-1"))
-    pipeline = _load_pipeline(module_path, "latin1_demo")
-
-    probe = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=tmp_path / "out" / "main",
-    )[0]
-
-    assert probe.decision.status == "needs-run"
-    assert probe.source_fingerprint.fingerprint != "error"
-
-
-def test_source_stat_cache_requires_same_physical_path(tmp_path: Path) -> None:
-    source_path = tmp_path / "source.py"
-    source_path.write_text("VALUE = 2\n", encoding="utf-8")
-    stat = source_path.stat()
-    stale = SourceManifestEntry(
-        path="pipeline/source.py",
-        cache_path=str(tmp_path / "other-checkout" / "source.py"),
-        digest="sha256:stale",
-        inode=stat.st_ino,
-        size=stat.st_size,
-        mtime_ns=stat.st_mtime_ns,
-    )
-
-    observed = source_module._source_entry(
-        "pipeline/source.py",
-        source_path,
-        stale,
-        force_rehash=False,
-    )
-
-    assert observed.cache_path == str(source_path.resolve())
-    assert observed.digest != stale.digest
-
-
-def test_source_stat_cache_is_reused_and_force_rehash_bypasses_it(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module_path = tmp_path / "cached_source_demo.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("same")'))
-    pipeline = _load_pipeline(module_path, "cached_source_demo")
-    output_base = tmp_path / "out"
-    output_root = output_base / "main"
-    run(pipeline, pipeline.Config(), cli_out=output_base)
-    original_parse = source_module.ast.parse
-    calls = 0
-
-    def counted_parse(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original_parse(*args, **kwargs)
-
-    monkeypatch.setattr(source_module.ast, "parse", counted_parse)
-
-    cached = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=output_root,
-    )[0]
-    assert cached.decision.status == "hit"
-    assert calls == 0
-
-    rehashed = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=output_root,
-        force_rehash=True,
-    )[0]
-    assert rehashed.decision.status == "hit"
-    assert calls > 0
-
-
-def test_declared_source_directory_tracks_added_python_files(tmp_path: Path) -> None:
-    helpers = tmp_path / "helpers"
-    helpers.mkdir()
-    (helpers / "first.py").write_text("VALUE = 1\n", encoding="utf-8")
-    module_path = tmp_path / "declared_demo.py"
-    source = _source('(ctx.out / "artifact.txt").write_text("same")')
-    source = source.replace(
-        "from varve import Pipeline, stage",
-        "from varve import Dependencies, Pipeline, stage",
-    ).replace(
-        '@stage(produces="artifact.txt")',
-        '@stage(produces="artifact.txt", depends=Dependencies(sources=[Path("helpers")]))',
-    )
-    module_path.write_text(source, encoding="utf-8")
-    pipeline = _load_pipeline(module_path, "declared_demo")
-    output_base = tmp_path / "out"
-    run(pipeline, pipeline.Config(), cli_out=output_base)
-
-    (helpers / "second.py").write_text("VALUE = 2\n", encoding="utf-8")
-    pipeline = _load_pipeline(module_path, "declared_demo")
-    probe = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=output_base / "main",
-    )[0]
-    assert probe.source_review == SourceReviewState("changed")
-    assert any(item.path.endswith("second.py") for item in probe.source_fingerprint.files)
-    added_fingerprint = probe.source_fingerprint.fingerprint
-
-    (helpers / "first.py").unlink()
-    removed = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=output_base / "main",
-    )[0]
-    assert removed.source_fingerprint.fingerprint != added_fingerprint
-
-    (helpers / "second.py").rename(helpers / "renamed.py")
-    renamed = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=output_base / "main",
-    )[0]
-    assert renamed.source_fingerprint.fingerprint != removed.source_fingerprint.fingerprint
-
-
-@pytest.mark.parametrize(
-    ("declared_name", "contents", "message"),
-    [
-        ("missing.py", None, "Declared source path does not exist"),
-        ("helper.txt", "value\n", "Declared source file must end in .py"),
-        ("broken.py", "def broken(:\n", "Cannot parse Python source file"),
-    ],
-)
-def test_invalid_declared_source_is_an_evaluation_error(
-    tmp_path: Path,
-    declared_name: str,
-    contents: str | None,
-    message: str,
-) -> None:
-    if contents is not None:
-        (tmp_path / declared_name).write_text(contents, encoding="utf-8")
-    module_path = tmp_path / "invalid_source_demo.py"
-    source = _source('(ctx.out / "artifact.txt").write_text("same")')
-    source = source.replace(
-        "from varve import Pipeline, stage",
-        "from varve import Dependencies, Pipeline, stage",
-    ).replace(
-        '@stage(produces="artifact.txt")',
-        f'@stage(produces="artifact.txt", depends=Dependencies(sources=[Path("{declared_name}")]))',
-    )
-    module_path.write_text(source, encoding="utf-8")
-    pipeline = _load_pipeline(module_path, f"invalid_source_{declared_name.replace('.', '_')}")
-
-    probe = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=tmp_path / "out" / "main",
-    )[0]
-
-    assert probe.decision.status == "error"
-    assert message in probe.decision.reason
+    assert pending.decision.status == "error"
+    assert pending.source_review == SourceReviewState("changed")
 
 
 def test_declared_source_symlink_is_an_evaluation_error(tmp_path: Path) -> None:
@@ -624,16 +520,33 @@ def test_declared_source_symlink_is_an_evaluation_error(tmp_path: Path) -> None:
     assert "Symlinks are not supported in source paths" in probe.decision.reason
 
 
-def test_accepted_source_uses_full_config_when_inputs_require_execution(
+def test_reused_source_uses_full_config_when_inputs_require_execution(
     tmp_path: Path,
 ) -> None:
     module_path = tmp_path / "config_demo.py"
     source_path = tmp_path / "input.txt"
     source_path.write_text("first", encoding="utf-8")
     module_path.write_text(
-        _source_with_input(
-            '(ctx.out / "artifact.txt").write_text(ctx.config.profile, encoding="utf-8")'
-        ),
+        """from pathlib import Path
+from pydantic import BaseModel
+from varve import Dependencies, Pipeline, stage
+
+HELPER = 1
+
+class Config(BaseModel):
+    profile: str
+    limit: int
+    source: Path
+
+class Demo(Pipeline):
+    Config = Config
+    @stage(
+        produces="artifact.txt",
+        depends=Dependencies(inputs={"source": lambda ctx: ctx.config.source}),
+    )
+    def build(self, ctx):
+        (ctx.out / "artifact.txt").write_text(ctx.config.profile, encoding="utf-8")
+""",
         encoding="utf-8",
     )
     pipeline = _load_pipeline(module_path, "config_review_demo")
@@ -644,9 +557,36 @@ def test_accepted_source_uses_full_config_when_inputs_require_execution(
     run(pipeline, config, args=args, cli_out=output_base)
 
     module_path.write_text(
-        _source_with_input(
-            '_ = ctx.config.profile\n        raise RuntimeError("stop after attempt")'
+        module_path.read_text(encoding="utf-8")
+        .replace("HELPER = 1", "HELPER = 2")
+        .replace(
+            '(ctx.out / "artifact.txt").write_text(ctx.config.profile, encoding="utf-8")',
+            '_ = ctx.config.profile\n        raise RuntimeError("stop after attempt")',
         ),
+        encoding="utf-8",
+    )
+    # Keep the Stage body identical so only residual review source changes.
+    module_path.write_text(
+        """from pathlib import Path
+from pydantic import BaseModel
+from varve import Dependencies, Pipeline, stage
+
+HELPER = 2
+
+class Config(BaseModel):
+    profile: str
+    limit: int
+    source: Path
+
+class Demo(Pipeline):
+    Config = Config
+    @stage(
+        produces="artifact.txt",
+        depends=Dependencies(inputs={"source": lambda ctx: ctx.config.source}),
+    )
+    def build(self, ctx):
+        (ctx.out / "artifact.txt").write_text(ctx.config.profile, encoding="utf-8")
+""",
         encoding="utf-8",
     )
     pipeline = _load_pipeline(module_path, "config_review_demo")
@@ -656,21 +596,56 @@ def test_accepted_source_uses_full_config_when_inputs_require_execution(
         pipeline,
         config,
         args=args,
-        decision="accept",
+        decision="reuse",
         cli_out=output_base,
     )
-    source_path.write_text("second", encoding="utf-8")
-    accepted_probe = probe_pipeline(
+    reused_before_input = probe_pipeline(
         pipeline,
         config,
         args=args,
         out=output_root,
     )[0]
-    assert accepted_probe.source_review == SourceReviewState("changed", "accept")
-    assert accepted_probe.components is not None
-    assert accepted_probe.components.config_access == ["profile"]
-    assert accepted_probe.decision.status == "needs-run"
+    assert reused_before_input.source_review == SourceReviewState("changed", "reuse")
+    assert reused_before_input.components is not None
+    assert reused_before_input.components.config_access == ["profile"]
+    assert reused_before_input.decision.status == "hit"
 
+    source_path.write_text("second", encoding="utf-8")
+    reused_probe = probe_pipeline(
+        pipeline,
+        config,
+        args=args,
+        out=output_root,
+    )[0]
+    # Input change forces a rerun, so Review is not required; the reuse decision remains stored.
+    assert reused_probe.decision.status == "needs-run"
+    assert Store(output_root).read_review("build") is not None
+
+    module_path.write_text(
+        """from pathlib import Path
+from pydantic import BaseModel
+from varve import Dependencies, Pipeline, stage
+
+HELPER = 2
+
+class Config(BaseModel):
+    profile: str
+    limit: int
+    source: Path
+
+class Demo(Pipeline):
+    Config = Config
+    @stage(
+        produces="artifact.txt",
+        depends=Dependencies(inputs={"source": lambda ctx: ctx.config.source}),
+    )
+    def build(self, ctx):
+        _ = ctx.config.profile
+        raise RuntimeError("stop after attempt")
+""",
+        encoding="utf-8",
+    )
+    pipeline = _load_pipeline(module_path, "config_review_demo")
     with pytest.raises(RuntimeError, match="stop after attempt"):
         run(pipeline, config, args=args, cli_out=output_base)
 
@@ -680,15 +655,38 @@ def test_accepted_source_uses_full_config_when_inputs_require_execution(
     assert attempt is not None
     assert failure is not None
     assert attempt.input_key == failure.input_key
-    assert attempt.input_key != accepted_probe.decision_key
 
 
 def test_review_targets_validate_all_stages_before_writing(tmp_path: Path) -> None:
     (tmp_path / "one_source.py").write_text("VALUE = 1\n", encoding="utf-8")
     (tmp_path / "two_source.py").write_text("VALUE = 1\n", encoding="utf-8")
     module_path = tmp_path / "two_stage_demo.py"
-    module_path.write_text(_two_stage_source(), encoding="utf-8")
+    module_path.write_text(
+        """from pathlib import Path
+from pydantic import BaseModel
+from varve import Dependencies, Pipeline, stage
+
+class Config(BaseModel):
+    pass
+
+class Demo(Pipeline):
+    Config = Config
+
+    @stage(produces="one.txt", depends=Dependencies(review_sources=[Path("one_source.py")]))
+    def one(self, ctx):
+        (ctx.out / "one.txt").write_text("one", encoding="utf-8")
+
+    @stage(produces="two.txt", depends=Dependencies(review_sources=[Path("two_source.py")]))
+    def two(self, ctx):
+        (ctx.out / "two.txt").write_text("two", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     pipeline = _load_pipeline(module_path, "two_stage_review_demo")
+    assert validate_base_stage_targets(pipeline.graph(), ("two", "one", "two")) == (
+        "one",
+        "two",
+    )
     output_base = tmp_path / "out"
     output_root = output_base / "main"
     run(pipeline, pipeline.Config(), cli_out=output_base)
@@ -697,7 +695,7 @@ def test_review_targets_validate_all_stages_before_writing(tmp_path: Path) -> No
     result = record_source_review(
         pipeline,
         pipeline.Config(),
-        decision="accept",
+        decision="reuse",
         targets=("one", "two"),
         cli_out=output_base,
     )
@@ -711,70 +709,153 @@ def test_review_targets_validate_all_stages_before_writing(tmp_path: Path) -> No
 
 def test_review_can_correct_decision_for_same_fingerprint(tmp_path: Path) -> None:
     module_path = tmp_path / "decision_demo.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("one")'))
+    module_path.write_text(_reviewable_source("1"), encoding="utf-8")
     pipeline = _load_pipeline(module_path, "decision_review_demo")
     output_base = tmp_path / "out"
     output_root = output_base / "main"
     run(pipeline, pipeline.Config(), cli_out=output_base)
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("two")'))
+    module_path.write_text(_reviewable_source("2"), encoding="utf-8")
     pipeline = _load_pipeline(module_path, "decision_review_demo")
 
-    first = record_source_review(
-        pipeline, pipeline.Config(), decision="accept", cli_out=output_base
-    )
-    accepted_at = Store(output_root).read_review("build").decided_at  # type: ignore[union-attr]
+    first = record_source_review(pipeline, pipeline.Config(), decision="reuse", cli_out=output_base)
+    reused_at = Store(output_root).read_review("build").decided_at  # type: ignore[union-attr]
     repeated = record_source_review(
-        pipeline, pipeline.Config(), decision="accept", cli_out=output_base
+        pipeline, pipeline.Config(), decision="reuse", cli_out=output_base
     )
     assert first.recorded == ("build",)
     assert repeated.recorded == ()
     assert repeated.already_decided == ("build",)
-    assert Store(output_root).read_review("build").decided_at == accepted_at  # type: ignore[union-attr]
+    assert Store(output_root).read_review("build").decided_at == reused_at  # type: ignore[union-attr]
     assert probe_pipeline(pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root)[
         0
-    ].source_review == SourceReviewState("changed", "accept")
+    ].source_review == SourceReviewState("changed", "reuse")
     record_source_review(
         pipeline,
         pipeline.Config(),
-        decision="reject",
+        decision="invalidate",
         targets=("build",),
         cli_out=output_base,
     )
     assert probe_pipeline(pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root)[
         0
-    ].source_review == SourceReviewState("changed", "reject")
-    assert Store(output_root).read_review("build").decided_at != accepted_at  # type: ignore[union-attr]
+    ].source_review == SourceReviewState("changed", "invalidate")
+    assert Store(output_root).read_review("build").decided_at != reused_at  # type: ignore[union-attr]
 
 
-def test_force_auto_reject_is_idempotent_and_survives_failure(tmp_path: Path) -> None:
+def test_force_does_not_write_review_and_survives_failure(tmp_path: Path) -> None:
     module_path = tmp_path / "force_failure.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("one")'))
+    module_path.write_text(
+        """from pathlib import Path
+from pydantic import BaseModel
+from varve import Pipeline, stage
+
+HELPER = 1
+
+class Config(BaseModel):
+    pass
+
+class Args(BaseModel):
+    fail: bool = False
+
+class Demo(Pipeline):
+    Config = Config
+    Args = Args
+    @stage(produces="artifact.txt")
+    def build(self, ctx):
+        if ctx.args.fail:
+            raise RuntimeError("planned")
+        (ctx.out / "artifact.txt").write_text("same", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     pipeline = _load_pipeline(module_path, "force_failure_demo")
     output_base = tmp_path / "out"
     output_root = output_base / "main"
-    run(pipeline, pipeline.Config(), cli_out=output_base)
+    run(pipeline, pipeline.Config(), args=pipeline.Args(), cli_out=output_base)
 
-    module_path.write_text(_forced_failure_source())
+    module_path.write_text(
+        module_path.read_text(encoding="utf-8").replace("HELPER = 1", "HELPER = 2"),
+        encoding="utf-8",
+    )
     pipeline = _load_pipeline(module_path, "force_failure_demo")
-    record_source_review(pipeline, pipeline.Config(), decision="accept", cli_out=output_base)
-    accepted = Store(output_root).read_review("build")
-    assert accepted is not None
+    record_source_review(
+        pipeline, pipeline.Config(), args=pipeline.Args(), decision="reuse", cli_out=output_base
+    )
+    reused = Store(output_root).read_review("build")
+    assert reused is not None
 
     with pytest.raises(RuntimeError, match="planned"):
-        run(pipeline, pipeline.Config(), cli_out=output_base, force=True)
-    rejected = Store(output_root).read_review("build")
-    assert rejected is not None
-    assert rejected.decision == "reject"
-    assert rejected.decided_at != accepted.decided_at
+        run(
+            pipeline,
+            pipeline.Config(),
+            args=pipeline.Args(fail=True),
+            cli_out=output_base,
+            force=True,
+        )
+    # Force does not rewrite Stage ReviewRecords.
+    assert Store(output_root).read_review("build") == reused
+    assert Store(output_root).read_attempt("build") is not None
 
     with pytest.raises(RuntimeError, match="planned"):
-        run(pipeline, pipeline.Config(), cli_out=output_base, force=True)
-    repeated = Store(output_root).read_review("build")
-    assert repeated is not None
-    assert repeated.decided_at == rejected.decided_at
-    assert probe_pipeline(pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root)[
-        0
-    ].source_review == SourceReviewState("changed", "reject")
+        run(
+            pipeline,
+            pipeline.Config(),
+            args=pipeline.Args(fail=True),
+            cli_out=output_base,
+            force=True,
+        )
+    assert Store(output_root).read_review("build") == reused
+
+
+def test_normal_run_recovers_force_partial_from_full_config_key(tmp_path: Path) -> None:
+    helper = tmp_path / "helper.py"
+    helper.write_text("VALUE = 1\n", encoding="utf-8")
+    module_path = tmp_path / "force_partial.py"
+    module_path.write_text(_force_partial_source(), encoding="utf-8")
+    pipeline = _load_pipeline(module_path, "force_partial_demo")
+    config = pipeline.Config(special="first", unused="unused")
+    output_base = tmp_path / "out"
+    output_root = output_base / "main"
+    run(pipeline, config, args=pipeline.Args(), cli_out=output_base)
+    (output_root / "calls.txt").unlink()
+    helper.write_text("VALUE = 2\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="planned"):
+        run(
+            pipeline,
+            config,
+            args=pipeline.Args(fail=True),
+            cli_out=output_base,
+            force=True,
+        )
+
+    store = Store(output_root)
+    attempt = store.read_attempt("build")
+    assert attempt is not None
+    assert store.read_partial("build", attempt.input_key)
+    assert store.read_review("build") is None
+
+    run(pipeline, config, args=pipeline.Args(), cli_out=output_base)
+
+    assert (output_root / "calls.txt").read_text(encoding="utf-8").splitlines() == [
+        "0",
+        "1",
+        "2",
+    ]
+    assert store.read_attempt("build") is None
+    assert store.read_review("build") is None
+    success = store.read_success("build")
+    assert success is not None
+    assert success.key_components.config_access is None
+
+    changed = probe_pipeline(
+        pipeline,
+        pipeline.Config(special="second", unused="unused"),
+        args=pipeline.Args(),
+        out=output_root,
+    )[0]
+    assert changed.decision.status == "needs-run"
+    assert changed.decision.reason.startswith("config:")
 
 
 def test_force_external_review_blocker_writes_nothing(tmp_path: Path) -> None:
@@ -783,7 +864,31 @@ def test_force_external_review_blocker_writes_nothing(tmp_path: Path) -> None:
     upstream.write_text("VALUE = 1\n", encoding="utf-8")
     target.write_text("VALUE = 1\n", encoding="utf-8")
     module_path = tmp_path / "external_review.py"
-    module_path.write_text(_dependent_two_stage_source(), encoding="utf-8")
+    module_path.write_text(
+        """from pathlib import Path
+from pydantic import BaseModel
+from varve import Dependencies, Pipeline, stage
+
+class Config(BaseModel):
+    pass
+
+class Demo(Pipeline):
+    Config = Config
+
+    @stage(produces="upstream.txt", depends=Dependencies(review_sources=[Path("upstream.py")]))
+    def upstream(self, ctx):
+        (ctx.out / "upstream.txt").write_text("upstream", encoding="utf-8")
+
+    @stage(
+        needs="upstream",
+        produces="target.txt",
+        depends=Dependencies(review_sources=[Path("target.py")]),
+    )
+    def target(self, ctx):
+        (ctx.out / "target.txt").write_text("target", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     pipeline = _load_pipeline(module_path, "external_review_demo")
     output_base = tmp_path / "out"
     output_root = output_base / "main"
@@ -866,26 +971,27 @@ def test_force_evaluation_error_writes_nothing(tmp_path: Path) -> None:
     assert Store(output_root).read_review("build") is None
 
 
-def test_force_hard_interruption_preserves_reject_and_attempt(tmp_path: Path) -> None:
+def test_force_hard_interruption_preserves_attempt_without_review(tmp_path: Path) -> None:
     module_path = tmp_path / "force_interrupt.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("one")'))
+    module_path.write_text(_reviewable_source("1"), encoding="utf-8")
     pipeline = _load_pipeline(module_path, "force_interrupt_demo")
     output_base = tmp_path / "out"
     output_root = output_base / "main"
     run(pipeline, pipeline.Config(), cli_out=output_base)
-    module_path.write_text(_forced_failure_source(hard_interrupt=True))
+    module_path.write_text(_forced_failure_source(hard_interrupt=True), encoding="utf-8")
     pipeline = _load_pipeline(module_path, "force_interrupt_demo")
 
     with pytest.raises(KeyboardInterrupt):
         run(pipeline, pipeline.Config(), cli_out=output_base, force=True)
 
     store = Store(output_root)
-    review = store.read_review("build")
-    assert review is not None and review.decision == "reject"
+    assert store.read_review("build") is None
     assert store.read_attempt("build") is not None
 
 
-def test_force_failure_preserves_reject_for_unstarted_selected_stage(tmp_path: Path) -> None:
+def test_force_failure_does_not_write_review_for_unstarted_selected_stage(
+    tmp_path: Path,
+) -> None:
     shared = tmp_path / "shared.py"
     shared.write_text("VALUE = 1\n", encoding="utf-8")
     module_path = tmp_path / "force_unstarted.py"
@@ -906,60 +1012,39 @@ def test_force_failure_preserves_reject_for_unstarted_selected_stage(tmp_path: P
         )
 
     store = Store(output_root)
-    assert store.read_review("one") is not None
-    assert store.read_review("two") is not None
+    assert store.read_review("one") is None
+    assert store.read_review("two") is None
     assert store.read_review("three") is None
     assert store.read_attempt("two") is None
     assert store.read_attempt("three") is None
 
+    # Pending Stage Review still blocks normal run after force failed mid-selection.
+    with pytest.raises(ReviewRequiredError):
+        run(pipeline, pipeline.Config(), args=pipeline.Args(), cli_out=output_base)
+    record_source_review(pipeline, pipeline.Config(), decision="invalidate", cli_out=output_base)
     run(pipeline, pipeline.Config(), args=pipeline.Args(), cli_out=output_base)
-    assert store.read_review("one") is None
-    assert store.read_review("two") is None
-    assert store.read_review("three") is None
+    assert store.read_review("one") is not None
+    assert store.read_review("two") is not None
 
 
-def test_force_review_write_failure_is_fail_closed_and_repeatable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_force_does_not_write_matrix_review_records(tmp_path: Path) -> None:
     helper = tmp_path / "helper.py"
     helper.write_text("VALUE = 1\n", encoding="utf-8")
-    module_path = tmp_path / "force_write_failure.py"
+    module_path = tmp_path / "force_matrix.py"
     module_path.write_text(_matrix_source(), encoding="utf-8")
-    pipeline = _load_pipeline(module_path, "force_write_failure_demo")
+    pipeline = _load_pipeline(module_path, "force_matrix_demo")
     output_base = tmp_path / "out"
     output_root = output_base / "main"
     run(pipeline, pipeline.Config(), cli_out=output_base)
-    artifacts = [
-        output_root / ".matrix" / "build" / f"cell={cell}" / "artifact.txt" for cell in ("a", "b")
-    ]
-    before = [path.stat().st_mtime_ns for path in artifacts]
     helper.write_text("VALUE = 2\n", encoding="utf-8")
-    original = Store.write_review
-    calls = 0
-
-    def fail_second(store: Store, stage: str, record) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise OSError("planned review write failure")
-        original(store, stage, record)
-
-    monkeypatch.setattr(Store, "write_review", fail_second)
-    with pytest.raises(OSError, match="planned review write failure"):
-        run(pipeline, pipeline.Config(), cli_out=output_base, force=True)
-
-    store = Store(output_root)
-    assert store.read_review("build@cell=a") is not None
-    assert store.read_review("build@cell=b") is None
-    assert [path.stat().st_mtime_ns for path in artifacts] == before
-
     run(pipeline, pipeline.Config(), cli_out=output_base, force=True)
+    store = Store(output_root)
+    assert store.read_review("build") is None
     assert store.read_review("build@cell=a") is None
     assert store.read_review("build@cell=b") is None
 
 
-def test_matrix_base_and_concrete_review_targets_have_expected_scope(tmp_path: Path) -> None:
+def test_matrix_review_is_base_stage_only(tmp_path: Path) -> None:
     helper = tmp_path / "helper.py"
     helper.write_text("VALUE = 1\n", encoding="utf-8")
     module_path = tmp_path / "matrix_demo.py"
@@ -973,31 +1058,25 @@ def test_matrix_base_and_concrete_review_targets_have_expected_scope(tmp_path: P
     probes = probe_pipeline(pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root)
     names = [probe.stage for probe in probes]
     assert names == ["build@cell=a", "build@cell=b"]
-    record_source_review(
-        pipeline,
-        pipeline.Config(),
-        decision="accept",
-        targets=(names[0],),
-        cli_out=output_base,
-    )
-    reviews = {
-        probe.stage: probe.source_review
-        for probe in probe_pipeline(
-            pipeline, pipeline.Config(), args=pipeline.Args(), out=output_root
+    with pytest.raises(ValueError, match="whole Stage"):
+        record_source_review(
+            pipeline,
+            pipeline.Config(),
+            decision="reuse",
+            targets=(names[0],),
+            cli_out=output_base,
         )
-    }
-    assert reviews == {
-        names[0]: SourceReviewState("changed", "accept"),
-        names[1]: SourceReviewState("changed"),
-    }
+    assert Store(output_root).read_review("build") is None
+    assert Store(output_root).read_review(names[0]) is None
 
     record_source_review(
         pipeline,
         pipeline.Config(),
-        decision="reject",
+        decision="invalidate",
         targets=("build",),
         cli_out=output_base,
     )
+    assert Store(output_root).read_review("build") is not None
     reviews = {
         probe.stage: probe.source_review
         for probe in probe_pipeline(
@@ -1005,12 +1084,12 @@ def test_matrix_base_and_concrete_review_targets_have_expected_scope(tmp_path: P
         )
     }
     assert reviews == {
-        names[0]: SourceReviewState("changed", "reject"),
-        names[1]: SourceReviewState("changed", "reject"),
+        names[0]: SourceReviewState("changed", "invalidate"),
+        names[1]: SourceReviewState("changed", "invalidate"),
     }
 
 
-def test_review_repeatable_partial_selectors_union_and_skip_current_cells(tmp_path: Path) -> None:
+def test_coordinate_review_targets_fail_before_writes(tmp_path: Path) -> None:
     helper = tmp_path / "helper.py"
     helper.write_text("VALUE = 1\n", encoding="utf-8")
     module_path = tmp_path / "matrix_2d_demo.py"
@@ -1020,36 +1099,19 @@ def test_review_repeatable_partial_selectors_union_and_skip_current_cells(tmp_pa
     output_root = output_base / "main"
     run(pipeline, pipeline.Config(), cli_out=output_base)
     helper.write_text("VALUE = 2\n", encoding="utf-8")
-    run(
-        pipeline,
-        pipeline.Config(),
-        cli_out=output_base,
-        only="build@bench=a,model=small",
-        force=True,
-    )
 
-    result = record_source_review(
-        pipeline,
-        pipeline.Config(),
-        decision="accept",
-        targets=("build@bench=a", "build@model=large"),
-        cli_out=output_base,
-    )
-
-    assert result.matched_cells == (
-        "build@bench=a,model=small",
-        "build@bench=a,model=large",
-        "build@bench=b,model=large",
-    )
-    assert result.recorded == (
-        "build@bench=a,model=large",
-        "build@bench=b,model=large",
-    )
-    assert result.did_not_need_review == ("build@bench=a,model=small",)
-    assert Store(output_root).read_review("build@bench=b,model=small") is None
+    with pytest.raises(ValueError, match="whole Stage"):
+        record_source_review(
+            pipeline,
+            pipeline.Config(),
+            decision="reuse",
+            targets=("build@bench=a", "build@model=large"),
+            cli_out=output_base,
+        )
+    assert Store(output_root).read_review("build") is None
 
 
-def test_invalid_repeatable_review_selector_writes_nothing(tmp_path: Path) -> None:
+def test_invalid_base_review_selector_writes_nothing(tmp_path: Path) -> None:
     helper = tmp_path / "helper.py"
     helper.write_text("VALUE = 1\n", encoding="utf-8")
     module_path = tmp_path / "invalid_selector_demo.py"
@@ -1064,36 +1126,66 @@ def test_invalid_repeatable_review_selector_writes_nothing(tmp_path: Path) -> No
         record_source_review(
             pipeline,
             pipeline.Config(),
-            decision="accept",
-            targets=("build@cell=a", "missing"),
+            decision="reuse",
+            targets=("build", "missing"),
             cli_out=output_base,
         )
 
+    assert Store(output_root).read_review("build") is None
     assert Store(output_root).read_review("build@cell=a") is None
     assert Store(output_root).read_review("build@cell=b") is None
 
 
-def test_dashboard_accept_route_records_review_without_running(tmp_path: Path) -> None:
+def test_top_level_and_bulk_review_routes_record_without_running(tmp_path: Path) -> None:
+    def source(helper: str) -> str:
+        return _reviewable_source(helper).replace(
+            '(ctx.out / "artifact.txt").write_text("same", encoding="utf-8")',
+            'with (ctx.out / "calls.txt").open("a", encoding="utf-8") as stream:\n'
+            '            stream.write("called\\n")\n'
+            '        (ctx.out / "artifact.txt").write_text("same", encoding="utf-8")',
+        )
+
     module_path = tmp_path / "dashboard_demo.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("one")'))
+    module_path.write_text(source("1"), encoding="utf-8")
     pipeline = _load_pipeline(module_path, "dashboard_review_demo")
     output_base = tmp_path / "demo" / "out"
     output_root = output_base / "main"
     run(pipeline, pipeline.Config(), cli_out=output_base)
+    calls = output_root / "calls.txt"
+    calls.unlink()
     artifact = output_root / "artifact.txt"
     before = artifact.read_bytes()
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("two")'))
+    store = Store(output_root)
+    success = store.read_success("build")
+    module_path.write_text(source("2"), encoding="utf-8")
     _load_pipeline(module_path, "dashboard_review_demo")
 
-    assert dashboard_main(["accept", "dashboard_review_demo", "--root", str(tmp_path)]) == 0
+    assert dashboard_main(["reuse", "dashboard_review_demo", "--root", str(tmp_path)]) == 0
 
-    review = Store(output_root).read_review("build")
+    review = store.read_review("build")
     assert review is not None
-    assert review.decision == "accept"
+    assert review.decision == "reuse"
+    assert not calls.exists()
     assert artifact.read_bytes() == before
+    assert store.read_success("build") == success
+    assert store.read_attempt("build") is None
+    assert store.read_failure("build") is None
+
+    module_path.write_text(source("3"), encoding="utf-8")
+    _load_pipeline(module_path, "dashboard_review_demo")
+    assert dashboard_main(["invalidate", "--all", "--root", str(tmp_path)]) == 0
+
+    review = store.read_review("build")
+    assert review is not None
+    assert review.decision == "invalidate"
+    assert not calls.exists()
+    assert artifact.read_bytes() == before
+    assert store.read_success("build") == success
+    assert store.read_attempt("build") is None
+    assert store.read_failure("build") is None
 
 
-def test_accept_preserves_batch_partial_and_reject_restarts_from_zero(
+def test_reuse_preserves_batch_partial_and_invalidate_restarts_from_zero(
     tmp_path: Path,
 ) -> None:
     helper = tmp_path / "helper.py"
@@ -1102,93 +1194,93 @@ def test_accept_preserves_batch_partial_and_reject_restarts_from_zero(
     module_path.write_text(_batch_source(), encoding="utf-8")
     pipeline = _load_pipeline(module_path, "batch_review_demo")
 
-    accepted_base = tmp_path / "accepted"
-    accepted_input = tmp_path / "accepted-input.txt"
-    accepted_input.write_text("first", encoding="utf-8")
+    reused_base = tmp_path / "reuse"
+    reused_input = tmp_path / "reused-input.txt"
+    reused_input.write_text("first", encoding="utf-8")
     run(
         pipeline,
-        pipeline.Config(input=accepted_input),
+        pipeline.Config(input=reused_input),
         args=pipeline.Args(),
-        cli_out=accepted_base,
+        cli_out=reused_base,
     )
-    (accepted_base / "main" / "calls.txt").unlink()
-    accepted_input.write_text("second", encoding="utf-8")
+    (reused_base / "main" / "calls.txt").unlink()
+    reused_input.write_text("second", encoding="utf-8")
     with pytest.raises(RuntimeError, match="planned failure"):
         run(
             pipeline,
-            pipeline.Config(input=accepted_input),
+            pipeline.Config(input=reused_input),
             args=pipeline.Args(fail_after=1),
-            cli_out=accepted_base,
+            cli_out=reused_base,
         )
     helper.write_text("VALUE = 2\n", encoding="utf-8")
     record_source_review(
         pipeline,
-        pipeline.Config(input=accepted_input),
+        pipeline.Config(input=reused_input),
         args=pipeline.Args(),
-        decision="accept",
-        cli_out=accepted_base,
+        decision="reuse",
+        cli_out=reused_base,
     )
-    accepted_probe = probe_pipeline(
+    reused_probe = probe_pipeline(
         pipeline,
-        pipeline.Config(input=accepted_input),
+        pipeline.Config(input=reused_input),
         args=pipeline.Args(),
-        out=accepted_base / "main",
+        out=reused_base / "main",
     )[0]
-    assert accepted_probe.decision.status == "failed"
-    assert accepted_probe.decision.display_reason == "stage-failed · resume 2/3"
+    assert reused_probe.decision.status == "failed"
+    assert reused_probe.decision.display_reason == "stage-failed · resume 2/3"
     run(
         pipeline,
-        pipeline.Config(input=accepted_input),
+        pipeline.Config(input=reused_input),
         args=pipeline.Args(),
-        cli_out=accepted_base,
+        cli_out=reused_base,
     )
-    assert (accepted_base / "main" / "calls.txt").read_text(encoding="utf-8").splitlines() == [
+    assert (reused_base / "main" / "calls.txt").read_text(encoding="utf-8").splitlines() == [
         "0",
         "1",
         "2",
     ]
 
-    rejected_base = tmp_path / "rejected"
-    rejected_input = tmp_path / "rejected-input.txt"
-    rejected_input.write_text("first", encoding="utf-8")
+    invalidated_base = tmp_path / "invalidate"
+    invalidated_input = tmp_path / "invalidated-input.txt"
+    invalidated_input.write_text("first", encoding="utf-8")
     run(
         pipeline,
-        pipeline.Config(input=rejected_input),
+        pipeline.Config(input=invalidated_input),
         args=pipeline.Args(),
-        cli_out=rejected_base,
+        cli_out=invalidated_base,
     )
-    (rejected_base / "main" / "calls.txt").unlink()
-    rejected_input.write_text("second", encoding="utf-8")
+    (invalidated_base / "main" / "calls.txt").unlink()
+    invalidated_input.write_text("second", encoding="utf-8")
     with pytest.raises(RuntimeError, match="planned failure"):
         run(
             pipeline,
-            pipeline.Config(input=rejected_input),
+            pipeline.Config(input=invalidated_input),
             args=pipeline.Args(fail_after=1),
-            cli_out=rejected_base,
+            cli_out=invalidated_base,
         )
     helper.write_text("VALUE = 3\n", encoding="utf-8")
     record_source_review(
         pipeline,
-        pipeline.Config(input=rejected_input),
+        pipeline.Config(input=invalidated_input),
         args=pipeline.Args(),
-        decision="reject",
-        cli_out=rejected_base,
+        decision="invalidate",
+        cli_out=invalidated_base,
     )
-    rejected_probe = probe_pipeline(
+    invalidated_probe = probe_pipeline(
         pipeline,
-        pipeline.Config(input=rejected_input),
+        pipeline.Config(input=invalidated_input),
         args=pipeline.Args(),
-        out=rejected_base / "main",
+        out=invalidated_base / "main",
     )[0]
-    assert rejected_probe.decision.status == "failed"
-    assert rejected_probe.source_review == SourceReviewState("changed", "reject")
+    assert invalidated_probe.decision.status == "failed"
+    assert invalidated_probe.source_review == SourceReviewState("changed", "invalidate")
     run(
         pipeline,
-        pipeline.Config(input=rejected_input),
+        pipeline.Config(input=invalidated_input),
         args=pipeline.Args(),
-        cli_out=rejected_base,
+        cli_out=invalidated_base,
     )
-    assert (rejected_base / "main" / "calls.txt").read_text(encoding="utf-8").splitlines() == [
+    assert (invalidated_base / "main" / "calls.txt").read_text(encoding="utf-8").splitlines() == [
         "0",
         "1",
         "0",

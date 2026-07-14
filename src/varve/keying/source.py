@@ -1,17 +1,21 @@
-"""File-granularity Python source observation."""
+"""Callable AST and residual-file Python source observation."""
 
 from __future__ import annotations
 
 import ast
+import copy
 import inspect
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from varve.dependencies import merge_dependencies
+from varve.dependencies import Dependencies, merge_dependencies
 from varve.keying.fingerprint import assert_no_symlink_path, json_sha256
-from varve.models import SourceFingerprint, SourceManifestEntry
+from varve.models import SourceFingerprint, SourceManifestEntry, SourceObservation
+
+_EMPTY_FINGERPRINT = SourceFingerprint(fingerprint=json_sha256([]), files=[])
 
 
 def _definition_file(value: Any, description: str) -> Path:
@@ -26,26 +30,62 @@ def _definition_file(value: Any, description: str) -> Path:
     return path
 
 
-def _source_roots(pipeline_type: type[Any], stage_spec: Any) -> tuple[tuple[str, Path], ...]:
-    pipeline_file = _definition_file(pipeline_type, f"pipeline {pipeline_type.__name__}")
-    stage_file = _definition_file(stage_spec.func, f"stage {stage_spec.name}")
-    depends = merge_dependencies(pipeline_type.depends, stage_spec.depends)
-    declaration_base = pipeline_file.parent
-    explicit = {
-        (path if path.is_absolute() else declaration_base / path).expanduser().absolute()
-        for path in depends.sources
+def _callable_identity(func: Any) -> dict[str, str]:
+    return {
+        "module": getattr(func, "__module__", "") or "",
+        "qualname": getattr(func, "__qualname__", "") or getattr(func, "__name__", "") or "",
     }
-    roots = [("pipeline", pipeline_file), ("stage", stage_file)]
-    for path in sorted(explicit, key=str):
-        try:
-            display = path.relative_to(declaration_base).as_posix()
-        except ValueError:
-            display = path.as_posix()
-        roots.append((f"declared:{display}", path))
-    unique: dict[Path, str] = {}
-    for label, path in roots:
-        unique.setdefault(path, label)
-    return tuple((label, path) for path, label in unique.items())
+
+
+def _callable_name(func: Any) -> str:
+    return getattr(func, "__name__", "") or ""
+
+
+def _callable_firstlineno(func: Any) -> int:
+    code = getattr(func, "__code__", None)
+    if code is None:
+        raise ValueError(f"Cannot locate source line for callable {func!r}")
+    return int(code.co_firstlineno)
+
+
+def _is_async_callable(func: Any) -> bool:
+    return inspect.iscoroutinefunction(func) or inspect.isasyncgenfunction(func)
+
+
+def _resolve_declared_root(path: Path, declaration_base: Path) -> Path:
+    resolved = (path if path.is_absolute() else declaration_base / path).expanduser()
+    assert_no_symlink_path(resolved, description="source paths")
+    return resolved.absolute()
+
+
+def _display_path(path: Path, declaration_base: Path) -> str:
+    try:
+        return path.relative_to(declaration_base).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _declared_roots(
+    depends: Dependencies,
+    declaration_base: Path,
+) -> tuple[dict[Path, str], dict[Path, str]]:
+    rerun: dict[Path, str] = {}
+    review: dict[Path, str] = {}
+    for path in depends.sources:
+        root = _resolve_declared_root(path, declaration_base)
+        display = _display_path(root, declaration_base)
+        rerun.setdefault(root, f"declared:{display}")
+    for path in depends.review_sources:
+        root = _resolve_declared_root(path, declaration_base)
+        display = _display_path(root, declaration_base)
+        review.setdefault(root, f"review:{display}")
+    conflicts = sorted(set(rerun) & set(review), key=str)
+    if conflicts:
+        details = ", ".join(_display_path(path, declaration_base) for path in conflicts)
+        raise ValueError(
+            "Dependencies.sources and review_sources declare the same root: " + details
+        )
+    return rerun, review
 
 
 def _collect_python_files(root: Path) -> list[tuple[str, Path]]:
@@ -65,6 +105,38 @@ def _collect_python_files(root: Path) -> list[tuple[str, Path]]:
         if member.is_file() and member.suffix == ".py":
             members.append((member.relative_to(root).as_posix(), member))
     return members
+
+
+def _read_module_ast(path: Path) -> tuple[ast.AST, Any]:
+    try:
+        source = path.read_bytes()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(source, filename=str(path))
+        after = path.stat()
+    except (OSError, SyntaxError, UnicodeError) as error:
+        raise ValueError(f"Cannot parse Python source file: {path}: {error}") from error
+    return tree, after
+
+
+def _digest_tree(tree: ast.AST) -> str:
+    return json_sha256(ast.dump(tree, annotate_fields=True, include_attributes=False))
+
+
+def _source_entry_from_tree(
+    label: str,
+    path: Path,
+    tree: ast.AST,
+    after: Any,
+) -> SourceManifestEntry:
+    return SourceManifestEntry(
+        path=label,
+        cache_path=str(path.resolve()),
+        digest=_digest_tree(tree),
+        inode=after.st_ino,
+        size=after.st_size,
+        mtime_ns=after.st_mtime_ns,
+    )
 
 
 def _source_entry(
@@ -90,70 +162,313 @@ def _source_entry(
                 and cached.algorithm == "ast-sha256"
             ):
                 return cached
-            source = path.read_bytes()
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", SyntaxWarning)
-                tree = ast.parse(source, filename=str(path))
-            after = path.stat()
-        except (OSError, SyntaxError, UnicodeError) as error:
+            tree, after = _read_module_ast(path)
+        except (OSError, SyntaxError, UnicodeError, ValueError) as error:
+            if isinstance(error, ValueError):
+                raise
             raise ValueError(f"Cannot parse Python source file: {path}: {error}") from error
         before_token = (before.st_ino, before.st_size, before.st_mtime_ns)
         after_token = (after.st_ino, after.st_size, after.st_mtime_ns)
         if before_token == after_token:
-            return SourceManifestEntry(
-                path=label,
-                cache_path=cache_path,
-                digest=json_sha256(ast.dump(tree, annotate_fields=True, include_attributes=False)),
-                inode=after.st_ino,
-                size=after.st_size,
-                mtime_ns=after.st_mtime_ns,
-            )
+            return _source_entry_from_tree(label, path, tree, after)
         if attempt == retries:
             raise ValueError(f"Python source file changed while fingerprinting: {path}")
     raise AssertionError("unreachable")
 
 
+def _fingerprint_entries(entries: Sequence[SourceManifestEntry]) -> SourceFingerprint:
+    files = sorted(entries, key=lambda item: item.path)
+    return SourceFingerprint(
+        fingerprint=json_sha256([{"path": entry.path, "digest": entry.digest} for entry in files]),
+        files=list(files),
+    )
+
+
+def _node_span(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[int, int]:
+    start = node.lineno
+    if node.decorator_list:
+        start = min(
+            decorator.lineno for decorator in node.decorator_list if hasattr(decorator, "lineno")
+        )
+    end = getattr(node, "end_lineno", None) or node.lineno
+    return start, end
+
+
+def _locate_callable_node(tree: ast.AST, func: Any, description: str) -> ast.AST:
+    name = _callable_name(func)
+    first = _callable_firstlineno(func)
+    async_expected = _is_async_callable(func)
+    matches: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name != name:
+            continue
+        if isinstance(node, ast.AsyncFunctionDef) != async_expected:
+            continue
+        start, end = _node_span(node)
+        if start <= first <= end:
+            matches.append(node)
+    if len(matches) != 1:
+        raise ValueError(
+            f"Cannot uniquely locate Stage callable AST for {description}: "
+            f"found {len(matches)} candidates for {name!r} at line {first}"
+        )
+    return matches[0]
+
+
+def _callable_component(
+    label: str,
+    path: Path,
+    func: Any,
+    description: str,
+    cached: SourceManifestEntry | None,
+    *,
+    force_rehash: bool,
+    retries: int = 2,
+) -> SourceManifestEntry:
+    cache_path = str(path.resolve())
+    identity = _callable_identity(func)
+    for attempt in range(retries + 1):
+        before = path.stat()
+        if (
+            cached is not None
+            and not force_rehash
+            and cached.path == label
+            and cached.cache_path == cache_path
+            and cached.inode == before.st_ino
+            and cached.size == before.st_size
+            and cached.mtime_ns == before.st_mtime_ns
+            and cached.algorithm == "ast-sha256"
+        ):
+            return cached
+        tree, after = _read_module_ast(path)
+        node = _locate_callable_node(tree, func, description)
+        before_token = (before.st_ino, before.st_size, before.st_mtime_ns)
+        after_token = (after.st_ino, after.st_size, after.st_mtime_ns)
+        if before_token != after_token:
+            if attempt == retries:
+                raise ValueError(f"Python source file changed while fingerprinting: {path}")
+            continue
+        payload = {
+            "identity": identity,
+            "node": ast.dump(node, annotate_fields=True, include_attributes=False),
+        }
+        return SourceManifestEntry(
+            path=label,
+            cache_path=cache_path,
+            digest=json_sha256(payload),
+            inode=after.st_ino,
+            size=after.st_size,
+            mtime_ns=after.st_mtime_ns,
+        )
+    raise AssertionError("unreachable")
+
+
+def _remove_nodes(tree: ast.AST, nodes: set[ast.AST]) -> ast.AST:
+    """Remove callable nodes from ``tree`` in place. ``nodes`` must come from ``tree``."""
+
+    class _Strip(ast.NodeTransformer):
+        def visit(self, node: ast.AST) -> Any:
+            if node in nodes:
+                return None
+            return self.generic_visit(node)
+
+        def generic_visit(self, node: ast.AST) -> Any:
+            for field_name, old_value in ast.iter_fields(node):
+                if isinstance(old_value, list):
+                    new_values = []
+                    for value in old_value:
+                        if isinstance(value, ast.AST):
+                            value = self.visit(value)
+                            if value is None:
+                                continue
+                            if isinstance(value, list):
+                                new_values.extend(value)
+                            else:
+                                new_values.append(value)
+                        else:
+                            new_values.append(value)
+                    old_value[:] = new_values
+                elif isinstance(old_value, ast.AST):
+                    new_node = self.visit(old_value)
+                    setattr(node, field_name, new_node)
+            return node
+
+    return _Strip().visit(tree)
+
+
+def _collect_stage_callables(
+    pipeline_type: type[Any],
+) -> list[tuple[str, Any, Path]]:
+    stages = pipeline_type.stages()
+    collected: list[tuple[str, Any, Path]] = []
+    for name, spec in stages.items():
+        path = _definition_file(spec.func, f"stage {name}")
+        collected.append((name, spec.func, path))
+    return collected
+
+
 @dataclass
 class SourceFingerprintSession:
-    _cache: dict[tuple[Any, ...], SourceFingerprint] = field(default_factory=dict)
+    _cache: dict[tuple[Any, ...], SourceObservation] = field(default_factory=dict)
     force_rehash: bool = False
+    _module_cache: dict[Path, tuple[Any, Any, str]] = field(default_factory=dict)
+    _pipeline_callables: dict[type[Any], list[tuple[str, Any, Path]]] = field(default_factory=dict)
 
-    def fingerprint(
+    def observe(
         self,
         pipeline_type: type[Any],
         stage_spec: Any,
         *,
-        cached: tuple[SourceFingerprint, ...] = (),
-    ) -> SourceFingerprint:
-        roots = _source_roots(pipeline_type, stage_spec)
+        cached: tuple[SourceObservation | SourceFingerprint, ...] = (),
+    ) -> SourceObservation:
+        depends = merge_dependencies(pipeline_type.depends, stage_spec.depends)
+        pipeline_file = _definition_file(pipeline_type, f"pipeline {pipeline_type.__name__}")
+        stage_file = _definition_file(stage_spec.func, f"stage {stage_spec.name}")
+        declaration_base = pipeline_file.parent
+        rerun_roots, review_roots = _declared_roots(depends, declaration_base)
         key = (
             pipeline_type,
             id(stage_spec.func),
-            tuple((label, str(root)) for label, root in roots),
+            tuple(str(path) for path in sorted(rerun_roots, key=str)),
+            tuple(str(path) for path in sorted(review_roots, key=str)),
         )
         observed = self._cache.get(key)
         if observed is not None:
             return observed
+
         cached_entries: dict[str, SourceManifestEntry] = {}
-        for fingerprint in cached:
-            for entry in fingerprint.files:
-                cached_entries.setdefault(entry.path, entry)
-        entries: dict[str, SourceManifestEntry] = {}
-        for label, root in roots:
+        for item in cached:
+            if isinstance(item, SourceObservation):
+                for entry in (*item.rerun.files, *item.review.files):
+                    cached_entries.setdefault(entry.path, entry)
+            else:
+                for entry in item.files:
+                    cached_entries.setdefault(entry.path, entry)
+
+        stage_callables = self._pipeline_callables.get(pipeline_type)
+        if stage_callables is None:
+            stage_callables = _collect_stage_callables(pipeline_type)
+            self._pipeline_callables[pipeline_type] = stage_callables
+
+        residual_files = [pipeline_file]
+        if stage_file != pipeline_file:
+            residual_files.append(stage_file)
+        residual_cache_hits = True
+        residual_labels = {
+            path: f"residual:{_display_path(path, declaration_base)}" for path in residual_files
+        }
+        for residual_path, label in residual_labels.items():
+            cached_entry = cached_entries.get(label)
+            if cached_entry is None or self.force_rehash:
+                residual_cache_hits = False
+                break
+            try:
+                after = residual_path.stat()
+            except OSError:
+                residual_cache_hits = False
+                break
+            if not (
+                cached_entry.path == label
+                and cached_entry.cache_path == str(residual_path.resolve())
+                and cached_entry.inode == after.st_ino
+                and cached_entry.size == after.st_size
+                and cached_entry.mtime_ns == after.st_mtime_ns
+                and cached_entry.algorithm == "ast-sha256"
+            ):
+                residual_cache_hits = False
+                break
+
+        rerun_entries: dict[str, SourceManifestEntry] = {}
+        review_entries: dict[str, SourceManifestEntry] = {}
+        rerun_file_paths: set[str] = set()
+
+        callable_label = f"callable:{stage_spec.name}"
+        callable_entry = _callable_component(
+            callable_label,
+            stage_file,
+            stage_spec.func,
+            f"stage {stage_spec.name}",
+            cached_entries.get(callable_label),
+            force_rehash=self.force_rehash,
+        )
+        rerun_entries[callable_label] = callable_entry
+
+        if residual_cache_hits:
+            for residual_path, label in residual_labels.items():
+                review_entries[label] = cached_entries[label]
+        else:
+            trees_by_file: dict[Path, tuple[ast.AST, Any]] = {}
+            callables_by_file: dict[Path, list[tuple[str, Any]]] = {}
+            for name, func, path in stage_callables:
+                trees_by_file[path] = self._module_tree(path)
+                callables_by_file.setdefault(path, []).append((name, func))
+            for residual_path, label in residual_labels.items():
+                tree, after = trees_by_file.get(residual_path) or self._module_tree(residual_path)
+                working = copy.deepcopy(tree)
+                nodes = {
+                    _locate_callable_node(working, func, f"stage {name}")
+                    for name, func in callables_by_file.get(residual_path, ())
+                }
+                residual = _remove_nodes(working, nodes)
+                review_entries[label] = _source_entry_from_tree(
+                    label, residual_path, residual, after
+                )
+
+        for root, label in sorted(rerun_roots.items(), key=lambda item: item[1]):
             for relative, member in _collect_python_files(root):
                 member_label = f"{label}/{relative}"
-                entries[member_label] = _source_entry(
+                entry = _source_entry(
                     member_label,
                     member,
                     cached_entries.get(member_label),
                     force_rehash=self.force_rehash,
                 )
-        files = [entries[name] for name in sorted(entries)]
-        result = SourceFingerprint(
-            fingerprint=json_sha256(
-                [{"path": entry.path, "digest": entry.digest} for entry in files]
-            ),
-            files=files,
+                rerun_entries[member_label] = entry
+                rerun_file_paths.add(str(member.resolve()))
+
+        for root, label in sorted(review_roots.items(), key=lambda item: item[1]):
+            for relative, member in _collect_python_files(root):
+                resolved = str(member.resolve())
+                if resolved in rerun_file_paths:
+                    continue
+                member_label = f"{label}/{relative}"
+                entry = _source_entry(
+                    member_label,
+                    member,
+                    cached_entries.get(member_label),
+                    force_rehash=self.force_rehash,
+                )
+                review_entries[member_label] = entry
+
+        result = SourceObservation(
+            rerun=_fingerprint_entries(rerun_entries.values()),
+            review=_fingerprint_entries(review_entries.values()),
         )
         self._cache[key] = result
         return result
+
+    def _module_tree(self, path: Path) -> tuple[ast.AST, Any]:
+        cache_path = str(path.resolve())
+        for attempt in range(3):
+            before = path.stat()
+            cached = self._module_cache.get(path)
+            if (
+                cached is not None
+                and not self.force_rehash
+                and cached[2] == cache_path
+                and cached[1].st_ino == before.st_ino
+                and cached[1].st_size == before.st_size
+                and cached[1].st_mtime_ns == before.st_mtime_ns
+            ):
+                return cached[0], cached[1]
+            tree, after = _read_module_ast(path)
+            before_token = (before.st_ino, before.st_size, before.st_mtime_ns)
+            after_token = (after.st_ino, after.st_size, after.st_mtime_ns)
+            if before_token == after_token:
+                self._module_cache[path] = (tree, after, cache_path)
+                return tree, after
+            if attempt == 2:
+                raise ValueError(f"Python source file changed while fingerprinting: {path}")
+        raise AssertionError("unreachable")

@@ -40,6 +40,7 @@ class Dependencies:
     )
     values: Mapping[str, Callable[[DependencyContext], JSON]] = field(default_factory=dict)
     sources: Sequence[Path] = field(default_factory=tuple)
+    review_sources: Sequence[Path] = field(default_factory=tuple)
 
 
 def merge_dependencies(base: Dependencies, stage: Dependencies) -> Dependencies:
@@ -52,8 +53,10 @@ def merge_dependencies(base: Dependencies, stage: Dependencies) -> Dependencies:
     if details := [f"{kind} {sorted(names)!r}" for kind, names in duplicates.items() if names]:
         raise ValueError("Duplicate pipeline and stage dependencies: " + ", ".join(details))
     sources = tuple(dict.fromkeys((*base.sources, *stage.sources)))
+    review_sources = tuple(dict.fromkeys((*base.review_sources, *stage.review_sources)))
     return Dependencies(
         inputs={**base.inputs, **stage.inputs},
         values={**base.values, **stage.values},
         sources=sources,
+        review_sources=review_sources,
     )

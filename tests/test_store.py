@@ -12,13 +12,25 @@ from varve.models import (
     KeyComponents,
     OutputHandle,
     SourceFingerprint,
+    SourceObservation,
     SuccessRecord,
 )
 from varve.store.store import CorruptStore, Store
 
 
 def _components() -> KeyComponents:
-    return KeyComponents(config={}, inputs={}, values={}, upstreams={})
+    return KeyComponents(
+        config={},
+        inputs={},
+        values={},
+        upstreams={},
+        rerun_source_fingerprint="source",
+    )
+
+
+def _source() -> SourceObservation:
+    fingerprint = SourceFingerprint(fingerprint="source", files=[])
+    return SourceObservation(rerun=fingerprint, review=fingerprint)
 
 
 def _artifact(path: str) -> ArtifactFingerprint:
@@ -36,13 +48,13 @@ def test_store_initializes_gitignore_and_manifest(tmp_path: Path) -> None:
     assert (tmp_path / ".varve" / ".gitignore").read_text(encoding="utf-8") == "*\n"
     manifest = store.read_manifest()
     assert manifest is not None
-    assert manifest.schema_version == 5
+    assert manifest.schema_version == 6
     assert manifest.pipeline == "Demo"
     assert manifest.module == "pkg.demo"
     assert manifest.temporary_config == {"token": "x"}
     assert manifest.temporary_axes == {"bench": ["a", "b"]}
     manifest_data = json.loads((store.root / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest_data["schema_version"] == 5
+    assert manifest_data["schema_version"] == 6
     assert manifest_data["temporary_axes"] == {"bench": ["a", "b"]}
     with pytest.raises(ValueError, match="belongs to Demo"):
         store.ensure_initialized("Other")
@@ -69,7 +81,7 @@ def test_success_round_trip_and_tmp_does_not_pollute(tmp_path: Path) -> None:
         kind="batch",
         input_key="sha256:a",
         key_components=_components(),
-        executed_source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
+        executed_source=_source(),
         artifact_fingerprint="artifacts",
         outputs=[OutputHandle(index=0, path="part-0.txt", artifact=_artifact("part-0.txt"))],
         committed_at="now",
@@ -78,10 +90,10 @@ def test_success_round_trip_and_tmp_does_not_pollute(tmp_path: Path) -> None:
     (tmp_path / ".varve" / "stages" / "transform.json.tmp").write_text("{bad", encoding="utf-8")
     assert store.read_success("transform") == record
     record_data = json.loads((store.root / "stages" / "transform.json").read_text(encoding="utf-8"))
-    assert record_data["schema_version"] == 5
+    assert record_data["schema_version"] == 6
 
 
-@pytest.mark.parametrize("schema_version", [2, 3, 4])
+@pytest.mark.parametrize("schema_version", [2, 3, 4, 5])
 def test_store_rebuilds_older_schema_on_initialization(
     tmp_path: Path,
     schema_version: int,
@@ -102,12 +114,37 @@ def test_store_rebuilds_older_schema_on_initialization(
     old_attempt = store.root / "attempts" / "sample.json"
     old_attempt.parent.mkdir()
     old_attempt.write_text('{"content_key": "old"}', encoding="utf-8")
+    old_success = store.root / "stages" / "sample.json"
+    old_success.parent.mkdir()
+    old_success.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "pipeline": "Demo",
+                "stage": "sample",
+                "kind": "single",
+                "input_key": "old",
+                "key_components": {
+                    "config": {},
+                    "inputs": {},
+                    "values": {},
+                    "upstreams": {},
+                },
+                "executed_source_fingerprint": {"fingerprint": "old", "files": []},
+                "artifact_fingerprint": "old",
+                "produces": [],
+                "committed_at": "old",
+            }
+        ),
+        encoding="utf-8",
+    )
     assert store.read_manifest() is not None
     store.ensure_initialized("Demo", module="pkg.demo")
     manifest = store.read_manifest()
     assert manifest is not None
-    assert manifest.schema_version == 5
+    assert manifest.schema_version == 6
     assert not old_attempt.exists()
+    assert store.read_success("sample") is None
 
 
 def test_attempt_and_partial_round_trip(tmp_path: Path) -> None:
@@ -115,7 +152,8 @@ def test_attempt_and_partial_round_trip(tmp_path: Path) -> None:
     store.ensure_initialized("Demo")
     marker = AttemptMarker(
         input_key="sha256:a",
-        source_fingerprint="source",
+        rerun_source_fingerprint="rerun",
+        review_source_fingerprint="review",
         started_at="now",
         touched_existing=False,
     )

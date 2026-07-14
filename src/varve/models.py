@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class VarveModel(BaseModel):
@@ -61,6 +61,11 @@ class SourceFingerprint(VarveModel):
     files: list[SourceManifestEntry]
 
 
+class SourceObservation(VarveModel):
+    rerun: SourceFingerprint
+    review: SourceFingerprint
+
+
 class KeyComponents(VarveModel):
     config: dict[str, Any]
     inputs: dict[str, list[FileFingerprint]]
@@ -71,6 +76,7 @@ class KeyComponents(VarveModel):
     # so unread config fields never enter the input key. Older records without
     # this field default to None and rerun once, then self-heal.
     config_access: list[str] | None = None
+    rerun_source_fingerprint: str = ""
 
 
 class OutputHandle(VarveModel):
@@ -92,7 +98,7 @@ class SuccessRecord(VarveModel):
     kind: Literal["single", "batch"]
     input_key: str
     key_components: KeyComponents
-    executed_source_fingerprint: SourceFingerprint
+    executed_source: SourceObservation
     artifact_fingerprint: str
     outputs: list[OutputHandle] | None = None
     produces: list[ProducedPath] | None = None
@@ -127,15 +133,16 @@ class BatchRecord(VarveModel):
 
 class AttemptMarker(VarveModel):
     input_key: str
-    source_fingerprint: str
+    rerun_source_fingerprint: str
+    review_source_fingerprint: str
     started_at: str
     touched_existing: bool
 
 
 class ReviewRecord(VarveModel):
-    source_fingerprint: str
-    source_observation: SourceFingerprint
-    decision: Literal["accept", "reject"]
+    review_fingerprint: str
+    review_observation: SourceFingerprint
+    decision: Literal["reuse", "invalidate"]
     decided_at: str
 
 
@@ -143,7 +150,8 @@ class FailureRecord(VarveModel):
     pipeline: str
     stage: str
     input_key: str
-    source_fingerprint: str
+    rerun_source_fingerprint: str
+    review_source_fingerprint: str
     exception_type: str
     message: str
     failed_at: str

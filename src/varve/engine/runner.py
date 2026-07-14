@@ -21,7 +21,6 @@ from varve.engine.review import (
     ReviewCandidate,
     SourceReviewResult,
     apply_review_writes,
-    plan_review_writes,
     plan_source_review,
 )
 from varve.engine.run_display import (
@@ -60,6 +59,7 @@ from varve.models import (
     ProducedPath,
     ReviewRecord,
     SourceFingerprint,
+    SourceObservation,
     SuccessRecord,
 )
 from varve.pipeline import Pipeline
@@ -74,7 +74,7 @@ class StageProbe:
     decision_key: str | None
     components: KeyComponents | None
     previous: SuccessRecord | None
-    source_fingerprint: SourceFingerprint
+    source_observation: SourceObservation
     source_review: SourceReviewState
     failure: FailureRecord | None = None
     unavailable_reason: str | None = None
@@ -124,7 +124,13 @@ class _KeyingSession:
     def discard_success(self, store: Store, stage: str) -> None:
         self.records.pop((store.root, stage), None)
 
-    def read_review(self, store: Store, stage: str) -> ReviewRecord | None:
+    def review_stage_name(self, stage_spec) -> str:
+        return stage_spec.base_name or stage_spec.name
+
+    def read_review(self, store: Store, stage_spec) -> ReviewRecord | None:
+        stage = (
+            self.review_stage_name(stage_spec) if not isinstance(stage_spec, str) else stage_spec
+        )
         key = (store.root, stage)
         cached = self.reviews.get(key, _RECORD_UNOBSERVED)
         if cached is _RECORD_UNOBSERVED:
@@ -133,20 +139,20 @@ class _KeyingSession:
             return record
         return None if cached is _RECORD_MISSING else cached  # type: ignore[return-value]
 
-    def source_fingerprint(
+    def source_observation(
         self,
         pipeline_type: type[Pipeline],
         stage_spec,
         store: Store,
-    ) -> SourceFingerprint:
-        cached: list[SourceFingerprint] = []
-        review = self.read_review(store, stage_spec.name)
+    ) -> SourceObservation:
+        cached: list[SourceObservation | SourceFingerprint] = []
+        review = self.read_review(store, stage_spec)
         if review is not None:
-            cached.append(review.source_observation)
+            cached.append(review.review_observation)
         previous = self.read_success(store, stage_spec.name)
         if previous is not None:
-            cached.append(previous.executed_source_fingerprint)
-        return self.sources.fingerprint(
+            cached.append(previous.executed_source)
+        return self.sources.observe(
             pipeline_type,
             stage_spec,
             cached=tuple(cached),
@@ -195,7 +201,7 @@ class ReviewRequiredError(Exception):
     def __init__(self, stages: list[str]) -> None:
         self.stages = stages
         super().__init__(
-            "Source review required for: " + ", ".join(stages) + ". Run accept or reject first."
+            "Source review required for: " + ", ".join(stages) + ". Run reuse or invalidate first."
         )
 
 
@@ -217,7 +223,8 @@ def _record_stage_failure(
             pipeline=runtime.pipeline.__name__,
             stage=stage_name,
             input_key=attempt.input_key,
-            source_fingerprint=attempt.source_fingerprint,
+            rerun_source_fingerprint=attempt.rerun_source_fingerprint,
+            review_source_fingerprint=attempt.review_source_fingerprint,
             exception_type=type(error).__name__,
             message=str(error),
             failed_at=_now(),
@@ -374,20 +381,63 @@ def _current_artifacts(
     return artifacts_root_fingerprint(current, positions=positions)
 
 
+def _review_baseline(
+    runtime: _Runtime,
+    stage_spec,
+    previous: SuccessRecord | None,
+    current: SourceObservation,
+    *,
+    current_key: str | None = None,
+    partial: dict[int, BatchRecord] | None = None,
+) -> tuple[str | None, SourceReviewState]:
+    """Return (baseline_kind, source_review) using current-key partial first."""
+
+    attempt = runtime.store.read_attempt(stage_spec.name)
+    failure = runtime.store.read_failure(stage_spec.name)
+    if partial and current_key is not None:
+        provenance = attempt if attempt is not None and attempt.input_key == current_key else None
+        if provenance is None and failure is not None and failure.input_key == current_key:
+            provenance_review = failure.review_source_fingerprint
+        elif provenance is not None:
+            provenance_review = provenance.review_source_fingerprint
+        else:
+            provenance_review = None
+        if provenance_review is not None:
+            if provenance_review == current.review.fingerprint:
+                return "partial", SourceReviewState("current")
+            review = runtime.keying.read_review(runtime.store, stage_spec)
+            if review is None or review.review_fingerprint != current.review.fingerprint:
+                return "partial", SourceReviewState("changed")
+            return "partial", SourceReviewState("changed", review.decision)
+    if previous is None:
+        return None, SourceReviewState("not-applicable")
+    if previous.executed_source.review.fingerprint == current.review.fingerprint:
+        return "success", SourceReviewState("current")
+    # Only open Review when the old materialization would otherwise remain reusable.
+    review = runtime.keying.read_review(runtime.store, stage_spec)
+    if review is None or review.review_fingerprint != current.review.fingerprint:
+        return "success", SourceReviewState("changed")
+    return "success", SourceReviewState("changed", review.decision)
+
+
 def _source_review(
     runtime: _Runtime,
-    stage_name: str,
+    stage_spec,
     previous: SuccessRecord | None,
-    current: SourceFingerprint,
+    current: SourceObservation,
+    *,
+    current_key: str | None = None,
+    partial: dict[int, BatchRecord] | None = None,
 ) -> SourceReviewState:
-    if previous is None:
-        return SourceReviewState("not-applicable")
-    if previous.executed_source_fingerprint.fingerprint == current.fingerprint:
-        return SourceReviewState("current")
-    review = runtime.keying.read_review(runtime.store, stage_name)
-    if review is None or review.source_fingerprint != current.fingerprint:
-        return SourceReviewState("changed")
-    return SourceReviewState("changed", review.decision)
+    _, state = _review_baseline(
+        runtime,
+        stage_spec,
+        previous,
+        current,
+        current_key=current_key,
+        partial=partial,
+    )
+    return state
 
 
 def selected_stages(
@@ -453,7 +503,7 @@ def _validated_partial(
 
 def _merge_config_access(
     previous: SuccessRecord | None,
-    source: SourceFingerprint,
+    source: SourceObservation,
     recorded: list[str] | None,
 ) -> list[str] | None:
     """Combine a run's recorded config access with the previous record's.
@@ -472,7 +522,10 @@ def _merge_config_access(
     prev_access = previous.key_components.config_access
     if prev_access is None:
         return None
-    if previous.executed_source_fingerprint.fingerprint != source.fingerprint:
+    if (
+        previous.executed_source.rerun.fingerprint != source.rerun.fingerprint
+        or previous.executed_source.review.fingerprint != source.review.fingerprint
+    ):
         return recorded
     return sorted(set(prev_access) | set(recorded))
 
@@ -519,11 +572,16 @@ def _decision_for_key(
     )
 
 
+def _empty_source_observation() -> SourceObservation:
+    empty = SourceFingerprint(fingerprint="error", files=[])
+    return SourceObservation(rerun=empty, review=empty)
+
+
 def _unavailable_probe(
     stage: str,
     decision: Decision,
     unavailable_reason: str,
-    source: SourceFingerprint,
+    source: SourceObservation,
     *,
     previous: SuccessRecord | None = None,
     review: SourceReviewState = SourceReviewState("not-applicable"),
@@ -535,29 +593,79 @@ def _unavailable_probe(
         decision_key=None,
         components=None,
         previous=previous,
-        source_fingerprint=source,
+        source_observation=source,
         source_review=review,
         failure=failure,
         unavailable_reason=unavailable_reason,
     )
 
 
+def _resolve_source_review(
+    runtime: _Runtime,
+    stage_spec,
+    *,
+    previous: SuccessRecord | None,
+    source_observation: SourceObservation,
+    decision_key: str,
+    decision: Decision,
+    partial: dict[int, BatchRecord] | None,
+    artifacts_match: bool,
+) -> SourceReviewState:
+    """Apply current-key partial first, then success baseline for reusable hits only."""
+
+    attempt = runtime.store.read_attempt(stage_spec.name)
+    failure = runtime.store.read_failure(stage_spec.name)
+    if partial:
+        provenance_review: str | None = None
+        if attempt is not None and attempt.input_key == decision_key:
+            provenance_review = attempt.review_source_fingerprint
+        elif failure is not None and failure.input_key == decision_key:
+            provenance_review = failure.review_source_fingerprint
+        if provenance_review is not None:
+            if provenance_review == source_observation.review.fingerprint:
+                return SourceReviewState("current")
+            review = runtime.keying.read_review(runtime.store, stage_spec)
+            if review is None or review.review_fingerprint != source_observation.review.fingerprint:
+                return SourceReviewState("changed")
+            return SourceReviewState("changed", review.decision)
+
+    if previous is None:
+        return SourceReviewState("not-applicable")
+    if previous.executed_source.review.fingerprint == source_observation.review.fingerprint:
+        return SourceReviewState("current")
+    otherwise_reusable = (
+        previous.input_key == decision_key
+        and artifacts_match
+        and decision.status in {"hit", "failed", "resume"}
+    )
+    if not otherwise_reusable:
+        return SourceReviewState("not-applicable")
+    review = runtime.keying.read_review(runtime.store, stage_spec)
+    if review is None or review.review_fingerprint != source_observation.review.fingerprint:
+        return SourceReviewState("changed")
+    return SourceReviewState("changed", review.decision)
+
+
 def _stage_decision(
     runtime: _Runtime,
     stage_spec,
     *,
-    source_fingerprint: SourceFingerprint,
+    source_observation: SourceObservation,
     known_upstream_fingerprints: dict[str, str] | None = None,
     source_review: SourceReviewState | None = None,
     config_access: list[str] | None | object = _INFER_CONFIG_ACCESS,
 ) -> StageProbe:
     previous = runtime.keying.read_success(runtime.store, stage_spec.name)
-    review = source_review or _source_review(runtime, stage_spec.name, previous, source_fingerprint)
+    inferred_config_access = config_access is _INFER_CONFIG_ACCESS
     if config_access is _INFER_CONFIG_ACCESS:
+        provisional_review = source_review or SourceReviewState("not-applicable")
         config_access = (
             previous.key_components.config_access
             if previous is not None
-            and not (review.relationship == "changed" and review.decision == "reject")
+            and not (
+                provisional_review.relationship == "changed"
+                and provisional_review.decision == "invalidate"
+            )
             else None
         )
     ctx = runtime.context(stage_spec)
@@ -569,6 +677,7 @@ def _stage_decision(
         config_access=config_access,  # type: ignore[arg-type]
         dependencies=merge_dependencies(runtime.pipeline.depends, stage_spec.depends),
         fingerprint_session=runtime.keying.fingerprints,
+        rerun_source_fingerprint=source_observation.rerun.fingerprint,
     )
     decision_key = input_key(components)
     artifacts_match = True
@@ -583,13 +692,61 @@ def _stage_decision(
         previous,
         artifacts_match,
     )
+    if (
+        inferred_config_access
+        and stage_spec.kind == "batch"
+        and config_access is not None
+        and partial is None
+    ):
+        attempt = runtime.store.read_attempt(stage_spec.name)
+        provenance = attempt or failure
+        if provenance is not None and provenance.input_key != decision_key:
+            full_config_probe = _stage_decision(
+                runtime,
+                stage_spec,
+                source_observation=source_observation,
+                known_upstream_fingerprints=known_upstream_fingerprints,
+                config_access=None,
+            )
+            if (
+                full_config_probe.decision_key == provenance.input_key
+                and full_config_probe._partial is not None
+            ):
+                return full_config_probe
+    review = source_review or _resolve_source_review(
+        runtime,
+        stage_spec,
+        previous=previous,
+        source_observation=source_observation,
+        decision_key=decision_key,
+        decision=decision,
+        partial=partial,
+        artifacts_match=artifacts_match,
+    )
+    if (
+        config_access is not None
+        and previous is not None
+        and source_review is None
+        and review.relationship == "changed"
+        and review.decision == "invalidate"
+        and previous.key_components.config_access is not None
+    ):
+        # Invalidated review should not reuse the previous projected access set.
+        return _stage_decision(
+            runtime,
+            stage_spec,
+            source_observation=source_observation,
+            known_upstream_fingerprints=known_upstream_fingerprints,
+            source_review=review,
+            config_access=None,
+        )
     return StageProbe(
         stage=stage_spec.name,
         decision=decision,
         decision_key=decision_key,
         components=components,
         previous=previous,
-        source_fingerprint=source_fingerprint,
+        source_observation=source_observation,
         source_review=review,
         failure=failure,
         _partial=partial,
@@ -602,14 +759,14 @@ def _probe_stage(
     stage_name: str,
     *,
     known_upstream_fingerprints: dict[str, str],
-    source_fingerprint: SourceFingerprint,
+    source_observation: SourceObservation,
 ) -> StageProbe:
     stage_spec = runtime.graph.stages[stage_name]
     probe = _stage_decision(
         runtime,
         stage_spec,
         known_upstream_fingerprints=known_upstream_fingerprints,
-        source_fingerprint=source_fingerprint,
+        source_observation=source_observation,
     )
     attempt = runtime.store.read_attempt(stage_name)
     if (
@@ -658,14 +815,14 @@ def probe_pipeline(
     for stage_name in topo_order:
         stage_spec = graph.stages[stage_name]
         try:
-            source_fingerprint = keying_session.source_fingerprint(pipeline_type, stage_spec, store)
+            source_observation = keying_session.source_observation(pipeline_type, stage_spec, store)
         except Exception as error:  # noqa: BLE001 - status must retain evaluation errors.
             probes.append(
                 _unavailable_probe(
                     stage_name,
                     Decision("error", str(error)),
                     str(error),
-                    SourceFingerprint(fingerprint="error", files=[]),
+                    _empty_source_observation(),
                     previous=keying_session.read_success(store, stage_name),
                 )
             )
@@ -677,7 +834,7 @@ def probe_pipeline(
                     stage_name,
                     Decision("needs-run", "schema-migration"),
                     f"store schema {manifest.schema_version} must be rebuilt as schema {SCHEMA_VERSION}",
-                    source_fingerprint,
+                    source_observation,
                 )
             )
             continue
@@ -692,29 +849,28 @@ def probe_pipeline(
                     stage_name,
                     Decision("needs-run", "no-cache"),
                     f"upstream {missing_upstream} has no success record",
-                    source_fingerprint,
+                    source_observation,
                     previous=previous,
-                    review=_source_review(runtime, stage_name, previous, source_fingerprint),
+                    review=_source_review(runtime, stage_spec, previous, source_observation),
                 )
             )
             continue
         previous = keying_session.read_success(store, stage_name)
-        review = _source_review(runtime, stage_name, previous, source_fingerprint)
         try:
             probe = _probe_stage(
                 runtime,
                 stage_name,
                 known_upstream_fingerprints=known_upstream_fingerprints,
-                source_fingerprint=source_fingerprint,
+                source_observation=source_observation,
             )
         except Exception as error:  # noqa: BLE001 - status must retain evaluation errors.
             probe = _unavailable_probe(
                 stage_name,
                 Decision("error", str(error)),
                 str(error),
-                source_fingerprint,
+                source_observation,
                 previous=previous,
-                review=review,
+                review=_source_review(runtime, stage_spec, previous, source_observation),
                 failure=store.read_failure(stage_name),
             )
         probes.append(probe)
@@ -792,14 +948,22 @@ async def _drive(
     )
     preflight_by_stage = {probe.stage: probe for probe in preflight}
     external = preflight_names.difference(selected)
-    pending = [
-        probe.stage
-        for probe in preflight
-        if probe.source_review.relationship == "changed" and probe.source_review.decision == "none"
-        if not force or probe.stage in external
-    ]
-    if pending:
-        raise ReviewRequiredError(pending)
+    pending_bases: list[str] = []
+    seen_pending: set[str] = set()
+    for probe in preflight:
+        if not (
+            probe.source_review.relationship == "changed" and probe.source_review.decision == "none"
+        ):
+            continue
+        if force and probe.stage not in external:
+            continue
+        base = graph.stages[probe.stage].base_name or probe.stage
+        if base in seen_pending:
+            continue
+        seen_pending.add(base)
+        pending_bases.append(base)
+    if pending_bases:
+        raise ReviewRequiredError(pending_bases)
     errors = [probe for probe in preflight if probe.decision.status == "error"]
     if errors:
         details = "; ".join(f"{probe.stage}: {probe.decision.reason}" for probe in errors)
@@ -815,20 +979,9 @@ async def _drive(
             f"{probe.stage}: {status}: {reason}" for probe, status, reason in unavailable_external
         )
         raise ValueError(f"Upstream stage is not current: {details}")
-    if force:
-        candidates = tuple(
-            ReviewCandidate(
-                stage=probe.stage,
-                source_fingerprint=probe.source_fingerprint,
-                source_review=probe.source_review,
-            )
-            for probe in preflight
-            if probe.stage in selected
-        )
-        apply_review_writes(store, plan_review_writes(candidates, "reject"), _now())
     execution_source_reviews = {
         probe.stage: (
-            SourceReviewState("changed", "reject")
+            SourceReviewState("changed", "invalidate")
             if force and probe.source_review.relationship == "changed"
             else probe.source_review
         )
@@ -844,12 +997,12 @@ async def _drive(
             continue
         stage_spec = graph.stages[stage_name]
         reporter.start(stage_name)
-        source_fingerprint = preflight_by_stage[stage_name].source_fingerprint
+        source_observation = preflight_by_stage[stage_name].source_observation
         review = execution_source_reviews[stage_name]
         probe = _stage_decision(
             runtime,
             stage_spec,
-            source_fingerprint=source_fingerprint,
+            source_observation=source_observation,
             source_review=review,
         )
         previous = probe.previous
@@ -867,14 +1020,14 @@ async def _drive(
             and previous_access is not None
             and (decision.status != "hit" or force)
         ):
-            # An accepted source change may continue using the old access set
+            # A reused source change may continue using the old access set
             # while probing a reusable materialization. Once this run will
             # actually execute, use the whole Config as the conservative input
             # basis and let the execution record a new access set.
             probe = _stage_decision(
                 runtime,
                 stage_spec,
-                source_fingerprint=source_fingerprint,
+                source_observation=source_observation,
                 source_review=review,
                 config_access=None,
             )
@@ -884,7 +1037,7 @@ async def _drive(
             if stage_spec.kind == "batch":
                 if (
                     review.relationship == "changed"
-                    and review.decision == "accept"
+                    and review.decision == "reuse"
                     and probe_key != current_key
                     and probe_partial
                 ):
@@ -920,7 +1073,7 @@ async def _drive(
                 else Decision("needs-run", "retry-failed")
             )
 
-        if review.relationship == "changed" and review.decision == "reject":
+        if review.relationship == "changed" and review.decision == "invalidate":
             decision = Decision("needs-run", "source-changed")
         if force:
             decision = Decision("needs-run", "forced")
@@ -949,7 +1102,7 @@ async def _drive(
                 store.write_batch(stage_name, new_key, batch)
             store.clear_partial(stage_name, old_key)
         if stage_spec.kind == "batch":
-            if force or (review.relationship == "changed" and review.decision == "reject"):
+            if force or (review.relationship == "changed" and review.decision == "invalidate"):
                 store.clear_partial(stage_name)
             elif not decision.resume_skip:
                 store.clear_partial(stage_name, current_key)
@@ -960,7 +1113,8 @@ async def _drive(
             stage_name,
             AttemptMarker(
                 input_key=current_key,
-                source_fingerprint=source_fingerprint.fingerprint,
+                rerun_source_fingerprint=source_observation.rerun.fingerprint,
+                review_source_fingerprint=source_observation.review.fingerprint,
                 started_at=_now(),
                 touched_existing=previous is not None,
             ),
@@ -1063,11 +1217,27 @@ async def _drive(
                 ],
             )
         elapsed = time.monotonic() - started
-        committed_access = _merge_config_access(previous, source_fingerprint, access.resolve())
+        resumed_without_access_baseline = (
+            stage_spec.kind == "batch"
+            and bool(decision.resume_skip)
+            and (
+                previous is None
+                or previous.executed_source.rerun.fingerprint
+                != source_observation.rerun.fingerprint
+                or previous.executed_source.review.fingerprint
+                != source_observation.review.fingerprint
+            )
+        )
+        committed_access = (
+            None
+            if resumed_without_access_baseline
+            else _merge_config_access(previous, source_observation, access.resolve())
+        )
         commit_components = components.model_copy(
             update={
                 "config": project_config(config_data(runtime.config), committed_access),
                 "config_access": committed_access,
+                "rerun_source_fingerprint": source_observation.rerun.fingerprint,
             }
         )
         keying_session.write_success(
@@ -1078,7 +1248,7 @@ async def _drive(
                 kind=stage_spec.kind,
                 input_key=input_key(commit_components),
                 key_components=commit_components,
-                executed_source_fingerprint=source_fingerprint,
+                executed_source=source_observation,
                 artifact_fingerprint=artifact_root,
                 produces=produces,
                 outputs=outputs,
@@ -1088,7 +1258,6 @@ async def _drive(
         )
         store.clear_attempt(stage_name)
         store.clear_failure(stage_name)
-        store.clear_review(stage_name)
         store.clear_partial(stage_name)
         keying_session.refresh_fingerprints()
         reporter.lifecycle(stage_name, "done", f"{elapsed:.2f}s")
@@ -1183,14 +1352,15 @@ def record_source_review(
     graph: PipelineGraph | None = None,
     _keying_session: _KeyingSession | None = None,
 ) -> SourceReviewResult:
-    """Atomically validate and record accept/reject decisions for source changes."""
+    """Atomically validate and record Stage-level reuse/invalidate decisions."""
 
-    if decision not in {"accept", "reject"}:
+    if decision not in {"reuse", "invalidate"}:
         raise ValueError(f"Unknown source review decision: {decision}")
     args = args if args is not None else pipeline.Args()
     graph = graph or build_graph(pipeline, axes)
     out = pipeline.output_root(config, cli_out=cli_out, branch=branch, is_temporary=is_temporary)
     store = Store(out)
+    keying = _keying_session or _KeyingSession()
     with OutputLock(store.root):
         probes = probe_pipeline(
             pipeline,
@@ -1198,22 +1368,32 @@ def record_source_review(
             args=args,
             out=out,
             graph=graph,
-            _keying_session=_keying_session,
+            _keying_session=keying,
         )
-        resolved_selectors = tuple(graph.resolve_selector(target) for target in targets)
+        errors = [probe for probe in probes if probe.decision.status == "error"]
+        if errors:
+            details = "; ".join(f"{probe.stage}: {probe.decision.reason}" for probe in errors)
+            raise ValueError(f"Cannot evaluate source review: {details}")
         candidates = tuple(
             ReviewCandidate(
                 stage=probe.stage,
-                source_fingerprint=probe.source_fingerprint,
+                base_stage=graph.stages[probe.stage].base_name or probe.stage,
+                review_observation=probe.source_observation.review,
                 source_review=probe.source_review,
             )
             for probe in probes
         )
+        existing = {
+            base: record
+            for base in graph.base_cells
+            if (record := keying.read_review(store, base)) is not None
+        }
         writes, result = plan_source_review(
             graph,
-            resolved_selectors,
+            targets,
             candidates,
             decision,
+            existing=existing,
         )
         apply_review_writes(store, writes, _now())
         return result

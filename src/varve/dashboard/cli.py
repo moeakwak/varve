@@ -22,7 +22,7 @@ from varve.dashboard.state import import_entry_pipeline, resolve_entry_context, 
 from varve.log import configure_cli_logging
 from varve.pipeline import Pipeline
 
-_DYNAMIC_COMMANDS = {"run", "status", "clean", "accept", "reject"}
+_DYNAMIC_COMMANDS = {"run", "status", "clean", "reuse", "invalidate"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -57,13 +57,13 @@ def main(argv: list[str] | None = None) -> int:
             parser = _parser()
             parser.parse_args(raw_argv)
             raise AssertionError("argparse did not exit after help")
-        if target == "--all" and first.command in {"run", "accept", "reject"}:
+        if target == "--all" and first.command in {"run", "reuse", "invalidate"}:
             scope = _dynamic_scope(first.command, raw_argv[1:])
         else:
             if target is None or target.startswith("-"):
                 _missing_target_error(first.command)
             module = target
-            if first.command in {"run", "accept", "reject"} and "--all" in raw_argv[2:]:
+            if first.command in {"run", "reuse", "invalidate"} and "--all" in raw_argv[2:]:
                 parser = _parser()
                 parser.error(f"varve {first.command} requires exactly one of MODULE or --all")
             scope = _dynamic_scope(first.command, raw_argv[2:])
@@ -141,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
             context,
             namespace,
             confirm=default_confirm,
+            review_targets=(
+                tuple(namespace.stage) if namespace.command in {"reuse", "invalidate"} else ()
+            ),
             target_module=entry.module,
         )
     except Exception as error:  # noqa: BLE001 - CLI reports backend diagnostics as exit 1.
@@ -183,7 +186,7 @@ def _parser(
         "status": "show exact status for one pipeline store",
         "run": "run one pipeline store or every filtered store",
     }
-    for name in ("status", "run", "accept", "reject"):
+    for name in ("status", "run", "reuse", "invalidate"):
         help_text = dynamic_help.get(name, f"{name} source changes for one or all pipeline stores")
         dynamic = command(name, help_text)
         target = "MODULE [OPTIONS]" if name == "status" else "(MODULE [OPTIONS] | --all [OPTIONS])"
@@ -229,10 +232,10 @@ def _add_dynamic_options(
 ) -> None:
     if positional:
         parser.add_argument("module", nargs="?", metavar="MODULE")
-    if command in {"run", "accept", "reject"}:
+    if command in {"run", "reuse", "invalidate"}:
         parser.add_argument("--all", action="store_true")
     _add_single_target_options(parser)
-    if command in {"run", "accept", "reject"}:
+    if command in {"run", "reuse", "invalidate"}:
         parser.add_argument("--prefix", metavar="MODULE_PREFIX")
     if command == "run":
         argmap.add_stage_selection(parser, help_text)
@@ -245,6 +248,14 @@ def _add_dynamic_options(
         parser.add_argument("--stage", metavar="STAGE_SELECTOR", help=help_text)
         parser.add_argument("--expand", action="store_true")
         parser.add_argument("--rehash", action="store_true")
+    elif command in {"reuse", "invalidate"}:
+        parser.add_argument(
+            "--stage",
+            action="append",
+            default=[],
+            metavar="BASE_STAGE",
+            help="Review this base Stage; repeat to take a union. Coordinates are not accepted.",
+        )
     elif command == "clean":
         parser.add_argument("--downstream", metavar="STAGE_SELECTOR", help=help_text)
         parser.add_argument("--yes", "-y", action="store_true")
@@ -269,7 +280,7 @@ def _validate_surface(parser: argparse.ArgumentParser, namespace: argparse.Names
     command = namespace.command
     module = getattr(namespace, "module", None)
     all_targets = getattr(namespace, "all", False)
-    if command in {"run", "accept", "reject"}:
+    if command in {"run", "reuse", "invalidate"}:
         if bool(module) == bool(all_targets):
             parser.error(f"varve {command} requires exactly one of MODULE or --all")
         if module is not None and namespace.prefix is not None:
@@ -286,3 +297,5 @@ def _validate_surface(parser: argparse.ArgumentParser, namespace: argparse.Names
             parser.error("varve run --all does not accept stage selection")
         if namespace.force or namespace.expand or namespace.compact:
             parser.error("varve run --all does not accept --force or display selection")
+    if command in {"reuse", "invalidate"} and all_targets and namespace.stage:
+        parser.error(f"varve {command} --all does not accept stage selection")

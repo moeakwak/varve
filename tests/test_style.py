@@ -46,9 +46,9 @@ def test_dependency_styles_are_available_from_shared_theme() -> None:
 
 
 def test_review_styles_are_available_from_shared_theme() -> None:
-    assert style.REVIEW_STYLES["accept_action"] == "green"
-    assert style.REVIEW_STYLES["reject_action"] == "yellow"
-    assert style.REVIEW_STYLES["reject_action"] != "red"
+    assert style.REVIEW_STYLES["reuse_action"] == "green"
+    assert style.REVIEW_STYLES["invalidate_action"] == "yellow"
+    assert style.REVIEW_STYLES["invalidate_action"] != "red"
     assert style.REVIEW_STYLES["module"] == "blue"
     assert style.REVIEW_STYLES["stage"] == "cyan"
     assert style.REVIEW_STYLES["noop"] == "dim"

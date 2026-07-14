@@ -83,8 +83,13 @@ def render_bulk_run(
 
     if reviews:
         console.print("\nTO REVIEW", style="bold yellow")
+        seen: set[tuple[str, str, str]] = set()
         for state, stage in reviews:
-            console.print(f"{_module(state)}  {state.entry.branch}  {stage.name}")
+            key = (_module(state), state.entry.branch, stage.base_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            console.print(f"{key[0]}  {key[1]}  {key[2]}")
     if failures:
         console.print("\nFAILED", style="bold red")
         for state, stage in failures:

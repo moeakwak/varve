@@ -156,9 +156,6 @@ class Store:
     def write_review(self, stage: str, record: ReviewRecord) -> None:
         _atomic_write_json(self._stage_path("reviews", stage), record)
 
-    def clear_review(self, stage: str) -> None:
-        self._stage_path("reviews", stage).unlink(missing_ok=True)
-
     def read_failure(self, stage: str) -> FailureRecord | None:
         return _read_model(self._stage_path("failures", stage), FailureRecord)
 

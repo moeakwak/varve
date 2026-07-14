@@ -47,4 +47,6 @@ feat(scope): concise subject
 
 ## Releases
 
-`CHANGELOG.md`, the version in `pyproject.toml`, and `.release-please-manifest.json` are owned by release-please. Do not hand-edit them on `main` or feature branches; such edits are overwritten on the next release-please run. The only legitimate hand-edit is tuning that release PR before it finalizes the release.
+release-please manages `CHANGELOG.md`. It derives release notes from Conventional Commits and updates the changelog through the automated release PR created or refreshed after pushes to `main`; contributors must not add an `Unreleased` section or hand-write release entries.
+
+The release PR also owns the version in `pyproject.toml` and `.release-please-manifest.json`. Merging that PR creates the GitHub release, builds the distributions, and publishes them to PyPI through `.github/workflows/release.yml`.

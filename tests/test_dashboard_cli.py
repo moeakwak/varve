@@ -99,7 +99,6 @@ def _stage_status(
         execution_status=execution,
         execution_reason="hit" if status == "needs-review" else (reason or status),
         source_relationship=relationship,
-        review_decision="none",
         duration=1.25,
         committed_at=None,
         decision_key=None,
@@ -141,7 +140,7 @@ def test_top_level_help_lists_only_unified_commands(capsys) -> None:
     captured = capsys.readouterr()
     assert captured.err == ""
     output = captured.out
-    for command in ("ls", "status", "run", "accept", "reject", "plan", "clean"):
+    for command in ("ls", "status", "run", "reuse", "invalidate", "plan", "clean"):
         assert command in output
     assert "\n  show " not in output
     assert "\n  refresh " not in output
@@ -151,18 +150,20 @@ def test_top_level_help_lists_only_unified_commands(capsys) -> None:
             main([removed])
 
 
-@pytest.mark.parametrize("command", ["ls", "status", "run", "accept", "reject", "plan", "clean"])
+@pytest.mark.parametrize("command", ["ls", "status", "run", "reuse", "invalidate", "plan", "clean"])
 def test_top_level_subcommand_help_uses_unified_surface(command: str, capsys) -> None:
     with pytest.raises(SystemExit) as exc_info:
         main([command, "--help"])
     assert exc_info.value.code == 0
     output = capsys.readouterr().out
-    if command in {"run", "accept", "reject"}:
+    if command in {"run", "reuse", "invalidate"}:
         assert "MODULE" in output and "--all" in output
     elif command in {"status", "plan", "clean"}:
         assert "MODULE" in output
     if command in {"status", "run", "plan", "clean"}:
         assert "STAGE_SELECTOR" in output
+    if command in {"reuse", "invalidate"}:
+        assert "--stage BASE_STAGE" in output
 
 
 def test_top_level_has_no_bulk_clean() -> None:
@@ -203,7 +204,7 @@ def test_ls_module_and_status_share_generated_renderers(
     assert CliDemo.__module__ in status
     assert "CliDemo" in status
     assert "sample" in status and "summary" in status
-    assert "REVIEW" not in status
+    assert "REVIEW" in status
 
     assert main(["run", CliDemo.__module__, "--root", root]) == 0
     run_output = capsys.readouterr().out
@@ -218,7 +219,7 @@ def test_status_requires_module_and_points_to_overview(capsys) -> None:
     assert "use 'varve ls'" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("command", ["run", "accept", "reject"])
+@pytest.mark.parametrize("command", ["run", "reuse", "invalidate"])
 def test_module_and_all_are_mutually_exclusive_and_required(command: str) -> None:
     with pytest.raises(SystemExit):
         main([command])
@@ -226,6 +227,47 @@ def test_module_and_all_are_mutually_exclusive_and_required(command: str) -> Non
         with pytest.raises(SystemExit) as exc_info:
             main([command, *arguments])
         assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("command", ["reuse", "invalidate"])
+def test_top_level_review_forwards_repeatable_base_stage_targets(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _run_demo(tmp_path / "demo" / "out")
+    captured = []
+
+    def fake_review(context, *, decision, targets):
+        captured.append((context.pipeline, decision, targets))
+        return SourceReviewResult(
+            decision=decision,
+            groups=(),
+            recorded=(),
+            already_decided=(),
+            did_not_need_review=(),
+        )
+
+    monkeypatch.setattr("varve.cli.commands.execute_review", fake_review)
+    assert (
+        main(
+            [
+                command,
+                CliDemo.__module__,
+                "--root",
+                str(tmp_path),
+                "--stage",
+                "summary",
+                "--stage",
+                "sample",
+            ]
+        )
+        == 0
+    )
+    assert captured == [(CliDemo, command, ("summary", "sample"))]
+
+    with pytest.raises(SystemExit):
+        main([command, "--all", "--root", str(tmp_path), "--stage", "sample"])
 
 
 def test_single_run_registers_pipeline_args_after_module_resolution(
@@ -685,10 +727,8 @@ def test_bulk_review_continues_after_entry_failure_and_uses_default_args(
 
     monkeypatch.setattr(commands, "_KeyingSession", Session)
     result = SourceReviewResult(
-        decision="accept",
+        decision="reuse",
         groups=(),
-        matched_cells=(),
-        source_changed_cells=(),
         recorded=(),
         already_decided=(),
         did_not_need_review=(),
@@ -707,7 +747,7 @@ def test_bulk_review_continues_after_entry_failure_and_uses_default_args(
             prefix=None,
             branch=None,
             include_temp=False,
-            decision="accept",
+            decision="reuse",
         )
         == 1
     )

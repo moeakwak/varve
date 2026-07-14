@@ -7,7 +7,7 @@ This guide is the working reference for authoring varve pipelines: how to define
 - [Installation](#installation)
 - [Defining a pipeline](#defining-a-pipeline)
 - [Stages, dependencies, and artifacts](#stages-dependencies-and-artifacts)
-- [Cache keys and decisions](#cache-keys-and-decisions)
+- [Input keys, source invalidation, and Review](#input-keys-source-invalidation-and-review)
 - [Resumable batch stages](#resumable-batch-stages)
 - [Matrix stages](#matrix-stages)
 - [Branches and output roots](#branches-and-output-roots)
@@ -118,7 +118,7 @@ Varve fingerprints managed output contents before committing a successful stage 
 
 The stage materialization fingerprint preserves the order exposed by `ctx.inputs()`: declaration order for ordinary `produces`, and batch index plus yield order within each index for batch stages. Reordering the same artifact set therefore invalidates downstream consumers whose positional input changed.
 
-## Input keys and source review
+## Input keys, source invalidation, and Review
 
 A stage input key is derived from:
 
@@ -126,11 +126,12 @@ A stage input key is derived from:
 - evaluated `Dependencies.inputs` contents;
 - evaluated `Dependencies.values` JSON;
 - concrete upstream artifact fingerprints;
+- the Stage callable and declared deterministic Python source fingerprint;
 - internal semantic versions where required for safe invalidation.
 
 ### Source files
 
-Varve automatically observes the Python files defining the pipeline class and stage callable. Declare other Python files or directories explicitly:
+Varve fingerprints the complete AST node for each Stage callable, including decorators, signature, docstring, and body. Changing it produces `needs-run · source-changed` without Review. Declare other deterministic Python files or directories with `Dependencies.sources`:
 
 ```python
 @stage(depends=Dependencies(sources=[Path("shared/normalization")]), produces="normalized.json")
@@ -138,7 +139,20 @@ def normalize(self, ctx: Ctx) -> None:
     external_helper(ctx.out / "normalized.json")
 ```
 
-Comments and formatting do not change the normalized AST fingerprint; docstrings and other runtime-visible AST do. Varve does not infer imports, calls, registries, factories, or runtime dispatch. A changed fingerprint must be accepted or rejected before `run` executes any selected stage.
+Comments and formatting do not change the normalized AST fingerprint; docstrings and other runtime-visible AST do. Varve does not infer imports, calls, registries, factories, or runtime dispatch, so helper files outside the definition files must be declared explicitly.
+
+The remaining AST in the pipeline and callable definition files is observed separately. It excludes every Stage callable collected from that pipeline, so changing Stage A does not open Review for Stage B merely because both methods share a file. Use `Dependencies.review_sources` for additional Python sources whose changes may leave existing materializations valid:
+
+```python
+@stage(
+    depends=Dependencies(review_sources=[Path("shared/report_layout.py")]),
+    produces="report.html",
+)
+def report(self, ctx: Ctx) -> None:
+    ...
+```
+
+A changed Review fingerprint opens `needs-review` only when a success or validated current-key partial could otherwise be reused. `reuse` preserves that reusable state; `invalidate` makes the Stage require a rerun. If another input, deterministic source, upstream artifact, or artifact-integrity change already requires execution from the beginning, Review is unnecessary. Declared source roots must exist and contain Python files only; a missing or renamed root is an evaluation error, while membership changes inside an existing directory change its fingerprint. If one actual file falls under both policies, deterministic rerun wins; declaring the same normalized root in both fields is an error.
 
 ### Files and values outside Python
 
@@ -172,14 +186,14 @@ Varve reports these stage states:
 | --- | --- |
 | `hit` | The current key matches a successful record and all artifacts exist. |
 | `needs-review` | Source differs from the successful materialization and no decision is bound to the current fingerprint. |
-| `needs-run` | A run is required; the reason names changed inputs, source rejection, artifact damage, or interruption. |
+| `needs-run` | A run is required; the reason names changed inputs, deterministic source invalidation, Stage invalidation, artifact damage, or interruption. |
 | `resume` | A matching batch has resumable partial indexes. |
 | `failed` | The last stage attempt raised an exception. |
 | `error` | Varve could not evaluate the stage reliably. |
 
-Execution status remains one of `hit`, `needs-run`, `resume`, `failed`, or `error`. Source review adds two orthogonal facts: relationship is `not-applicable`, `current`, or `changed`, and a changed fingerprint has decision `none`, `accept`, or `reject`. The effective overlay maps changed plus none to `needs-review · source-changed`, changed plus reject to `needs-run · source-changed`, and changed plus accept back to the execution result. No baseline is not-applicable and does not require review; a current source ignores unrelated old review records.
+Execution status remains one of `hit`, `needs-run`, `resume`, `failed`, or `error`. Review source adds two orthogonal facts: relationship is `not-applicable`, `current`, or `changed`, and a changed fingerprint has decision `none`, `reuse`, or `invalidate`. The effective overlay maps changed plus none to `needs-review · source-changed`, changed plus invalidate to `needs-run · source-changed`, and changed plus reuse back to the execution result. No reusable baseline is not-applicable and does not require Review; a current fingerprint ignores unrelated old ReviewRecords. Review Decision belongs to the logical base Stage, while execution status, success, failure, attempt, partial state, and artifacts remain concrete-stage or Cell state.
 
-A normal run validates its selected stages and required external upstreams before any stage body starts. Any changed source with decision none returns exit code 2 and prints the complete review targets. `run --force` first validates selectors, external upstreams, and exact probes, then records reject for source-changed stages inside the execution selection and starts execution. It never decides for external upstreams that it will only reuse. Successful stages replace their executed-source fingerprint and clear the decision; failed, interrupted, and not-yet-started stages retain reject so a later normal run can continue from `needs-run` without another review. Forced or rejected batch stages discard old partial state before the attempt. `status` is read-only: it does not initialize a store, execute stages, establish a source baseline, or rewrite schema 5 stores.
+A normal run validates its selected concrete stages and required external upstreams before any Stage body starts. Any pending Stage Review returns exit code 2 and prints topology-ordered base Stage names. `run --force` validates the same preflight and reruns selected concrete stages without writing ReviewRecord or changing the decision of unselected Cells. External upstreams that force will only reuse must still be current or have a resolved Review. A force attempt records the current rerun and Review source fingerprints, so a later normal run can resume partial produced by that current source; old-source partial is cleared when the forced attempt starts. Successful execution stores the source observation frozen at attempt start and does not clear the shared Stage ReviewRecord. `status` is read-only: it does not initialize a store, execute stages, establish a source baseline, or rewrite an old-schema store.
 
 ## Resumable batch stages
 
@@ -202,7 +216,7 @@ class Demo(Pipeline):
             yield path
 ```
 
-Resume is positional. Varve records completed indexes and skips them on the next run with the same input key when their artifact fingerprints still match. The iterable must therefore have deterministic order for fixed inputs; sort unstable sources before passing them to `ctx.resume()`.
+Resume is positional. Varve records completed indexes under the execution input key and skips them on the next run only when their artifact fingerprints still match. Current-key partial uses its AttemptMarker or FailureRecord source provenance before any older success baseline: partial from the current Review fingerprint resumes directly, partial from an older Review fingerprint requires one Stage-level `reuse` or `invalidate` decision, and partial under another input key is ignored. `reuse` preserves validated indexes; `invalidate` leaves them on disk until execution begins and then clears them before restarting from zero. The iterable must have deterministic order for fixed inputs; sort unstable sources before passing them to `ctx.resume()`.
 
 A successful batch record is not resumable partial state. If one of its managed artifacts is missing, the stage reports `needs-run · artifact-missing` and starts from the beginning; remaining success outputs are not silently reused as checkpoints.
 
@@ -254,7 +268,7 @@ class Evaluation(Pipeline):
 
 Each coordinate combination becomes a concrete stage such as `score@bench=unimer,model=large`. Shared Axis objects align by equal coordinate value: one score cell reads the prepare cell for the same benchmark. An axis that exists only upstream becomes fan-in: the ordinary summarize stage reads score artifacts across every active benchmark and model in deterministic upstream-axis order.
 
-Coordinates are part of the concrete stage identity rather than a separate key component. Each cell has its own store record, attempt marker, partial state, input key, source review, selection identity, and artifact root.
+Coordinates are part of the concrete stage identity rather than a separate key component. Each Cell has its own success record, attempt marker, failure record, partial state, input key, selection identity, and artifact root. All Cells of one logical Matrix Stage share a single base-stage ReviewRecord and therefore one `reuse` or `invalidate` decision.
 
 ### Cell context and artifacts
 
@@ -274,15 +288,15 @@ Branches may activate a subset of each Axis by canonical id. Omitted axes use th
 
 ### Matrix selection and display
 
-Every stage-targeting option uses `STAGE` or `STAGE@AXIS=VALUE[,AXIS=VALUE...]`. A bare Matrix base selects all active cells, a partial selector filters the named axes and treats omitted axes as wildcards, and full coordinates select one cell. Axis input order does not matter, but canonical selectors always follow declaration order. Duplicate or unknown axes, unknown or inactive values, coordinates on an ordinary stage, and selectors matching no active cell fail before execution, review writes, confirmation, or cleaning.
+Execution, status, plan, and clean selectors use `STAGE` or `STAGE@AXIS=VALUE[,AXIS=VALUE...]`. A bare Matrix base selects all active Cells, a partial selector filters the named axes and treats omitted axes as wildcards, and full coordinates select one Cell. Axis input order does not matter, but canonical selectors always follow declaration order. Review commands are intentionally different: `--stage` accepts only ordinary or Matrix base Stage names because a Review Decision always covers the whole logical Stage. A coordinate target fails before any write and reports the copyable base name.
 
-`run --only score@bench=a` selects the matching active score cells without automatically running their upstreams; external upstreams must already be current. `--upto`, `--downstream`, and `--only` are mutually exclusive and apply their respective closure after the shared resolver returns concrete seeds. `clean --downstream` applies descendant closure, while status and review do not expand upstream or downstream. `--slice axis=id` remains a separate temporary-run constraint across selected stages and their aligned upstream closure.
+`run --only score@bench=a` selects the matching active score Cells without automatically running their upstreams; external upstreams must already be current. `--upto`, `--downstream`, and `--only` are mutually exclusive and apply their respective closure after the shared resolver returns concrete seeds. `clean --downstream` applies descendant closure, while status applies no implicit upstream or downstream expansion. Repeated Review base targets form a topology-ordered stable union. `--slice axis=id` remains a separate temporary-run constraint across selected stages and their aligned upstream closure.
 
 Run display uses one policy for the plan, lifecycle log, and outcome table. In automatic mode, large matrix groups fold to a single summary line, while small groups and groups with known slow cells stay expanded. `run --expand` always shows concrete cells and `run --compact` always folds matrix groups; failures and slow cells keep their concrete identities, and `-v` keeps concrete lifecycle and key diagnostics. The exact fold thresholds live in [Matrix graph expansion](ARCHITECTURE.md#matrix-graph-expansion).
 
 Matrix batch progress defaults to canonical coordinate values in axis declaration order instead of the full concrete stage name. An explicit `ctx.resume(desc=...)` remains authoritative.
 
-`status` probes the complete graph and then folds cells by base stage, including effective-status counts, logical needs, and recorded durations. A single changed plus undecided cell promotes its Matrix group and pipeline to `needs-review`. A partial selector heading shows its canonical selector and matched count; add `--expand` to render axis columns, or select a concrete cell to inspect its individual input, artifact, execution, source relationship, review decision, and changed source files. Review actions fold broad results by base rather than printing hundreds of cells.
+`status` probes the complete graph and then folds Cells by base Stage, including effective-status counts, logical needs, recorded durations, and one Stage Review field. A single changed plus undecided Cell promotes its Matrix group and pipeline to `needs-review`. A partial selector heading shows its canonical selector and matched count; add `--expand` to render axis columns, or select a concrete Cell to inspect its individual input, artifact, execution, source relationship, and changed source files. The Stage decision is rendered once at the group level and is never stored or presented as a Cell-owned decision.
 
 ## Branches and output roots
 
@@ -322,8 +336,8 @@ Place `raise SystemExit(MyPipeline.cli())` in the pipeline module and run comman
 ```bash
 python pipeline.py run
 python pipeline.py status
-python pipeline.py accept
-python pipeline.py reject
+python pipeline.py reuse
+python pipeline.py invalidate
 python pipeline.py plan
 python pipeline.py ls
 python pipeline.py clean
@@ -337,7 +351,7 @@ run [--branch NAME] [--override JSON]
     [--slice AXIS=ID] [--force] [--rehash] [--expand | --compact] [--out PATH]
 ```
 
-`--upto` selects resolved seeds and their upstream closure. `--downstream` selects seeds and descendants. `--only` selects exactly the resolved ordinary stage, Matrix base, partial subset, or concrete cell. Before a scoped execution, upstream stages outside the selection must have current successful records and artifacts and must not require review. `--force` reruns selected stages and records reject for their source changes only after the complete preflight succeeds. `--rehash` ignores persisted stat shortcuts while evaluating inputs and existing artifacts.
+`--upto` selects resolved seeds and their upstream closure. `--downstream` selects seeds and descendants. `--only` selects exactly the resolved ordinary Stage, Matrix base, partial subset, or concrete Cell. Before a scoped execution, upstream stages outside the selection must have current successful records and artifacts and must not require Review. `--force` reruns selected concrete stages after the complete preflight succeeds; it never writes a Stage ReviewRecord. `--rehash` ignores persisted stat shortcuts while evaluating inputs, sources, and existing artifacts.
 
 ### status
 
@@ -346,16 +360,16 @@ status [STAGE_SELECTOR] [--branch NAME]
     [--expand] [--rehash] [--out PATH]
 ```
 
-The default is a concise effective-status summary with no separate review column. For an ordinary stage or concrete Matrix cell, `--expand` shows detailed input, artifact, attempt, failure, execution reason, source relationship, review decision, and changed source files. For a Matrix base or partial subset, `--expand` shows the selected cells.
+The default is a concise effective-status summary with one `REVIEW` value per logical Stage. For an ordinary Stage or concrete Matrix Cell, `--expand` shows detailed input, artifact, attempt, failure, execution reason, source relationship, the owning Stage Review, and changed source files. For a Matrix base or partial subset, `--expand` shows the selected Cells and renders Review once in the Stage heading.
 
-### accept and reject
+### reuse and invalidate
 
 ```text
-accept [--stage STAGE_SELECTOR]... [--branch NAME] [--out PATH]
-reject [--stage STAGE_SELECTOR]... [--branch NAME] [--out PATH]
+reuse [--stage BASE_STAGE]... [--branch NAME] [--out PATH]
+invalidate [--stage BASE_STAGE]... [--branch NAME] [--out PATH]
 ```
 
-Without `--stage`, these commands process every source-changed active stage in the pipeline, including stages with an earlier accept or reject decision. Repeated selectors form a stable union; broad selectors skip current and not-applicable cells, while any invalid selector makes the command fail before the first write. `accept` keeps an otherwise current materialization reusable; `reject` produces `needs-run · source-changed`. Repeating the same decision is an idempotent success that preserves `decided_at`, and the output distinguishes `No source changes require review.` from `No review decisions changed.`. Both commands only record decisions bound to the exact current source fingerprint and never execute a stage or rewrite a success record.
+Without `--stage`, these commands process every logical Stage with a current Review candidate, including Stages with an earlier decision for the same fingerprint so the decision can be corrected. Repeated base names form a topology-ordered stable union; coordinates and partial selectors fail before the first write. `reuse` preserves an otherwise reusable success or validated partial; `invalidate` maps it to `needs-run · source-changed` and clears stale partial only when execution starts. Repeating the same decision is an idempotent success that preserves `decided_at`, while the opposite decision atomically replaces that Stage record. Both commands validate all observations and targets before writing, bind decisions to the exact current Review fingerprint, never execute a Stage body, and never rewrite success, attempt, failure, partial, artifact fingerprint, or managed artifact state.
 
 ### plan and ls
 
@@ -374,7 +388,7 @@ clean [--branch NAME] [--downstream STAGE_SELECTOR] [--out PATH] [--yes]
 
 Without `--downstream`, clean removes the complete selected output root after confirmation. With a selector, it deletes recorded artifacts and store state for the concrete seeds and their descendants. Clean does not infer ownership from filenames; it relies on manifest anchors and recorded paths.
 
-All commands accept the global `-v` or `--verbose` flag before the command. Generated Args flags are available on `run`, `status`, `accept`, `reject`, and `clean`.
+All commands accept the global `-v` or `--verbose` flag before the command. Generated Args flags are available on `run`, `status`, `reuse`, `invalidate`, and `clean`.
 
 ## Top-level CLI
 
@@ -384,23 +398,23 @@ The installed `varve` command discovers existing branch stores from manifests. M
 varve ls [MODULE]
 varve status MODULE [--stage STAGE_SELECTOR]
 varve run MODULE | varve run --all
-varve accept MODULE | varve accept --all
-varve reject MODULE | varve reject --all
+varve reuse MODULE [--stage BASE_STAGE]... | varve reuse --all
+varve invalidate MODULE [--stage BASE_STAGE]... | varve invalidate --all
 varve plan MODULE
 varve clean MODULE
 ```
 
 `varve ls` exact-evaluates each selected entry through the shared status collector and one command observation session. `--prefix`, `--branch`, and `--include-temp` filter discovery before import and evaluation; repeatable `--status` filters effective rows afterward. A discovery scope with no entries returns 1, while a successful evaluation whose status filter matches no rows returns 0. The overview displays complete MODULE selectors with `BRANCH` and effective `STATUS`; wide terminals add duration and last run, while narrow terminals use stacked rows instead of truncating MODULE. Manifest, import, resolve, and evaluate errors occupy rows without stopping later entries.
 
-`varve ls MODULE` is branch-independent and shares the generated `ls` renderer. `status MODULE`, `run MODULE`, `accept MODULE`, `reject MODULE`, `plan MODULE`, and `clean MODULE` restore the existing manifest output identity and call the same single-pipeline services as generated commands. They do not accept `--out`, `--override`, or `--slice`. Top-level status supports one `--stage`; top-level accept and reject intentionally remain pipeline-wide. Run, status, clean, accept, and reject register the selected pipeline's Args after resolving MODULE; plan and structure listing do not instantiate Args.
+`varve ls MODULE` is branch-independent and shares the generated `ls` renderer. `status MODULE`, `run MODULE`, `reuse MODULE`, `invalidate MODULE`, `plan MODULE`, and `clean MODULE` restore the existing manifest output identity and call the same single-pipeline services as generated commands. They do not accept `--out`, `--override`, or `--slice`. Top-level status supports one execution selector; top-level `reuse` and `invalidate` support repeatable base Stage targets. Run, status, clean, reuse, and invalidate register the selected pipeline's Args after resolving MODULE; plan and structure listing do not instantiate Args.
 
-`run --all`, `accept --all`, and `reject --all` accept `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run additionally accepts `--rehash`. Bulk commands use each pipeline's default Args and reject pipeline-specific flags. Bulk review gives each store its own lock and commit, continues after failures, refreshes command observations after every entry, and returns 1 if any entry failed. Bulk run exact-evaluates each entry, skips hits and complete pipelines blocked only by `needs-review`, runs `needs-run`, `resume`, or `failed` entries, refreshes observations after each attempt, and exact-evaluates final state. It returns 0 when all entries are complete, 2 when `needs-review` is the only incomplete reason, and 1 for failed, error, needs-run, resume, or mixed incomplete results.
+`run --all`, `reuse --all`, and `invalidate --all` accept `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run additionally accepts `--rehash`. Bulk commands use each pipeline's default Args and reject pipeline-specific flags; bulk Review does not accept Stage selection. Each store has its own lock and commit, failures do not stop later entries, and the command returns 1 if any entry failed. Bulk run exact-evaluates each entry, skips hits and complete pipelines blocked only by `needs-review`, runs `needs-run`, `resume`, or `failed` entries, refreshes observations after each attempt, and exact-evaluates final state. It returns 0 when all entries are complete, 2 when `needs-review` is the only incomplete reason, and 1 for failed, error, needs-run, resume, or mixed incomplete results.
 
 ## Clean safety and recovery
 
 All clean operations require a valid `.varve/manifest.json` anchor. Full clean rejects dangerous roots such as `/`, the home directory, and the current working directory. Override `Pipeline.clean_roots(config)` to restrict full clean further for a particular pipeline.
 
-Per-stage clean removes only recorded managed artifacts and corresponding store state. Paths are checked against the branch output root, and matrix artifacts remain contained by their cell roots.
+Per-stage clean removes only recorded managed artifacts and the selected concrete stages' success, attempt, failure, and partial state. Paths are checked against the branch output root, and Matrix artifacts remain contained by their Cell roots. Targeted ordinary, Matrix base, and partial-selector clean preserve the shared base Stage ReviewRecord because inactive Cells may still need that decision when reactivated. Full store clean removes every ReviewRecord with the output root.
 
 If a stage body raises after its attempt begins, Varve records a `FailureRecord` and reports `failed`; a matching batch partial also reports its resumable progress. If a process exits without recording that failure, a valid partial reports `resume`, while a bare attempt reports `needs-run · interrupted`. Running the pipeline again retries an ordinary failure or continues eligible batch indexes. If a successful artifact was deleted, rerun rebuilds the `artifact-missing` stage. Use `clean --downstream STAGE` when intentional invalidation should remove both one stage and all materializations that consume it.
 

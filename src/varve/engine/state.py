@@ -25,7 +25,7 @@ EffectiveStatus = Literal[
     "error",
 ]
 SourceRelationship = Literal["not-applicable", "current", "changed"]
-ReviewDecision = Literal["none", "accept", "reject"]
+ReviewDecision = Literal["none", "reuse", "invalidate"]
 
 
 @dataclass(frozen=True)
@@ -82,7 +82,7 @@ def effective_status(
 ) -> EffectiveStatus:
     """Overlay source review semantics without changing the cache decision."""
 
-    if source_review.relationship != "changed" or source_review.decision == "accept":
+    if source_review.relationship != "changed" or source_review.decision == "reuse":
         return execution_status
     if source_review.decision == "none":
         return "needs-review"
@@ -92,7 +92,7 @@ def effective_status(
 def effective_reason(execution_reason: str, source_review: SourceReviewState) -> str:
     """Return the summary reason for an effective stage status."""
 
-    if source_review.relationship == "changed" and source_review.decision != "accept":
+    if source_review.relationship == "changed" and source_review.decision != "reuse":
         return "source-changed"
     return execution_reason
 
@@ -168,6 +168,8 @@ def decide(
 
 
 def invalidation_reason(old: KeyComponents, new: KeyComponents) -> str:
+    if old.rerun_source_fingerprint != new.rerun_source_fingerprint:
+        return "source-changed"
     for label, before, after in (
         ("config", old.config, new.config),
         ("value", old.values, new.values),

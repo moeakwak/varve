@@ -33,14 +33,11 @@ def _console(*, color: bool) -> tuple[Console, StringIO]:
 
 def _result(
     *,
-    decision: ReviewAction = "accept",
+    decision: ReviewAction = "reuse",
     target: str = "score",
-    matched: tuple[str, ...] = ("score@bench=a",),
-    changed: tuple[str, ...] = ("score@bench=a",),
-    recorded: tuple[str, ...] = ("score@bench=a",),
+    recorded: tuple[str, ...] = ("score",),
     already: tuple[str, ...] = (),
     did_not_need: tuple[str, ...] = (),
-    exact: str | None = None,
     groups: bool = True,
 ) -> SourceReviewResult:
     group = ReviewGroupResult(
@@ -52,12 +49,9 @@ def _result(
     return SourceReviewResult(
         decision=decision,
         groups=(group,) if groups else (),
-        matched_cells=matched,
-        source_changed_cells=changed,
         recorded=recorded,
         already_decided=already,
         did_not_need_review=did_not_need,
-        exact_target=exact,
     )
 
 
@@ -65,43 +59,38 @@ def test_exact_review_messages_cover_recorded_already_and_not_needed() -> None:
     console, output = _console(color=False)
     render_source_review(
         console,
-        _result(exact="score@bench=a", target="score@bench=a"),
+        _result(target="score", recorded=("score",), already=(), did_not_need=()),
     )
     render_source_review(
         console,
         _result(
             recorded=(),
-            already=("score@bench=a",),
-            exact="score@bench=a",
-            target="score@bench=a",
+            already=("score",),
+            target="score",
         ),
     )
     render_source_review(
         console,
         _result(
-            matched=("score@bench=a",),
-            changed=(),
             recorded=(),
-            did_not_need=("score@bench=a",),
-            exact="score@bench=a",
-            target="score@bench=a",
+            did_not_need=("score",),
+            target="score",
         ),
     )
     render_source_review(
         console,
         _result(
-            decision="reject",
-            exact="score@bench=a",
-            target="score@bench=a",
+            decision="invalidate",
+            recorded=("score",),
+            target="score",
         ),
     )
 
-    assert output.getvalue().splitlines() == [
-        "Accepted source change for score@bench=a.",
-        "score@bench=a was already accepted.",
-        "score@bench=a did not need review.",
-        "Rejected source change for score@bench=a.",
-    ]
+    lines = output.getvalue().splitlines()
+    assert "Reused source changes" in lines
+    assert any("already reused" in line for line in lines)
+    assert any("did not need review" in line for line in lines)
+    assert "Invalidated source changes" in lines
 
 
 def test_broad_review_summary_uses_natural_language_and_distinct_noops() -> None:
@@ -110,30 +99,26 @@ def test_broad_review_summary_uses_natural_language_and_distinct_noops() -> None
         console,
         _result(
             target="score",
-            matched=("a", "b", "c"),
-            changed=("a", "b"),
-            recorded=("a",),
-            already=("b",),
-            did_not_need=("c",),
+            recorded=("score",),
+            already=(),
+            did_not_need=(),
         ),
     )
-    assert output.getvalue() == (
-        "Accepted source changes\n\n"
-        "score: 1 decision recorded, 1 already accepted; 1 cell did not need review.\n\n"
-        "Recorded 1 review decision across 2 source-changed cells.\n"
-    )
+    assert "Reused source changes" in output.getvalue()
+    assert "1 decision recorded" in output.getvalue()
+    assert "source-changed stage" in output.getvalue()
 
     console, output = _console(color=False)
     render_source_review(
         console,
-        _result(recorded=(), already=("score@bench=a",)),
+        _result(recorded=(), already=("score",)),
     )
     assert output.getvalue().endswith("No review decisions changed.\n")
 
     console, output = _console(color=False)
     render_source_review(
         console,
-        _result(matched=(), changed=(), recorded=(), groups=False),
+        _result(recorded=(), groups=False),
     )
     assert output.getvalue() == "No source changes require review.\n"
 
@@ -143,25 +128,23 @@ def test_broad_all_current_or_no_baseline_only_prints_no_source_changes() -> Non
     render_source_review(
         console,
         _result(
-            matched=("score@bench=a", "score@bench=b"),
-            changed=(),
             recorded=(),
-            did_not_need=("score@bench=a", "score@bench=b"),
+            did_not_need=("score",),
         ),
     )
 
-    assert output.getvalue() == "No source changes require review.\n"
+    assert output.getvalue() == "score did not need review.\n"
 
 
-def test_reject_summary_uses_yellow_not_red_and_plain_text_stays_complete() -> None:
+def test_invalidate_summary_uses_yellow_not_red_and_plain_text_stays_complete() -> None:
     console, output = _console(color=True)
-    render_source_review(console, _result(decision="reject"))
+    render_source_review(console, _result(decision="invalidate"))
     rendered = output.getvalue()
 
     assert "\x1b[" in rendered
     assert "33m" in rendered
     assert "31m" not in rendered
-    assert "Rejected source changes" in rendered
+    assert "Invalidated source changes" in rendered
     assert "Recorded" in rendered
 
 
@@ -170,15 +153,13 @@ def test_review_semantic_colors_cover_stage_module_noop_and_error() -> None:
     render_source_review(
         console,
         _result(
-            matched=("a", "b"),
-            changed=("a",),
             recorded=("a",),
             did_not_need=("b",),
         ),
     )
     render_bulk_source_review(
         console,
-        "accept",
+        "reuse",
         (BulkReviewEntry("studies.exp.demo", "main", _result()),),
         (BulkReviewFailure("studies.exp.failed", "dev", "locked"),),
     )
@@ -188,20 +169,20 @@ def test_review_semantic_colors_cover_stage_module_noop_and_error() -> None:
     assert "34m" in rendered  # module blue
     assert "2m" in rendered  # branch/no-op dim
     assert "31m" in rendered  # real error red
-    assert "32m" in rendered  # accept action green
+    assert "32m" in rendered  # reuse action green
 
 
 def test_bulk_review_folds_pipeline_branches_and_reports_failures() -> None:
     console, output = _console(color=False)
     render_bulk_source_review(
         console,
-        "accept",
+        "reuse",
         (
             BulkReviewEntry("studies.exp.one", "main", _result()),
             BulkReviewEntry(
                 "studies.exp.two",
                 "dev",
-                _result(matched=(), changed=(), recorded=(), groups=False),
+                _result(recorded=(), groups=False),
             ),
         ),
         (BulkReviewFailure("studies.exp.failed", "main", "output is locked"),),
@@ -217,8 +198,8 @@ def test_bulk_review_folds_pipeline_branches_and_reports_failures() -> None:
     console, output = _console(color=False)
     render_bulk_source_review(
         console,
-        "reject",
-        (BulkReviewEntry("studies.exp.one", "main", _result(decision="reject")),),
+        "invalidate",
+        (BulkReviewEntry("studies.exp.one", "main", _result(decision="invalidate")),),
     )
-    assert "Rejected source changes" in output.getvalue()
+    assert "Invalidated source changes" in output.getvalue()
     assert "studies.exp.one [main]: 1 decision recorded." in output.getvalue()

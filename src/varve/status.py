@@ -26,6 +26,34 @@ from varve.models import KeyComponents
 SourceChange = Literal["changed", "added", "removed"]
 
 
+def _aggregate_stage_review(base_name: str, cells: list[StageStatus]) -> StageReviewStatus:
+    review_changes: dict[str, SourceChange] = {}
+    relationship: SourceRelationship = "not-applicable"
+    decision: ReviewDecision = "none"
+    for cell in cells:
+        for path, change in cell.source_changes.items():
+            if path.startswith("review/"):
+                review_changes[path.removeprefix("review/")] = change
+        if cell.source_relationship != "changed":
+            if relationship == "not-applicable" and cell.source_relationship == "current":
+                relationship = "current"
+            continue
+        relationship = "changed"
+        if cell.status == "needs-review":
+            decision = "none"
+        elif decision == "none":
+            if cell.status == "needs-run" and cell.reason == "source-changed":
+                decision = "invalidate"
+            else:
+                decision = "reuse"
+    return StageReviewStatus(
+        base_name=base_name,
+        relationship=relationship,
+        decision=decision if relationship == "changed" else "none",
+        source_changes=review_changes,
+    )
+
+
 @dataclass(frozen=True)
 class CellCoordinate:
     axis: str
@@ -45,7 +73,6 @@ class StageStatus:
     execution_status: ExecutionStatus
     execution_reason: str
     source_relationship: SourceRelationship
-    review_decision: ReviewDecision
     duration: float | None
     committed_at: datetime | None
     decision_key: str | None
@@ -57,11 +84,20 @@ class StageStatus:
 
 
 @dataclass(frozen=True)
+class StageReviewStatus:
+    base_name: str
+    relationship: SourceRelationship
+    decision: ReviewDecision
+    source_changes: dict[str, SourceChange]
+
+
+@dataclass(frozen=True)
 class StageStatusGroup:
     base_name: str
     axes: tuple[str, ...]
     logical_needs: tuple[str, ...]
     cells: tuple[StageStatus, ...]
+    review: StageReviewStatus
 
     @property
     def is_matrix(self) -> bool:
@@ -116,6 +152,7 @@ class PipelineStatus:
                 axes=tuple(coordinate.axis for coordinate in cells[0].cell),
                 logical_needs=cells[0].logical_needs,
                 cells=tuple(cells),
+                review=_aggregate_stage_review(base_name, cells),
             )
             for base_name, cells in grouped.items()
         )
@@ -209,12 +246,17 @@ def collect_pipeline_status(
         spec = context.graph.stages[probe.stage]
         previous = probe.previous
         source_changes: dict[str, SourceChange] = {}
-        if probe.source_review.relationship == "changed" and previous is not None:
-            old_files = {
-                item.path: item.digest for item in previous.executed_source_fingerprint.files
-            }
-            new_files = {item.path: item.digest for item in probe.source_fingerprint.files}
-            source_changes = source_component_changes(old_files, new_files)
+        if previous is not None:
+            for prefix, old_fp, new_fp in (
+                ("rerun", previous.executed_source.rerun, probe.source_observation.rerun),
+                ("review", previous.executed_source.review, probe.source_observation.review),
+            ):
+                if old_fp.fingerprint == new_fp.fingerprint:
+                    continue
+                old_files = {item.path: item.digest for item in old_fp.files}
+                new_files = {item.path: item.digest for item in new_fp.files}
+                for path, change in source_component_changes(old_files, new_files).items():
+                    source_changes[f"{prefix}/{path}"] = change
         execution_reason = probe.decision.display_reason
         status = effective_status(probe.decision.status, probe.source_review)
         reason = effective_reason(execution_reason, probe.source_review)
@@ -234,7 +276,6 @@ def collect_pipeline_status(
                 execution_status=probe.decision.status,
                 execution_reason=execution_reason,
                 source_relationship=probe.source_review.relationship,
-                review_decision=probe.source_review.decision,
                 duration=None if previous is None else previous.elapsed,
                 committed_at=_committed_at(None if previous is None else previous.committed_at),
                 decision_key=probe.decision_key,

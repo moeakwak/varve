@@ -149,7 +149,7 @@ def _out(base: Path) -> Path:
     return base / "main"
 
 
-@pytest.mark.parametrize("mode", ["force", "reject"])
+@pytest.mark.parametrize("mode", ["force", "invalidate"])
 def test_batch_restart_clears_all_partial_before_attempt_and_body(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -173,15 +173,19 @@ def test_batch_restart_clears_all_partial_before_attempt_and_body(
 
     run(RestartBatch, Config(), cli_out=tmp_path)
     store = Store(_out(tmp_path))
-    if mode == "reject":
+    if mode == "invalidate":
         previous = store.read_success("build")
         assert previous is not None
         store.write_success(
             previous.model_copy(
                 update={
-                    "executed_source_fingerprint": SourceFingerprint(
-                        fingerprint="old-source",
-                        files=[],
+                    "executed_source": previous.executed_source.model_copy(
+                        update={
+                            "review": SourceFingerprint(
+                                fingerprint="old-source",
+                                files=[],
+                            )
+                        }
                     )
                 }
             )
@@ -189,7 +193,7 @@ def test_batch_restart_clears_all_partial_before_attempt_and_body(
         record_source_review(
             RestartBatch,
             Config(),
-            decision="reject",
+            decision="invalidate",
             cli_out=tmp_path,
         )
     store.write_batch(

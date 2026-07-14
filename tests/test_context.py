@@ -13,6 +13,7 @@ from varve.models import (
     OutputHandle,
     ProducedPath,
     SourceFingerprint,
+    SourceObservation,
     SuccessRecord,
 )
 from varve.store.store import Store
@@ -56,7 +57,18 @@ def _ctx(tmp_path: Path, **kwargs) -> Ctx:
 
 
 def _key_components() -> KeyComponents:
-    return KeyComponents(config={}, inputs={}, values={}, upstreams={})
+    return KeyComponents(
+        config={},
+        inputs={},
+        values={},
+        upstreams={},
+        rerun_source_fingerprint="source",
+    )
+
+
+def _source() -> SourceObservation:
+    fingerprint = SourceFingerprint(fingerprint="source", files=[])
+    return SourceObservation(rerun=fingerprint, review=fingerprint)
 
 
 def _artifact(path: str) -> ArtifactFingerprint:
@@ -70,7 +82,7 @@ def _single_record(stage: str, paths: list[str]) -> SuccessRecord:
         kind="single",
         input_key=f"{stage}-key",
         key_components=_key_components(),
-        executed_source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
+        executed_source=_source(),
         artifact_fingerprint="artifacts",
         produces=[ProducedPath(path=path, kind="file", artifact=_artifact(path)) for path in paths],
         committed_at="now",
@@ -84,7 +96,7 @@ def _batch_record(stage: str, paths: list[str]) -> SuccessRecord:
         kind="batch",
         input_key=f"{stage}-key",
         key_components=_key_components(),
-        executed_source_fingerprint=SourceFingerprint(fingerprint="source", files=[]),
+        executed_source=_source(),
         artifact_fingerprint="artifacts",
         outputs=[
             OutputHandle(index=index, path=path, artifact=_artifact(path))

@@ -225,7 +225,7 @@ def test_probe_without_upstream_record_keeps_source_fingerprint(tmp_path: Path) 
     assert downstream.decision.reason == "no-cache"
     assert downstream.decision_key is None
     assert downstream.components is None
-    assert downstream.source_fingerprint.files
+    assert downstream.source_observation.review.files
     assert downstream.unavailable_reason == "upstream upstream has no success record"
 
 
@@ -250,9 +250,9 @@ def test_probe_shares_matrix_template_source_fingerprint(tmp_path: Path) -> None
     )
 
     assert len(probes) == 4
-    assert probes[0].source_fingerprint is probes[1].source_fingerprint
-    assert probes[1].source_fingerprint is probes[2].source_fingerprint
-    assert probes[2].source_fingerprint is not probes[3].source_fingerprint
+    assert probes[0].source_observation is probes[1].source_observation
+    assert probes[1].source_observation is probes[2].source_observation
+    assert probes[2].source_observation is not probes[3].source_observation
 
 
 def test_external_validation_does_not_freeze_execution_file_inputs(tmp_path: Path) -> None:
@@ -345,7 +345,8 @@ def test_external_validation_rejects_a_non_current_recursive_ancestor(
             "ancestor",
             AttemptMarker(
                 input_key=record.input_key,
-                source_fingerprint=record.executed_source_fingerprint.fingerprint,
+                rerun_source_fingerprint=record.executed_source.rerun.fingerprint,
+                review_source_fingerprint=record.executed_source.review.fingerprint,
                 started_at="test",
                 touched_existing=True,
             ),
@@ -485,7 +486,7 @@ def test_probe_reads_each_success_record_once(
     assert reads == {stage: 1 for stage in MatrixProbePipeline.graph().topo_order()}
 
 
-def test_forced_auto_reject_reuses_single_preflight_observations(
+def test_forced_source_change_reuses_single_preflight_observations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -496,9 +497,13 @@ def test_forced_auto_reject_reuses_single_preflight_observations(
     store.write_success(
         previous.model_copy(
             update={
-                "executed_source_fingerprint": SourceFingerprint(
-                    fingerprint="old-source",
-                    files=[],
+                "executed_source": previous.executed_source.model_copy(
+                    update={
+                        "review": SourceFingerprint(
+                            fingerprint="old-source",
+                            files=[],
+                        )
+                    }
                 )
             }
         )
@@ -508,7 +513,7 @@ def test_forced_auto_reject_reuses_single_preflight_observations(
     source_observations = 0
     original_success = Store.read_success
     original_review = Store.read_review
-    original_source = SourceFingerprintSession.fingerprint
+    original_source = SourceFingerprintSession.observe
 
     def counted_success(self, stage):
         nonlocal success_reads
@@ -527,7 +532,7 @@ def test_forced_auto_reject_reuses_single_preflight_observations(
 
     monkeypatch.setattr(Store, "read_success", counted_success)
     monkeypatch.setattr(Store, "read_review", counted_review)
-    monkeypatch.setattr(SourceFingerprintSession, "fingerprint", counted_source)
+    monkeypatch.setattr(SourceFingerprintSession, "observe", counted_source)
 
     run(ProbePipeline, Config(), cli_out=tmp_path, force=True)
 
@@ -562,7 +567,7 @@ def test_probe_reports_old_store_schema_without_rewriting_manifest(tmp_path: Pat
 
     assert probe.decision.status == "needs-run"
     assert probe.decision.reason == "schema-migration"
-    assert probe.unavailable_reason == "store schema 4 must be rebuilt as schema 5"
+    assert probe.unavailable_reason == "store schema 4 must be rebuilt as schema 6"
     assert manifest_path.read_bytes() == before
 
 

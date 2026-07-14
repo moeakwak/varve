@@ -29,12 +29,12 @@ STATUS_STYLES: dict[str, str] = {
 }
 
 REVIEW_STYLES: dict[str, str] = {
-    "accept_heading": "bold green",
-    "accept_action": "green",
-    "accept_already": "dim green",
-    "reject_heading": "bold yellow",
-    "reject_action": "yellow",
-    "reject_already": "dim yellow",
+    "reuse_heading": "bold green",
+    "reuse_action": "green",
+    "reuse_already": "dim green",
+    "invalidate_heading": "bold yellow",
+    "invalidate_action": "yellow",
+    "invalidate_already": "dim yellow",
     "stage": "cyan",
     "module": "blue",
     "branch": "dim",

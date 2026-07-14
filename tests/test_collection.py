@@ -6,6 +6,7 @@ import pytest
 from pydantic import BaseModel
 
 from varve import Dependencies, Pipeline, batch_stage, stage
+from varve.dependencies import merge_dependencies
 
 
 def test_decorators_capture_stage_metadata() -> None:
@@ -67,6 +68,35 @@ def test_pipeline_accepts_method_reference_dependencies() -> None:
 
     assert Demo.stages()["summarize"].needs == ("sample",)
     assert Demo.topo_order() == ["sample", "summarize"]
+
+
+def test_merge_dependencies_combines_review_sources_and_rejects_duplicate_names() -> None:
+    base = Dependencies(
+        inputs={"shared": lambda ctx: Path("base.txt")},
+        values={"token": lambda ctx: "base"},
+        sources=[Path("a.py"), Path("b.py")],
+        review_sources=[Path("review_a.py"), Path("review_b.py")],
+    )
+    stage = Dependencies(
+        inputs={"stage": lambda ctx: Path("stage.txt")},
+        values={"limit": lambda ctx: 1},
+        sources=[Path("b.py"), Path("c.py")],
+        review_sources=[Path("review_b.py"), Path("review_c.py")],
+    )
+    merged = merge_dependencies(base, stage)
+    assert list(merged.inputs) == ["shared", "stage"]
+    assert list(merged.values) == ["token", "limit"]
+    assert merged.sources == (Path("a.py"), Path("b.py"), Path("c.py"))
+    assert merged.review_sources == (
+        Path("review_a.py"),
+        Path("review_b.py"),
+        Path("review_c.py"),
+    )
+    with pytest.raises(ValueError, match="Duplicate pipeline and stage dependencies"):
+        merge_dependencies(
+            Dependencies(inputs={"shared": lambda ctx: Path("base.txt")}),
+            Dependencies(inputs={"shared": lambda ctx: Path("stage.txt")}),
+        )
 
 
 def test_output_root_default_resolution(tmp_path: Path) -> None:

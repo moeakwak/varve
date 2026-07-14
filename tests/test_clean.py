@@ -9,7 +9,7 @@ from varve import Axis, Pipeline, matrix, stage
 from varve.cli.clean import _validate_destructive, clean
 from varve.engine.runner import run
 from varve.matrix import build_graph
-from varve.models import ProducedPath
+from varve.models import ProducedPath, ReviewRecord, SourceFingerprint
 from varve.store.lock import OutputLock
 from varve.store.store import Store
 
@@ -258,6 +258,16 @@ def test_clean_partial_matrix_selector_deletes_only_matching_descendants(
     tmp_path: Path,
 ) -> None:
     run(MatrixCleanPipeline, Config(), cli_out=tmp_path)
+    store = Store(tmp_path / "main")
+    store.write_review(
+        "score",
+        ReviewRecord(
+            review_fingerprint="review",
+            review_observation=SourceFingerprint(fingerprint="review", files=[]),
+            decision="invalidate",
+            decided_at="2026-07-14T00:00:00+00:00",
+        ),
+    )
     root = tmp_path / "main" / ".matrix"
 
     clean(
@@ -276,6 +286,7 @@ def test_clean_partial_matrix_selector_deletes_only_matching_descendants(
     assert (root / "score" / "bench=b" / "model=y" / "score.txt").exists()
     assert not (root / "report" / "bench=a" / "report.txt").exists()
     assert (root / "report" / "bench=b" / "report.txt").exists()
+    assert store.read_review("score") is not None
 
 
 def test_clean_inactive_partial_selector_fails_before_confirmation(tmp_path: Path) -> None:

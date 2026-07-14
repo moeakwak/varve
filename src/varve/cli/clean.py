@@ -115,5 +115,4 @@ def clean(
             (store.root / "stages" / f"{stage_name}.json").unlink(missing_ok=True)
             store.clear_attempt(stage_name)
             store.clear_partial(stage_name)
-            store.clear_review(stage_name)
             store.clear_failure(stage_name)

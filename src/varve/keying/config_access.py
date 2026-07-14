@@ -9,7 +9,7 @@ depended-on.
 
 Projecting the config onto the recorded field set is sound for unchanged
 source: fields that were not read cannot affect the output.  Source review is
-separate from the input key; accepting a source change also accepts
+separate from the input key; reusing a source change also reuses
 responsibility for reusing the old access set when deciding whether an
 existing materialization is still valid.  Any execution under a different
 source fingerprint starts from the whole Config and records a new field set.

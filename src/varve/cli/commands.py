@@ -121,7 +121,7 @@ def dispatch_command(
             return 2
         render_run_outcomes(make_console(), outcomes)
         return 0
-    if namespace.command in {"accept", "reject"}:
+    if namespace.command in {"reuse", "invalidate"}:
         result = execute_review(context, decision=namespace.command, targets=review_targets)
         render_source_review(make_console(), result)
         return 0

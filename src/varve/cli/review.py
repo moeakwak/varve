@@ -27,7 +27,9 @@ class BulkReviewFailure:
 
 def _words(decision: ReviewAction) -> tuple[str, str]:
     try:
-        return {"accept": ("Accepted", "accepted"), "reject": ("Rejected", "rejected")}[decision]
+        return {"reuse": ("Reused", "reused"), "invalidate": ("Invalidated", "invalidated")}[
+            decision
+        ]
     except KeyError as error:
         raise ValueError(f"Unknown source review decision: {decision}") from error
 
@@ -69,8 +71,8 @@ def _group_line(group: ReviewGroupResult, decision: ReviewAction) -> Text:
             f"{len(group.did_not_need_review)} "
             + _plural(
                 len(group.did_not_need_review),
-                "cell did not need review",
-                "cells did not need review",
+                "stage did not need review",
+                "stages did not need review",
             ),
             style="varve.review.noop",
         )
@@ -79,24 +81,16 @@ def _group_line(group: ReviewGroupResult, decision: ReviewAction) -> Text:
 
 
 def render_source_review(console: Console, result: SourceReviewResult) -> None:
-    """Render one pipeline's explicit accept/reject result."""
+    """Render one pipeline's explicit reuse/invalidate result."""
 
     title, past = _words(result.decision)
-    if result.exact_target is not None:
+    if not result.has_source_changes and not result.did_not_need_review:
+        console.print("No source changes require review.", style="varve.review.noop")
+        return
+    if not result.has_source_changes and len(result.did_not_need_review) == 1:
         line = Text()
-        if result.recorded:
-            line.append(title, style=_action_style(result.decision, "action"))
-            line.append(" source change for ")
-            line.append(result.exact_target, style="varve.review.stage")
-            line.append(".")
-        elif result.already_decided:
-            line.append(result.exact_target, style="varve.review.stage")
-            line.append(" was already ")
-            line.append(past, style=_action_style(result.decision, "already"))
-            line.append(".")
-        else:
-            line.append(result.exact_target, style="varve.review.stage")
-            line.append(" did not need review.", style="varve.review.noop")
+        line.append(result.did_not_need_review[0], style="varve.review.stage")
+        line.append(" did not need review.", style="varve.review.noop")
         console.print(line)
         return
 
@@ -122,10 +116,10 @@ def render_source_review(console: Console, result: SourceReviewResult) -> None:
         )
         total.append(" across ")
         total.append(
-            str(len(result.source_changed_cells)),
+            str(len(result.recorded)),
             style=_action_style(result.decision, "action"),
         )
-        total.append(f" {_plural(len(result.source_changed_cells), 'source-changed cell')}.")
+        total.append(f" {_plural(len(result.recorded), 'source-changed stage')}.")
         console.print(total)
     else:
         console.print("No review decisions changed.", style="varve.review.noop")

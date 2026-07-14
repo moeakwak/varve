@@ -554,7 +554,7 @@ def test_cli_root_help_lists_only_unified_commands(capsys) -> None:
         CliPipeline.cli(["--help"])
     assert exc_info.value.code == 0
     output = capsys.readouterr().out
-    assert "{run,status,clean,accept,reject,plan,ls}" in output
+    assert "{run,status,clean,reuse,invalidate,plan,ls}" in output
     assert "\n    list " not in output
 
 
@@ -564,8 +564,6 @@ def test_cli_root_help_lists_only_unified_commands(capsys) -> None:
         ("run", "--only STAGE_SELECTOR"),
         ("status", "STAGE_SELECTOR"),
         ("clean", "--downstream STAGE_SELECTOR"),
-        ("accept", "--stage STAGE_SELECTOR"),
-        ("reject", "--stage STAGE_SELECTOR"),
         ("plan", "--only STAGE_SELECTOR"),
     ],
 )
@@ -582,12 +580,22 @@ def test_cli_stage_target_help_uses_one_selector_contract(
     assert "full coordinates select one cell" in output
 
 
+@pytest.mark.parametrize("command", ["reuse", "invalidate"])
+def test_cli_review_help_uses_base_stage_targets(command: str, capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        CliPipeline.cli([command, "--help"])
+    assert exc_info.value.code == 0
+    output = " ".join(capsys.readouterr().out.split())
+    assert "--stage BASE_STAGE" in output
+    assert "Coordinates are not accepted" in output
+
+
 def test_cli_review_uses_repeatable_stage_option(tmp_path: Path, capsys) -> None:
     assert CliPipeline.cli(["run", f"--out={tmp_path}"]) == 0
-    assert CliPipeline.cli(["accept", f"--out={tmp_path}", "--stage", "sample"]) == 0
-    assert "sample did not need review." in capsys.readouterr().out
+    assert CliPipeline.cli(["reuse", f"--out={tmp_path}", "--stage", "sample"]) == 0
+    assert "did not need review" in capsys.readouterr().out
     with pytest.raises(SystemExit):
-        CliPipeline.cli(["accept", "sample", f"--out={tmp_path}"])
+        CliPipeline.cli(["reuse", "sample", f"--out={tmp_path}"])
 
 
 def test_cli_status_expands_all_stages_in_non_matrix_pipeline(tmp_path: Path, capsys) -> None:
