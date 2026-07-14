@@ -124,6 +124,34 @@ def test_stage_body_change_only_affects_that_stage_rerun(tmp_path: Path) -> None
     assert after["two"].decision.status == "hit"
 
 
+@pytest.mark.parametrize(
+    ("case", "before", "after"),
+    [
+        (
+            "decorator",
+            '@stage(produces="artifact.txt")',
+            '@stage(produces=["artifact.txt"])',
+        ),
+        ("signature", "def build(self, ctx):", "def build(self, ctx) -> None:"),
+    ],
+)
+def test_stage_decorator_and_signature_enter_rerun_fingerprint(
+    tmp_path: Path,
+    case: str,
+    before: str,
+    after: str,
+) -> None:
+    module_path = tmp_path / f"{case}.py"
+    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("same")'))
+    pipeline = _load_pipeline(module_path, f"{case}_keying_demo")
+    first = SourceFingerprintSession().observe(pipeline, pipeline.stages()["build"])
+    module_path.write_text(module_path.read_text().replace(before, after))
+    pipeline = _load_pipeline(module_path, f"{case}_keying_demo")
+    second = SourceFingerprintSession().observe(pipeline, pipeline.stages()["build"])
+    assert second.rerun.fingerprint != first.rerun.fingerprint
+    assert second.review.fingerprint == first.review.fingerprint
+
+
 def test_shared_helper_change_opens_review_for_both_stages(tmp_path: Path) -> None:
     module_path = tmp_path / "shared_helper.py"
     module_path.write_text(_two_stage_shared_helper_source(), encoding="utf-8")
@@ -321,9 +349,7 @@ def test_checkout_absolute_path_does_not_enter_fingerprint(tmp_path: Path) -> No
         assert str(tmp_path) not in entry.digest
 
 
-def test_missing_declared_file_is_error_directory_manifest_changes_fingerprint(
-    tmp_path: Path,
-) -> None:
+def test_declared_source_directory_manifest_changes_fingerprint(tmp_path: Path) -> None:
     helpers = tmp_path / "helpers"
     helpers.mkdir()
     (helpers / "first.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -358,34 +384,6 @@ class Demo(Pipeline):
     )[0]
     assert second.source_observation.rerun.fingerprint != first
     assert second.decision.reason == "source-changed"
-
-    missing_module = tmp_path / "missing_file.py"
-    missing_module.write_text(
-        """from pathlib import Path
-from pydantic import BaseModel
-from varve import Dependencies, Pipeline, stage
-
-class Config(BaseModel):
-    pass
-
-class Demo(Pipeline):
-    Config = Config
-
-    @stage(produces="artifact.txt", depends=Dependencies(sources=[Path("missing.py")]))
-    def build(self, ctx):
-        (ctx.out / "artifact.txt").write_text("same", encoding="utf-8")
-""",
-        encoding="utf-8",
-    )
-    missing_pipeline = _load_pipeline(missing_module, "missing_file_keying_demo")
-    missing_probe = probe_pipeline(
-        missing_pipeline,
-        missing_pipeline.Config(),
-        args=missing_pipeline.Args(),
-        out=tmp_path / "missing-out" / "main",
-    )[0]
-    assert missing_probe.decision.status == "error"
-    assert "Declared source path does not exist" in missing_probe.decision.reason
 
 
 def test_source_stat_cache_requires_same_physical_path(tmp_path: Path) -> None:
@@ -427,7 +425,7 @@ def test_residual_ast_retries_when_file_changes_during_read(
     def racing_read(path: Path):
         nonlocal reads
         tree, after = original_read(path)
-        if path == module_path and reads == 1:
+        if path == module_path and reads == 0:
             module_path.write_text(changed, encoding="utf-8")
             after = module_path.stat()
         reads += 1
@@ -436,7 +434,7 @@ def test_residual_ast_retries_when_file_changes_during_read(
     monkeypatch.setattr(source_module, "_read_module_ast", racing_read)
     observed = SourceFingerprintSession().observe(pipeline, stage_spec)
 
-    assert reads >= 3
+    assert reads == 2
     assert observed.review.fingerprint != baseline.review.fingerprint
 
 

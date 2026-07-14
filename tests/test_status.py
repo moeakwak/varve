@@ -412,6 +412,7 @@ def test_required_review_renders_as_effective_needs_review(pipeline_status) -> N
         reason="source-changed",
         summary_reason="source-changed",
         source_relationship="changed",
+        source_decision="none",
         source_changes={"review/pipeline.py": "changed"},
     )
     status = replace(pipeline_status, stages=(stage,))
@@ -524,6 +525,7 @@ def test_matrix_effective_status_prioritizes_needs_review(pipeline_status) -> No
         execution_status="error",
         execution_reason="cannot evaluate input",
         source_relationship="changed",
+        source_decision="none",
     )
     status = replace(pipeline_status, stages=(hit, required))
 
@@ -606,7 +608,11 @@ def test_high_cardinality_status_probes_once_and_review_stays_folded(
 
 @pytest.mark.parametrize(
     ("decision", "label", "effective"),
-    [("reuse", "reuse", "hit"), ("invalidate", "invalidate", "needs-run")],
+    [
+        ("reuse", "reuse", "hit"),
+        ("reuse", "reuse", "needs-run"),
+        ("invalidate", "invalidate", "needs-run"),
+    ],
 )
 def test_changed_source_detail_preserves_review_decision_and_files(
     pipeline_status,
@@ -618,9 +624,10 @@ def test_changed_source_detail_preserves_review_decision_and_files(
     stage = replace(
         original,
         status=effective,
-        reason="source-changed" if decision == "invalidate" else "hit",
-        summary_reason="source-changed" if decision == "invalidate" else "hit",
+        reason="source-changed" if effective == "needs-run" else "hit",
+        summary_reason="source-changed" if effective == "needs-run" else "hit",
         source_relationship="changed",
+        source_decision=decision,
         source_changes={"review/pipeline.py": "changed"},
     )
     status = replace(pipeline_status, stages=(stage,))

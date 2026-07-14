@@ -26,10 +26,10 @@ from varve.models import KeyComponents
 SourceChange = Literal["changed", "added", "removed"]
 
 
-def _aggregate_stage_review(base_name: str, cells: list[StageStatus]) -> StageReviewStatus:
+def _aggregate_stage_review(cells: list[StageStatus]) -> StageReviewStatus:
     review_changes: dict[str, SourceChange] = {}
     relationship: SourceRelationship = "not-applicable"
-    decision: ReviewDecision = "none"
+    decisions: set[ReviewDecision] = set()
     for cell in cells:
         for path, change in cell.source_changes.items():
             if path.startswith("review/"):
@@ -39,17 +39,15 @@ def _aggregate_stage_review(base_name: str, cells: list[StageStatus]) -> StageRe
                 relationship = "current"
             continue
         relationship = "changed"
-        if cell.status == "needs-review":
-            decision = "none"
-        elif decision == "none":
-            if cell.status == "needs-run" and cell.reason == "source-changed":
-                decision = "invalidate"
-            else:
-                decision = "reuse"
+        decisions.add(cell.source_decision)
+    decision: ReviewDecision = "none"
+    if "none" not in decisions and len(decisions) == 1:
+        decision = next(iter(decisions))
+    elif "none" not in decisions and decisions:
+        raise ValueError("Inconsistent Review Decisions within one Stage")
     return StageReviewStatus(
-        base_name=base_name,
         relationship=relationship,
-        decision=decision if relationship == "changed" else "none",
+        decision=decision,
         source_changes=review_changes,
     )
 
@@ -73,6 +71,7 @@ class StageStatus:
     execution_status: ExecutionStatus
     execution_reason: str
     source_relationship: SourceRelationship
+    source_decision: ReviewDecision
     duration: float | None
     committed_at: datetime | None
     decision_key: str | None
@@ -85,7 +84,6 @@ class StageStatus:
 
 @dataclass(frozen=True)
 class StageReviewStatus:
-    base_name: str
     relationship: SourceRelationship
     decision: ReviewDecision
     source_changes: dict[str, SourceChange]
@@ -152,7 +150,7 @@ class PipelineStatus:
                 axes=tuple(coordinate.axis for coordinate in cells[0].cell),
                 logical_needs=cells[0].logical_needs,
                 cells=tuple(cells),
-                review=_aggregate_stage_review(base_name, cells),
+                review=_aggregate_stage_review(cells),
             )
             for base_name, cells in grouped.items()
         )
@@ -276,6 +274,7 @@ def collect_pipeline_status(
                 execution_status=probe.decision.status,
                 execution_reason=execution_reason,
                 source_relationship=probe.source_review.relationship,
+                source_decision=probe.source_review.decision,
                 duration=None if previous is None else previous.elapsed,
                 committed_at=_committed_at(None if previous is None else previous.committed_at),
                 decision_key=probe.decision_key,

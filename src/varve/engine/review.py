@@ -11,19 +11,17 @@ from varve.matrix import PipelineGraph
 from varve.models import ReviewRecord, SourceFingerprint
 
 ReviewAction = Literal["reuse", "invalidate"]
+ReviewOutcome = Literal["recorded", "already-decided", "not-needed"]
 
 
 class ReviewStore(Protocol):
     def write_review(self, stage: str, record: ReviewRecord) -> None: ...
-
-    def read_review(self, stage: str) -> ReviewRecord | None: ...
 
 
 @dataclass(frozen=True)
 class ReviewCandidate:
     """A source observation complete enough to make a review decision."""
 
-    stage: str
     base_stage: str
     review_observation: SourceFingerprint
     source_review: SourceReviewState
@@ -36,17 +34,14 @@ class ReviewWrite:
     base_stage: str
     review_observation: SourceFingerprint
     decision: ReviewAction
-    decided_at: str | None = None
 
 
 @dataclass(frozen=True)
-class ReviewGroupResult:
+class ReviewStageResult:
     """Natural-language summary data for one base stage."""
 
-    canonical_target: str
-    recorded: tuple[str, ...]
-    already_decided: tuple[str, ...]
-    did_not_need_review: tuple[str, ...]
+    stage: str
+    outcome: ReviewOutcome
 
 
 @dataclass(frozen=True)
@@ -54,19 +49,26 @@ class SourceReviewResult:
     """Structured result returned by an explicit pipeline review command."""
 
     decision: ReviewAction
-    groups: tuple[ReviewGroupResult, ...]
-    recorded: tuple[str, ...]
-    already_decided: tuple[str, ...]
-    did_not_need_review: tuple[str, ...]
+    stages: tuple[ReviewStageResult, ...]
+
+    def _stages(self, outcome: ReviewOutcome) -> tuple[str, ...]:
+        return tuple(stage.stage for stage in self.stages if stage.outcome == outcome)
+
+    @property
+    def recorded(self) -> tuple[str, ...]:
+        return self._stages("recorded")
+
+    @property
+    def already_decided(self) -> tuple[str, ...]:
+        return self._stages("already-decided")
+
+    @property
+    def did_not_need_review(self) -> tuple[str, ...]:
+        return self._stages("not-needed")
 
     @property
     def has_source_changes(self) -> bool:
         return bool(self.recorded or self.already_decided)
-
-    def __len__(self) -> int:
-        """Return the number of decisions recorded by this command."""
-
-        return len(self.recorded)
 
 
 def validate_base_stage_targets(
@@ -102,9 +104,6 @@ def validate_base_stage_targets(
 def plan_review_writes(
     candidates: Sequence[ReviewCandidate],
     decision: ReviewAction,
-    *,
-    existing: dict[str, ReviewRecord] | None = None,
-    decided_at: str | None = None,
 ) -> tuple[ReviewWrite, ...]:
     """Plan one write per base Stage for changed candidates only."""
 
@@ -122,28 +121,13 @@ def plan_review_writes(
             raise ValueError(f"Inconsistent review fingerprints for Stage {candidate.base_stage!r}")
     writes: list[ReviewWrite] = []
     for base_stage, candidate in by_base.items():
-        current = None if existing is None else existing.get(base_stage)
-        if (
-            current is not None
-            and current.review_fingerprint == candidate.review_observation.fingerprint
-            and current.decision == decision
-        ):
+        if candidate.source_review.decision == decision:
             continue
-        if candidate.source_review.decision == decision and current is not None:
-            continue
-        keep_decided_at = None
-        if (
-            current is not None
-            and current.review_fingerprint == candidate.review_observation.fingerprint
-            and current.decision == decision
-        ):
-            keep_decided_at = current.decided_at
         writes.append(
             ReviewWrite(
                 base_stage=base_stage,
                 review_observation=candidate.review_observation,
                 decision=decision,
-                decided_at=keep_decided_at or decided_at,
             )
         )
     return tuple(writes)
@@ -163,7 +147,7 @@ def apply_review_writes(
                 review_fingerprint=write.review_observation.fingerprint,
                 review_observation=write.review_observation,
                 decision=write.decision,
-                decided_at=write.decided_at or decided_at,
+                decided_at=decided_at,
             ),
         )
 
@@ -173,8 +157,6 @@ def plan_source_review(
     targets: Sequence[str],
     candidates: Sequence[ReviewCandidate],
     decision: ReviewAction,
-    *,
-    existing: dict[str, ReviewRecord] | None = None,
 ) -> tuple[tuple[ReviewWrite, ...], SourceReviewResult]:
     """Build a complete explicit-review plan and renderer-facing result."""
 
@@ -200,63 +182,23 @@ def plan_source_review(
     selected_candidates = [
         candidate for base in selected_bases for candidate in by_base_candidates.get(base, ())
     ]
-    writes = plan_review_writes(selected_candidates, decision, existing=existing)
+    writes = plan_review_writes(selected_candidates, decision)
     recorded_set = {write.base_stage for write in writes}
 
-    recorded: list[str] = []
-    already: list[str] = []
-    did_not_need: list[str] = []
-    groups: list[ReviewGroupResult] = []
+    stages: list[ReviewStageResult] = []
     for base in selected_bases:
         group = by_base_candidates.get(base, [])
-        if not group:
-            did_not_need.append(base)
-            groups.append(
-                ReviewGroupResult(
-                    canonical_target=base,
-                    recorded=(),
-                    already_decided=(),
-                    did_not_need_review=(base,),
-                )
-            )
-            continue
         changed = any(item.source_review.relationship == "changed" for item in group)
-        if not changed:
-            did_not_need.append(base)
-            groups.append(
-                ReviewGroupResult(
-                    canonical_target=base,
-                    recorded=(),
-                    already_decided=(),
-                    did_not_need_review=(base,),
-                )
-            )
-            continue
-        if base in recorded_set:
-            recorded.append(base)
-            groups.append(
-                ReviewGroupResult(
-                    canonical_target=base,
-                    recorded=(base,),
-                    already_decided=(),
-                    did_not_need_review=(),
-                )
-            )
-        else:
-            already.append(base)
-            groups.append(
-                ReviewGroupResult(
-                    canonical_target=base,
-                    recorded=(),
-                    already_decided=(base,),
-                    did_not_need_review=(),
-                )
-            )
+        outcome: ReviewOutcome = (
+            "not-needed"
+            if not changed
+            else "recorded"
+            if base in recorded_set
+            else "already-decided"
+        )
+        stages.append(ReviewStageResult(stage=base, outcome=outcome))
 
     return writes, SourceReviewResult(
         decision=decision,
-        groups=tuple(groups),
-        recorded=tuple(recorded),
-        already_decided=tuple(already),
-        did_not_need_review=tuple(did_not_need),
+        stages=tuple(stages),
     )

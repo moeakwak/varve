@@ -13,7 +13,7 @@ from varve.cli.review import (
     render_bulk_source_review,
     render_source_review,
 )
-from varve.engine.review import ReviewAction, ReviewGroupResult, SourceReviewResult
+from varve.engine.review import ReviewAction, ReviewOutcome, ReviewStageResult, SourceReviewResult
 
 
 def _console(*, color: bool) -> tuple[Console, StringIO]:
@@ -34,24 +34,22 @@ def _console(*, color: bool) -> tuple[Console, StringIO]:
 def _result(
     *,
     decision: ReviewAction = "reuse",
-    target: str = "score",
     recorded: tuple[str, ...] = ("score",),
     already: tuple[str, ...] = (),
     did_not_need: tuple[str, ...] = (),
-    groups: bool = True,
+    include_stages: bool = True,
 ) -> SourceReviewResult:
-    group = ReviewGroupResult(
-        canonical_target=target,
-        recorded=recorded,
-        already_decided=already,
-        did_not_need_review=did_not_need,
-    )
+    entries: list[tuple[str, ReviewOutcome]] = []
+    entries.extend((stage, "recorded") for stage in recorded)
+    entries.extend((stage, "already-decided") for stage in already)
+    entries.extend((stage, "not-needed") for stage in did_not_need)
     return SourceReviewResult(
         decision=decision,
-        groups=(group,) if groups else (),
-        recorded=recorded,
-        already_decided=already,
-        did_not_need_review=did_not_need,
+        stages=(
+            tuple(ReviewStageResult(stage=stage, outcome=outcome) for stage, outcome in entries)
+            if include_stages
+            else ()
+        ),
     )
 
 
@@ -59,14 +57,13 @@ def test_exact_review_messages_cover_recorded_already_and_not_needed() -> None:
     console, output = _console(color=False)
     render_source_review(
         console,
-        _result(target="score", recorded=("score",), already=(), did_not_need=()),
+        _result(recorded=("score",), already=(), did_not_need=()),
     )
     render_source_review(
         console,
         _result(
             recorded=(),
             already=("score",),
-            target="score",
         ),
     )
     render_source_review(
@@ -74,7 +71,6 @@ def test_exact_review_messages_cover_recorded_already_and_not_needed() -> None:
         _result(
             recorded=(),
             did_not_need=("score",),
-            target="score",
         ),
     )
     render_source_review(
@@ -82,7 +78,6 @@ def test_exact_review_messages_cover_recorded_already_and_not_needed() -> None:
         _result(
             decision="invalidate",
             recorded=("score",),
-            target="score",
         ),
     )
 
@@ -98,7 +93,6 @@ def test_broad_review_summary_uses_natural_language_and_distinct_noops() -> None
     render_source_review(
         console,
         _result(
-            target="score",
             recorded=("score",),
             already=(),
             did_not_need=(),
@@ -118,7 +112,7 @@ def test_broad_review_summary_uses_natural_language_and_distinct_noops() -> None
     console, output = _console(color=False)
     render_source_review(
         console,
-        _result(recorded=(), groups=False),
+        _result(recorded=(), include_stages=False),
     )
     assert output.getvalue() == "No source changes require review.\n"
 
@@ -182,7 +176,7 @@ def test_bulk_review_folds_pipeline_branches_and_reports_failures() -> None:
             BulkReviewEntry(
                 "studies.exp.two",
                 "dev",
-                _result(recorded=(), groups=False),
+                _result(recorded=(), include_stages=False),
             ),
         ),
         (BulkReviewFailure("studies.exp.failed", "main", "output is locked"),),

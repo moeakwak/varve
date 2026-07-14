@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from rich.console import Console
 from rich.text import Text
 
-from varve.engine.review import ReviewAction, ReviewGroupResult, SourceReviewResult
+from varve.engine.review import ReviewAction, ReviewStageResult, SourceReviewResult
 
 
 @dataclass(frozen=True)
@@ -47,33 +47,24 @@ def _plural(value: int, singular: str, plural: str | None = None) -> str:
     return singular if value == 1 else plural or f"{singular}s"
 
 
-def _group_line(group: ReviewGroupResult, decision: ReviewAction) -> Text:
+def _group_line(stage: ReviewStageResult, decision: ReviewAction) -> Text:
     _, past = _words(decision)
     line = Text()
-    line.append(group.canonical_target, style="varve.review.stage")
+    line.append(stage.stage, style="varve.review.stage")
     line.append(": ")
-    if group.recorded:
+    if stage.outcome == "recorded":
         _append_count(
             line,
-            len(group.recorded),
-            _plural(len(group.recorded), "decision recorded", "decisions recorded"),
+            1,
+            "decision recorded",
             decision,
         )
-    if group.already_decided:
-        if group.recorded:
-            line.append(", ")
-        line.append(str(len(group.already_decided)), style=_action_style(decision, "already"))
+    elif stage.outcome == "already-decided":
+        line.append("1", style=_action_style(decision, "already"))
         line.append(f" already {past}", style=_action_style(decision, "already"))
-    if group.did_not_need_review:
-        if group.recorded or group.already_decided:
-            line.append("; ")
+    else:
         line.append(
-            f"{len(group.did_not_need_review)} "
-            + _plural(
-                len(group.did_not_need_review),
-                "stage did not need review",
-                "stages did not need review",
-            ),
+            "1 stage did not need review",
             style="varve.review.noop",
         )
     line.append(".")
@@ -103,8 +94,8 @@ def render_source_review(console: Console, result: SourceReviewResult) -> None:
         style=_action_style(result.decision, "heading"),
     )
     console.print()
-    for group in result.groups:
-        console.print(_group_line(group, result.decision))
+    for stage in result.stages:
+        console.print(_group_line(stage, result.decision))
     console.print()
     if result.recorded:
         total = Text("Recorded ", style="varve.review.total")

@@ -99,6 +99,7 @@ def _stage_status(
         execution_status=execution,
         execution_reason="hit" if status == "needs-review" else (reason or status),
         source_relationship=relationship,
+        source_decision="none",
         duration=1.25,
         committed_at=None,
         decision_key=None,
@@ -242,10 +243,7 @@ def test_top_level_review_forwards_repeatable_base_stage_targets(
         captured.append((context.pipeline, decision, targets))
         return SourceReviewResult(
             decision=decision,
-            groups=(),
-            recorded=(),
-            already_decided=(),
-            did_not_need_review=(),
+            stages=(),
         )
 
     monkeypatch.setattr("varve.cli.commands.execute_review", fake_review)
@@ -728,10 +726,7 @@ def test_bulk_review_continues_after_entry_failure_and_uses_default_args(
     monkeypatch.setattr(commands, "_KeyingSession", Session)
     result = SourceReviewResult(
         decision="reuse",
-        groups=(),
-        recorded=(),
-        already_decided=(),
-        did_not_need_review=(),
+        stages=(),
     )
     backend_sessions = []
 

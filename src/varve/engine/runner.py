@@ -124,12 +124,9 @@ class _KeyingSession:
     def discard_success(self, store: Store, stage: str) -> None:
         self.records.pop((store.root, stage), None)
 
-    def review_stage_name(self, stage_spec) -> str:
-        return stage_spec.base_name or stage_spec.name
-
     def read_review(self, store: Store, stage_spec) -> ReviewRecord | None:
         stage = (
-            self.review_stage_name(stage_spec) if not isinstance(stage_spec, str) else stage_spec
+            stage_spec if isinstance(stage_spec, str) else stage_spec.base_name or stage_spec.name
         )
         key = (store.root, stage)
         cached = self.reviews.get(key, _RECORD_UNOBSERVED)
@@ -381,43 +378,34 @@ def _current_artifacts(
     return artifacts_root_fingerprint(current, positions=positions)
 
 
-def _review_baseline(
+def _review_state(
     runtime: _Runtime,
     stage_spec,
-    previous: SuccessRecord | None,
     current: SourceObservation,
-    *,
-    current_key: str | None = None,
-    partial: dict[int, BatchRecord] | None = None,
-) -> tuple[str | None, SourceReviewState]:
-    """Return (baseline_kind, source_review) using current-key partial first."""
-
-    attempt = runtime.store.read_attempt(stage_spec.name)
-    failure = runtime.store.read_failure(stage_spec.name)
-    if partial and current_key is not None:
-        provenance = attempt if attempt is not None and attempt.input_key == current_key else None
-        if provenance is None and failure is not None and failure.input_key == current_key:
-            provenance_review = failure.review_source_fingerprint
-        elif provenance is not None:
-            provenance_review = provenance.review_source_fingerprint
-        else:
-            provenance_review = None
-        if provenance_review is not None:
-            if provenance_review == current.review.fingerprint:
-                return "partial", SourceReviewState("current")
-            review = runtime.keying.read_review(runtime.store, stage_spec)
-            if review is None or review.review_fingerprint != current.review.fingerprint:
-                return "partial", SourceReviewState("changed")
-            return "partial", SourceReviewState("changed", review.decision)
-    if previous is None:
-        return None, SourceReviewState("not-applicable")
-    if previous.executed_source.review.fingerprint == current.review.fingerprint:
-        return "success", SourceReviewState("current")
-    # Only open Review when the old materialization would otherwise remain reusable.
+    baseline: str | None,
+) -> SourceReviewState:
+    if baseline is None:
+        return SourceReviewState("not-applicable")
+    if baseline == current.review.fingerprint:
+        return SourceReviewState("current")
     review = runtime.keying.read_review(runtime.store, stage_spec)
     if review is None or review.review_fingerprint != current.review.fingerprint:
-        return "success", SourceReviewState("changed")
-    return "success", SourceReviewState("changed", review.decision)
+        return SourceReviewState("changed")
+    return SourceReviewState("changed", review.decision)
+
+
+def _partial_review_fingerprint(
+    runtime: _Runtime,
+    stage_name: str,
+    current_key: str,
+) -> str | None:
+    attempt = runtime.store.read_attempt(stage_name)
+    if attempt is not None and attempt.input_key == current_key:
+        return attempt.review_source_fingerprint
+    failure = runtime.store.read_failure(stage_name)
+    if failure is not None and failure.input_key == current_key:
+        return failure.review_source_fingerprint
+    return None
 
 
 def _source_review(
@@ -429,15 +417,14 @@ def _source_review(
     current_key: str | None = None,
     partial: dict[int, BatchRecord] | None = None,
 ) -> SourceReviewState:
-    _, state = _review_baseline(
-        runtime,
-        stage_spec,
-        previous,
-        current,
-        current_key=current_key,
-        partial=partial,
+    baseline = (
+        _partial_review_fingerprint(runtime, stage_spec.name, current_key)
+        if partial and current_key is not None
+        else None
     )
-    return state
+    if baseline is None and previous is not None:
+        baseline = previous.executed_source.review.fingerprint
+    return _review_state(runtime, stage_spec, current, baseline)
 
 
 def selected_stages(
@@ -613,37 +600,27 @@ def _resolve_source_review(
 ) -> SourceReviewState:
     """Apply current-key partial first, then success baseline for reusable hits only."""
 
-    attempt = runtime.store.read_attempt(stage_spec.name)
-    failure = runtime.store.read_failure(stage_spec.name)
     if partial:
-        provenance_review: str | None = None
-        if attempt is not None and attempt.input_key == decision_key:
-            provenance_review = attempt.review_source_fingerprint
-        elif failure is not None and failure.input_key == decision_key:
-            provenance_review = failure.review_source_fingerprint
-        if provenance_review is not None:
-            if provenance_review == source_observation.review.fingerprint:
-                return SourceReviewState("current")
-            review = runtime.keying.read_review(runtime.store, stage_spec)
-            if review is None or review.review_fingerprint != source_observation.review.fingerprint:
-                return SourceReviewState("changed")
-            return SourceReviewState("changed", review.decision)
+        baseline = _partial_review_fingerprint(runtime, stage_spec.name, decision_key)
+        if baseline is not None:
+            return _review_state(runtime, stage_spec, source_observation, baseline)
 
-    if previous is None:
-        return SourceReviewState("not-applicable")
-    if previous.executed_source.review.fingerprint == source_observation.review.fingerprint:
+    if (
+        previous is not None
+        and previous.executed_source.review.fingerprint == source_observation.review.fingerprint
+    ):
         return SourceReviewState("current")
     otherwise_reusable = (
-        previous.input_key == decision_key
+        previous is not None
+        and previous.input_key == decision_key
         and artifacts_match
         and decision.status in {"hit", "failed", "resume"}
     )
-    if not otherwise_reusable:
-        return SourceReviewState("not-applicable")
-    review = runtime.keying.read_review(runtime.store, stage_spec)
-    if review is None or review.review_fingerprint != source_observation.review.fingerprint:
-        return SourceReviewState("changed")
-    return SourceReviewState("changed", review.decision)
+    baseline = None
+    if otherwise_reusable:
+        assert previous is not None
+        baseline = previous.executed_source.review.fingerprint
+    return _review_state(runtime, stage_spec, source_observation, baseline)
 
 
 def _stage_decision(
@@ -1376,24 +1353,17 @@ def record_source_review(
             raise ValueError(f"Cannot evaluate source review: {details}")
         candidates = tuple(
             ReviewCandidate(
-                stage=probe.stage,
                 base_stage=graph.stages[probe.stage].base_name or probe.stage,
                 review_observation=probe.source_observation.review,
                 source_review=probe.source_review,
             )
             for probe in probes
         )
-        existing = {
-            base: record
-            for base in graph.base_cells
-            if (record := keying.read_review(store, base)) is not None
-        }
         writes, result = plan_source_review(
             graph,
             targets,
             candidates,
             decision,
-            existing=existing,
         )
         apply_review_writes(store, writes, _now())
         return result
