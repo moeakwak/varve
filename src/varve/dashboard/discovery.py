@@ -87,36 +87,23 @@ def filter_entries(
     )
 
 
-def _relative_parts(root: Path, output_root: Path) -> tuple[str, ...]:
-    try:
-        relative = output_root.relative_to(root)
-    except ValueError:
-        relative = output_root
-    return relative.parts
-
-
 def _branch_output_id(root: Path, output_root: Path) -> tuple[str, str] | None:
-    parts = _relative_parts(root, output_root)
-    if len(parts) >= 3 and parts[-3] == "out" and parts[-2] == ".tmp":
-        pipeline_parts = parts[:-3]
-        pipeline_id = (
-            ".".join(pipeline_parts) if pipeline_parts else output_root.parent.parent.parent.name
-        )
-        return pipeline_id, parts[-1]
     if output_root.parent.name == ".tmp" and output_root.parent.parent.name == "out":
-        return output_root.parent.parent.parent.name, output_root.name
-    if len(parts) >= 2 and parts[-2] == "out":
-        pipeline_parts = parts[:-2]
-        pipeline_id = ".".join(pipeline_parts) if pipeline_parts else output_root.parent.parent.name
-        return pipeline_id, parts[-1]
-    if output_root.parent.name == "out":
-        return output_root.parent.parent.name, output_root.name
-    return None
+        pipeline_root = output_root.parent.parent.parent
+    elif output_root.parent.name == "out":
+        pipeline_root = output_root.parent.parent
+    else:
+        return None
+    try:
+        relative = pipeline_root.relative_to(root)
+    except ValueError:
+        relative = Path(pipeline_root.name)
+    pipeline_id = ".".join(relative.parts) if relative.parts else pipeline_root.name
+    return pipeline_id, output_root.name
 
 
 def _is_temporary_output_root(output_root: Path) -> bool:
-    parts = output_root.resolve().parts
-    return any(left == "out" and right == ".tmp" for left, right in zip(parts, parts[1:]))
+    return output_root.parent.name == ".tmp" and output_root.parent.parent.name == "out"
 
 
 def _read_manifest(manifest_path: Path) -> tuple[Manifest | None, str | None]:

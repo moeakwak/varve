@@ -5,52 +5,44 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
-
-from pydantic import BaseModel
 
 from varve.cli import argmap
+from varve.cli.clean import default_confirm
+from varve.cli.commands import dispatch_command
 from varve.dashboard.commands import (
     bulk_review_command,
     bulk_run_command,
-    clean_command,
     overview_command,
     plan_command,
     render_structure_command,
-    review_command,
-    run_command,
-    status_command,
 )
 from varve.dashboard.discovery import discover_pipelines
 from varve.dashboard.models import PipelineEntry
-from varve.dashboard.state import import_entry_pipeline, resolve_module_entry
+from varve.dashboard.state import import_entry_pipeline, resolve_entry_context, resolve_module_entry
+from varve.log import configure_cli_logging
 from varve.pipeline import Pipeline
 
 _DYNAMIC_COMMANDS = {"run", "status", "clean", "accept", "reject"}
-_SELECTOR_HELP = (
-    "Base selects all active cells; omitted axes are wildcards; full coordinates select one cell."
-)
 
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     if not raw_argv:
         raw_argv = ["ls"]
-    if raw_argv == ["--help"] or raw_argv == ["-h"]:
-        parser, _ = _parser()
+    if raw_argv in (["--help"], ["-h"]):
+        parser = _parser()
         parser.parse_args(raw_argv)
         raise AssertionError("argparse did not exit after help")
-
-    preliminary, _ = _parser(add_help=False)
+    preliminary = _parser(add_help=False)
     try:
         first, _unknown = preliminary.parse_known_args(raw_argv)
     except SystemExit:
-        parser, _ = _parser()
+        parser = _parser()
         parser.parse_args(raw_argv)
         raise AssertionError("argparse did not exit")
 
     if any(token.split("=", 1)[0] in {"--out", "--override", "--slice"} for token in raw_argv):
-        parser, _ = _parser()
+        parser = _parser()
         parser.parse_args(raw_argv)
         raise AssertionError("argparse accepted an identity-changing option")
 
@@ -59,27 +51,25 @@ def main(argv: list[str] | None = None) -> int:
     entries: list[PipelineEntry] = []
     scope = first
     module: str | None = None
-    wants_all = False
     if first.command in _DYNAMIC_COMMANDS:
         target = raw_argv[1] if len(raw_argv) > 1 else None
         if target in {"-h", "--help"}:
-            parser, _ = _parser()
+            parser = _parser()
             parser.parse_args(raw_argv)
             raise AssertionError("argparse did not exit after help")
         if target == "--all" and first.command in {"run", "accept", "reject"}:
-            wants_all = True
-            scope, _ = _dynamic_scope(first.command, raw_argv[1:])
+            scope = _dynamic_scope(first.command, raw_argv[1:])
         else:
             if target is None or target.startswith("-"):
                 _missing_target_error(first.command)
             module = target
             if first.command in {"run", "accept", "reject"} and "--all" in raw_argv[2:]:
-                parser, _ = _parser()
+                parser = _parser()
                 parser.error(f"varve {first.command} requires exactly one of MODULE or --all")
-            scope, _ = _dynamic_scope(first.command, raw_argv[2:])
+            scope = _dynamic_scope(first.command, raw_argv[2:])
             entries = discover_pipelines(scope.root, include_temporary=scope.include_temp)
 
-    if first.command in _DYNAMIC_COMMANDS and module is not None and not wants_all:
+    if module is not None:
         try:
             entry = resolve_module_entry(entries, module, branch=scope.branch or "main")
             pipeline = import_entry_pipeline(entry)
@@ -87,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
             print(str(error), file=sys.stderr)
             return 1
 
-    parser, _ = _parser(pipeline=pipeline, dynamic_command=first.command)
+    parser = _parser(pipeline=pipeline, dynamic_command=first.command)
     namespace = parser.parse_args(raw_argv)
     _validate_surface(parser, namespace)
     if module is not None and namespace.module != module:
@@ -113,21 +103,15 @@ def main(argv: list[str] | None = None) -> int:
         all_targets = getattr(namespace, "all", False)
         assert namespace.module is not None or all_targets
         if all_targets:
+            scope_kwargs = {
+                "root": namespace.root,
+                "prefix": namespace.prefix,
+                "branch": namespace.branch,
+                "include_temp": namespace.include_temp,
+            }
             if namespace.command == "run":
-                return bulk_run_command(
-                    namespace.root,
-                    prefix=namespace.prefix,
-                    branch=namespace.branch,
-                    include_temp=namespace.include_temp,
-                    rehash=namespace.rehash,
-                )
-            return bulk_review_command(
-                namespace.root,
-                prefix=namespace.prefix,
-                branch=namespace.branch,
-                include_temp=namespace.include_temp,
-                decision=namespace.command,
-            )
+                return bulk_run_command(**scope_kwargs, rehash=namespace.rehash)
+            return bulk_review_command(**scope_kwargs, decision=namespace.command)
 
         if entry is None or pipeline is None:
             assert namespace.module is not None
@@ -149,47 +133,16 @@ def main(argv: list[str] | None = None) -> int:
                 downstream=namespace.downstream,
                 only=namespace.only,
             )
-        pipeline_args = _pipeline_args(pipeline, namespace)
-        if namespace.command == "status":
-            return status_command(
-                entry,
-                pipeline,
-                pipeline_args,
-                selector=namespace.stage,
-                expand=namespace.expand,
-                rehash=namespace.rehash,
-            )
+        pipeline_args = argmap.model_from_namespace(namespace, pipeline.Args)
+        context = resolve_entry_context(entry, pipeline, pipeline_args)
         if namespace.command == "run":
-            display_mode = (
-                "expand" if namespace.expand else "compact" if namespace.compact else "auto"
-            )
-            return run_command(
-                entry,
-                pipeline,
-                pipeline_args,
-                upto=namespace.upto,
-                downstream=namespace.downstream,
-                only=namespace.only,
-                force=namespace.force,
-                rehash=namespace.rehash,
-                display_mode=display_mode,
-            )
-        if namespace.command in {"accept", "reject"}:
-            return review_command(
-                entry,
-                pipeline,
-                pipeline_args,
-                decision=namespace.command,
-            )
-        if namespace.command == "clean":
-            return clean_command(
-                entry,
-                pipeline,
-                pipeline_args,
-                downstream=namespace.downstream,
-                yes=namespace.yes,
-                confirm=_default_confirm,
-            )
+            configure_cli_logging()
+        return dispatch_command(
+            context,
+            namespace,
+            confirm=default_confirm,
+            target_module=entry.module,
+        )
     except Exception as error:  # noqa: BLE001 - CLI reports backend diagnostics as exit 1.
         print(str(error), file=sys.stderr)
         return 1
@@ -201,7 +154,7 @@ def _parser(
     add_help: bool = True,
     pipeline: type[Pipeline] | None = None,
     dynamic_command: str | None = None,
-) -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="varve", add_help=add_help)
     subparsers = parser.add_subparsers(dest="command", required=True)
     commands: dict[str, argparse.ArgumentParser] = {}
@@ -213,11 +166,11 @@ def _parser(
 
     ls_parser = command("ls", "show exact pipeline overview or one pipeline structure")
     ls_parser.add_argument("module", nargs="?", metavar="MODULE")
-    _add_root(ls_parser)
+    ls_parser.add_argument("--root", type=Path, default=Path.cwd())
     ls_parser.add_argument("--prefix", metavar="MODULE_PREFIX")
     ls_parser.add_argument("--branch", metavar="NAME")
-    _add_include_temp(ls_parser)
-    _add_rehash(ls_parser)
+    ls_parser.add_argument("--include-temp", action="store_true")
+    ls_parser.add_argument("--rehash", action="store_true")
     ls_parser.add_argument(
         "--status",
         action="append",
@@ -226,85 +179,79 @@ def _parser(
         metavar="STATUS",
     )
 
-    status_parser = command("status", "show exact status for one pipeline store")
-    status_parser.usage = "varve status MODULE [OPTIONS]"
-    status_parser.add_argument("module", nargs="?", metavar="MODULE")
-    _add_single_target_options(status_parser)
-    status_parser.add_argument("--stage", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
-    status_parser.add_argument("--expand", action="store_true")
-    _add_rehash(status_parser)
-
-    run_parser = command("run", "run one pipeline store or every filtered store")
-    run_parser.usage = "varve run (MODULE [OPTIONS] | --all [OPTIONS])"
-    _add_bulk_target(run_parser)
-    run_selection = run_parser.add_mutually_exclusive_group()
-    run_selection.add_argument("--upto", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
-    run_selection.add_argument("--downstream", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
-    run_selection.add_argument("--only", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
-    run_parser.add_argument("--force", "-f", action="store_true")
-    _add_rehash(run_parser)
-    run_display = run_parser.add_mutually_exclusive_group()
-    run_display.add_argument("--expand", action="store_true")
-    run_display.add_argument("--compact", action="store_true")
-
-    for name in ("accept", "reject"):
-        review_parser = command(name, f"{name} source changes for one or all pipeline stores")
-        review_parser.usage = f"varve {name} (MODULE [OPTIONS] | --all [OPTIONS])"
-        _add_bulk_target(review_parser)
+    dynamic_help = {
+        "status": "show exact status for one pipeline store",
+        "run": "run one pipeline store or every filtered store",
+    }
+    for name in ("status", "run", "accept", "reject"):
+        help_text = dynamic_help.get(name, f"{name} source changes for one or all pipeline stores")
+        dynamic = command(name, help_text)
+        target = "MODULE [OPTIONS]" if name == "status" else "(MODULE [OPTIONS] | --all [OPTIONS])"
+        dynamic.usage = f"varve {name} {target}"
+        _add_dynamic_options(dynamic, name, positional=True, help_text=argmap.STAGE_SELECTOR_HELP)
 
     plan_parser = command("plan", "print selected stage order for one pipeline store")
     plan_parser.add_argument("module", nargs="?", metavar="MODULE")
     _add_single_target_options(plan_parser)
-    plan_selection = plan_parser.add_mutually_exclusive_group()
-    plan_selection.add_argument("--upto", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
-    plan_selection.add_argument("--downstream", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
-    plan_selection.add_argument("--only", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
+    argmap.add_stage_selection(plan_parser, argmap.STAGE_SELECTOR_HELP)
 
     clean_parser = command("clean", "clean one pipeline store")
     clean_parser.usage = "varve clean MODULE [OPTIONS]"
-    clean_parser.add_argument("module", nargs="?", metavar="MODULE")
-    _add_single_target_options(clean_parser)
-    clean_parser.add_argument("--downstream", metavar="STAGE_SELECTOR", help=_SELECTOR_HELP)
-    clean_parser.add_argument("--yes", "-y", action="store_true")
+    _add_dynamic_options(
+        clean_parser,
+        "clean",
+        positional=True,
+        help_text=argmap.STAGE_SELECTOR_HELP,
+    )
 
     if pipeline is not None and dynamic_command in _DYNAMIC_COMMANDS:
         argmap.register_args(commands[dynamic_command], pipeline.Args)
-    return parser, commands
+    return parser
 
 
 def _dynamic_scope(
     command: str,
     argv: list[str],
-) -> tuple[argparse.Namespace, list[str]]:
+) -> argparse.Namespace:
     """Parse discovery and static options without assigning a positional MODULE."""
 
     parser = argparse.ArgumentParser(add_help=False)
-    _add_single_target_options(parser)
+    _add_dynamic_options(parser, command, positional=False)
+    return parser.parse_known_args(argv)[0]
+
+
+def _add_dynamic_options(
+    parser: argparse.ArgumentParser,
+    command: str,
+    *,
+    positional: bool,
+    help_text: str | None = None,
+) -> None:
+    if positional:
+        parser.add_argument("module", nargs="?", metavar="MODULE")
     if command in {"run", "accept", "reject"}:
         parser.add_argument("--all", action="store_true")
+    _add_single_target_options(parser)
+    if command in {"run", "accept", "reject"}:
         parser.add_argument("--prefix", metavar="MODULE_PREFIX")
     if command == "run":
-        selection = parser.add_mutually_exclusive_group()
-        selection.add_argument("--upto", metavar="STAGE_SELECTOR")
-        selection.add_argument("--downstream", metavar="STAGE_SELECTOR")
-        selection.add_argument("--only", metavar="STAGE_SELECTOR")
+        argmap.add_stage_selection(parser, help_text)
         parser.add_argument("--force", "-f", action="store_true")
-        _add_rehash(parser)
+        parser.add_argument("--rehash", action="store_true")
         display = parser.add_mutually_exclusive_group()
         display.add_argument("--expand", action="store_true")
         display.add_argument("--compact", action="store_true")
     elif command == "status":
-        parser.add_argument("--stage", metavar="STAGE_SELECTOR")
+        parser.add_argument("--stage", metavar="STAGE_SELECTOR", help=help_text)
         parser.add_argument("--expand", action="store_true")
-        _add_rehash(parser)
+        parser.add_argument("--rehash", action="store_true")
     elif command == "clean":
-        parser.add_argument("--downstream", metavar="STAGE_SELECTOR")
+        parser.add_argument("--downstream", metavar="STAGE_SELECTOR", help=help_text)
         parser.add_argument("--yes", "-y", action="store_true")
-    return parser.parse_known_args(argv)
 
 
 def _missing_target_error(command: str) -> None:
-    parser, _ = _parser()
+    parser = _parser()
     if command == "status":
         parser.error("varve status requires MODULE; use 'varve ls' for the overview")
     if command == "clean":
@@ -312,29 +259,10 @@ def _missing_target_error(command: str) -> None:
     parser.error(f"varve {command} requires exactly one of MODULE or --all")
 
 
-def _add_root(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--root", type=Path, default=Path.cwd())
-
-
-def _add_include_temp(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--include-temp", action="store_true")
-
-
-def _add_rehash(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--rehash", action="store_true")
-
-
 def _add_single_target_options(parser: argparse.ArgumentParser) -> None:
-    _add_root(parser)
+    parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--branch", metavar="NAME")
-    _add_include_temp(parser)
-
-
-def _add_bulk_target(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("module", nargs="?", metavar="MODULE")
-    parser.add_argument("--all", action="store_true")
-    _add_single_target_options(parser)
-    parser.add_argument("--prefix", metavar="MODULE_PREFIX")
+    parser.add_argument("--include-temp", action="store_true")
 
 
 def _validate_surface(parser: argparse.ArgumentParser, namespace: argparse.Namespace) -> None:
@@ -346,10 +274,8 @@ def _validate_surface(parser: argparse.ArgumentParser, namespace: argparse.Names
             parser.error(f"varve {command} requires exactly one of MODULE or --all")
         if module is not None and namespace.prefix is not None:
             parser.error("--prefix is only available with --all")
-    if command in {"status", "plan", "clean"} and module is None:
-        if command == "status":
-            parser.error("varve status requires MODULE; use 'varve ls' for the overview")
-        parser.error(f"varve {command} requires MODULE")
+    if command == "plan" and module is None:
+        parser.error("varve plan requires MODULE")
     if command == "ls" and module is not None:
         if namespace.prefix is not None or namespace.branch is not None or namespace.status:
             parser.error("varve ls MODULE accepts only --root and --include-temp")
@@ -360,16 +286,3 @@ def _validate_surface(parser: argparse.ArgumentParser, namespace: argparse.Names
             parser.error("varve run --all does not accept stage selection")
         if namespace.force or namespace.expand or namespace.compact:
             parser.error("varve run --all does not accept --force or display selection")
-
-
-def _pipeline_args(pipeline: type[Pipeline], namespace: argparse.Namespace) -> BaseModel:
-    values: dict[str, Any] = argmap.collect_cli_args_namespace(namespace, pipeline.Args)
-    return pipeline.Args.model_validate(values)
-
-
-def _default_confirm(message: str) -> bool:
-    try:
-        answer = input(f"{message} [y/N] ").strip().lower()
-    except EOFError:
-        return False
-    return answer in {"y", "yes"}

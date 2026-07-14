@@ -45,9 +45,6 @@ def _result(
 ) -> SourceReviewResult:
     group = ReviewGroupResult(
         canonical_target=target,
-        base_stage="score",
-        matched_cells=matched,
-        source_changed_cells=changed,
         recorded=recorded,
         already_decided=already,
         did_not_need_review=did_not_need,

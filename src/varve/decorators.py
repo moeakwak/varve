@@ -46,25 +46,41 @@ class StageSpec:
         return replace(self, needs=needs, need_cells=need_cells)
 
 
-def _need_name(need: NeedItem) -> str:
-    if isinstance(need, str):
-        return need
-    return need.__name__
-
-
 def _normalize_needs(
     needs: NeedItem | list[NeedItem] | tuple[NeedItem, ...] | None,
 ) -> tuple[str, ...]:
     if needs is None:
         return ()
     if isinstance(needs, str) or callable(needs):
-        return (_need_name(needs),)
-    return tuple(_need_name(need) for need in needs)
+        needs = (needs,)
+    return tuple(need if isinstance(need, str) else need.__name__ for need in needs)
 
 
 def _attach_stage_spec(func: Callable[..., Any], spec: StageSpec) -> Callable[..., Any]:
     setattr(func, "__varve_stage__", spec)
     return func
+
+
+def _stage_decorator(
+    kind: StageKind,
+    needs: NeedItem | list[NeedItem] | tuple[NeedItem, ...] | None,
+    produces: ProducesSpec,
+    depends: Dependencies | None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+        return _attach_stage_spec(
+            func,
+            StageSpec(
+                name=func.__name__,
+                kind=kind,
+                func=func,
+                needs=_normalize_needs(needs),
+                produces=produces,
+                depends=depends if depends is not None else Dependencies(),
+            ),
+        )
+
+    return decorate
 
 
 def stage(
@@ -79,18 +95,7 @@ def stage(
     class body.
     """
 
-    def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
-        spec = StageSpec(
-            name=func.__name__,
-            kind="single",
-            func=func,
-            needs=_normalize_needs(needs),
-            produces=produces,
-            depends=depends if depends is not None else Dependencies(),
-        )
-        return _attach_stage_spec(func, spec)
-
-    return decorate
+    return _stage_decorator("single", needs, produces, depends)
 
 
 def batch_stage(
@@ -111,18 +116,7 @@ def batch_stage(
             "paths each batch yields, not from a static produces declaration."
         )
 
-    def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
-        spec = StageSpec(
-            name=func.__name__,
-            kind="batch",
-            func=func,
-            needs=_normalize_needs(needs),
-            produces=produces,
-            depends=depends if depends is not None else Dependencies(),
-        )
-        return _attach_stage_spec(func, spec)
-
-    return decorate
+    return _stage_decorator("batch", needs, None, depends)
 
 
 def matrix(*axes: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:

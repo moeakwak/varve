@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import re
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from difflib import get_close_matches
 from enum import Enum
@@ -204,6 +204,23 @@ class PipelineGraph:
         selected = {stage for selector in resolved for stage in selector.concrete_stages}
         return tuple(name for name in self.topo_order() if name in selected)
 
+    def closure(self, seeds: Iterable[str], *, downstream: bool = False) -> set[str]:
+        if downstream:
+            edges = {name: set() for name in self.stages}
+            for name, spec in self.stages.items():
+                for upstream in spec.needs:
+                    edges[upstream].add(name)
+        else:
+            edges = {name: set(spec.needs) for name, spec in self.stages.items()}
+        seen: set[str] = set()
+        stack = list(seeds)
+        while stack:
+            item = stack.pop()
+            if item not in seen:
+                seen.add(item)
+                stack.extend(edges[item])
+        return seen
+
     def selected(
         self,
         *,
@@ -214,28 +231,14 @@ class PipelineGraph:
     ) -> set[str]:
         if sum(item is not None for item in (upto, downstream, only)) > 1:
             raise ValueError("only, upto, and downstream are mutually exclusive")
-        ancestors = {name: set(spec.needs) for name, spec in self.stages.items()}
-        descendants = {name: set() for name in self.stages}
-        for name, spec in self.stages.items():
-            for upstream in spec.needs:
-                descendants[upstream].add(name)
-
-        def closure(seeds: Sequence[str], edges: Mapping[str, set[str]]) -> set[str]:
-            seen: set[str] = set()
-            stack = list(seeds)
-            while stack:
-                item = stack.pop()
-                if item not in seen:
-                    seen.add(item)
-                    stack.extend(edges[item])
-            return seen
-
         if only is not None:
             selected = set(self.resolve_selector(only).concrete_stages)
         elif downstream is not None:
-            selected = closure(self.resolve_selector(downstream).concrete_stages, descendants)
+            selected = self.closure(
+                self.resolve_selector(downstream).concrete_stages, downstream=True
+            )
         elif upto is not None:
-            selected = closure(self.resolve_selector(upto).concrete_stages, ancestors)
+            selected = self.closure(self.resolve_selector(upto).concrete_stages)
         else:
             selected = set(self.stages)
         if not slices:
@@ -255,7 +258,7 @@ class PipelineGraph:
                 axis in coordinates and coordinates[axis] in ids for axis, ids in wanted.items()
             ):
                 seeds.append(name)
-        return closure(seeds, ancestors)
+        return self.closure(seeds)
 
 
 def cell_output_path(output_root: Path, spec: StageSpec) -> Path:
@@ -275,8 +278,7 @@ def pipeline_axes(pipeline: type[Any]) -> dict[str, Axis]:
     by_name: dict[str, Axis] = {}
     for spec in pipeline.stages().values():
         for axis in spec.matrix:
-            previous = by_name.get(axis.name)
-            if previous is not None and previous is not axis:
+            if by_name.get(axis.name, axis) is not axis:
                 raise ValueError(
                     f"Duplicate matrix axis name {axis.name!r} refers to different Axis objects"
                 )
@@ -307,13 +309,6 @@ def normalize_axes(
     return result
 
 
-def _cell_name(spec: StageSpec, cell: tuple[tuple[Axis, Any], ...]) -> str:
-    if not cell:
-        return spec.name
-    coordinates = ",".join(f"{axis.name}={axis.id_of(value)}" for axis, value in cell)
-    return f"{spec.name}@{coordinates}"
-
-
 def build_graph(
     pipeline: type[Any], axes: Mapping[str, Sequence[str]] | None = None
 ) -> PipelineGraph:
@@ -340,9 +335,9 @@ def build_graph(
         expanded[base_name] = []
         for coordinate_values in cells:
             cell = tuple(zip(template.matrix, coordinate_values, strict=True))
-            expanded[base_name].append(
-                template.expanded(name=_cell_name(template, cell), cell=cell)
-            )
+            coordinates = ",".join(f"{axis.name}={axis.id_of(value)}" for axis, value in cell)
+            name = f"{template.name}@{coordinates}" if cell else template.name
+            expanded[base_name].append(template.expanded(name=name, cell=cell))
 
     concrete: dict[str, StageSpec] = {}
     base_cells: dict[str, tuple[str, ...]] = {}

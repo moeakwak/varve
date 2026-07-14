@@ -13,8 +13,6 @@ from varve.style import format_elapsed, status_text
 def render_run_outcomes(
     console: Console,
     outcomes: list[StageOutcome],
-    *,
-    elapsed: bool,
 ) -> None:
     """Render the same outcome table for generated and top-level runs."""
 
@@ -27,8 +25,7 @@ def render_run_outcomes(
     if has_groups:
         table.add_column("CELLS", justify="right")
         table.add_column("RAN", justify="right")
-    if elapsed:
-        table.add_column("ELAPSED", justify="right")
+    table.add_column("ELAPSED", justify="right")
     for outcome in rows:
         if outcome.grouped:
             status = Text()
@@ -46,7 +43,6 @@ def render_run_outcomes(
                 if outcome.grouped
                 else ["-", str(outcome.ran)]
             )
-        if elapsed:
-            row.append(format_elapsed(outcome.elapsed, missing="-"))
+        row.append(format_elapsed(outcome.elapsed, missing="-"))
         table.add_row(*row)
     console.print(table)

@@ -246,7 +246,7 @@ def test_cli_command_args_do_not_pollute_conflicting_args_fields(
         captured.append(kwargs["args"])
         return []
 
-    monkeypatch.setattr("varve.cli.app.run", fake_run)
+    monkeypatch.setattr("varve.cli.commands.run", fake_run)
     assert ConflictingCliPipeline.cli(["run", "--upto", "sample", f"--out={out}", "--force"]) == 0
     assert captured[-1] == ConflictingCliArgs()
 
@@ -269,7 +269,7 @@ def test_cli_accepts_negative_config_values(
         captured.append(kwargs["args"])
         return []
 
-    monkeypatch.setattr("varve.cli.app.run", fake_run)
+    monkeypatch.setattr("varve.cli.commands.run", fake_run)
     assert CliPipeline.cli(["run", f"--out={tmp_path}", "--threshold", "-1"]) == 0
 
     assert captured[-1].threshold == -1
@@ -285,7 +285,7 @@ def test_cli_passes_out_as_builtin_runner_argument(
         captured.append((config, kwargs))
         return []
 
-    monkeypatch.setattr("varve.cli.app.run", fake_run)
+    monkeypatch.setattr("varve.cli.commands.run", fake_run)
     assert CliPipeline.cli(["run", f"--out={tmp_path}"]) == 0
 
     config, kwargs = captured[-1]
@@ -308,7 +308,7 @@ def test_cli_run_passes_matrix_display_mode(
         captured.append(kwargs)
         return []
 
-    monkeypatch.setattr("varve.cli.app.run", fake_run)
+    monkeypatch.setattr("varve.cli.commands.run", fake_run)
 
     assert CliPipeline.cli(["run", f"--out={tmp_path}", flag]) == 0
     assert captured[0]["display_mode"] == expected
@@ -359,7 +359,7 @@ def test_cli_end_to_end_equivalence_with_nested_config(
         captured.append(kwargs["args"])
         return []
 
-    monkeypatch.setattr("varve.cli.app.run", fake_run)
+    monkeypatch.setattr("varve.cli.commands.run", fake_run)
 
     out = tmp_path / "out"
     assert (
@@ -408,7 +408,7 @@ def test_cli_priority_cli_gt_env_gt_dotenv_gt_yaml_gt_default(
         captured.append((config, kwargs["args"]))
         return []
 
-    monkeypatch.setattr("varve.cli.app.run", fake_run)
+    monkeypatch.setattr("varve.cli.commands.run", fake_run)
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
         "TOKEN=from-dotenv\n",
@@ -486,7 +486,7 @@ def _capture_run(monkeypatch: pytest.MonkeyPatch) -> list[tuple[BaseModel, Any, 
         captured.append((config, kwargs["args"], kwargs))
         return []
 
-    monkeypatch.setattr("varve.cli.app.run", fake_run)
+    monkeypatch.setattr("varve.cli.commands.run", fake_run)
     return captured
 
 

@@ -74,25 +74,12 @@ def render_bulk_run(
         return
     console.print("Run incomplete")
 
-    reviews = [
-        (state, stage)
-        for state in incomplete
-        for stage in state.stages
-        if stage.status == "needs-review"
-    ]
-    failures = [
-        (state, stage) for state in incomplete for stage in state.stages if stage.status == "failed"
-    ]
+    stage_states = [(state, stage) for state in incomplete for stage in state.stages]
+    reviews = [item for item in stage_states if item[1].status == "needs-review"]
+    failures = [item for item in stage_states if item[1].status == "failed"]
     pipeline_errors = [state for state in incomplete if state.error is not None]
-    stage_errors = [
-        (state, stage) for state in incomplete for stage in state.stages if stage.status == "error"
-    ]
-    to_run = [
-        (state, stage)
-        for state in incomplete
-        for stage in state.stages
-        if stage.status in {"needs-run", "resume"}
-    ]
+    stage_errors = [item for item in stage_states if item[1].status == "error"]
+    to_run = [item for item in stage_states if item[1].status in {"needs-run", "resume"}]
 
     if reviews:
         console.print("\nTO REVIEW", style="bold yellow")

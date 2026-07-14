@@ -42,14 +42,10 @@ def _source_roots(pipeline_type: type[Any], stage_spec: Any) -> tuple[tuple[str,
         except ValueError:
             display = path.as_posix()
         roots.append((f"declared:{display}", path))
-    seen: set[Path] = set()
-    unique = []
+    unique: dict[Path, str] = {}
     for label, path in roots:
-        if path in seen:
-            continue
-        seen.add(path)
-        unique.append((label, path))
-    return tuple(unique)
+        unique.setdefault(path, label)
+    return tuple((label, path) for path, label in unique.items())
 
 
 def _collect_python_files(root: Path) -> list[tuple[str, Path]]:

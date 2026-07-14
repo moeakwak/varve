@@ -86,15 +86,33 @@ def _main_config(
         raise
 
 
+def _manifest_axes(manifest) -> dict[str, tuple[str, ...]]:
+    return {name: tuple(values) for name, values in (manifest.temporary_axes or {}).items()}
+
+
 def _temporary_from_manifest(
     main_base: Path, branch: str
 ) -> tuple[dict[str, Any], dict[str, tuple[str, ...]]]:
     manifest = Store(main_base / ".tmp" / branch).read_manifest()
     if manifest is None or manifest.temporary_config is None:
         raise ValueError(f"Unknown varve branch {branch!r}")
-    return manifest.temporary_config, {
-        name: tuple(values) for name, values in (manifest.temporary_axes or {}).items()
-    }
+    return manifest.temporary_config, _manifest_axes(manifest)
+
+
+def _validate_temporary_store(
+    main_base: Path,
+    branch: str,
+    config: dict[str, Any],
+    axes: dict[str, tuple[str, ...]],
+) -> None:
+    manifest = Store(main_base / ".tmp" / branch).read_manifest()
+    if manifest is None:
+        return
+    if manifest.temporary_config is None:
+        raise ValueError(f"Unknown varve branch {branch!r}")
+    assert_same_config(manifest.temporary_config, config, branch=branch)
+    if _manifest_axes(manifest) != axes:
+        raise ValueError(f"Temporary varve branch {branch!r} was created with different axes")
 
 
 def resolve_branch(
@@ -106,117 +124,65 @@ def resolve_branch(
     allow_bare_output_root: bool = False,
 ) -> ResolvedBranch:
     validate_branch_name(branch)
+    output_base = Path(cli_out) if cli_out is not None else None
     branches = load_branches(pipeline.varve_config_path())
     main_definition = branches.get("main")
     raw_main = main_definition.config if main_definition is not None else {}
     main_axes = normalize_axes(
         pipeline, main_definition.axes if main_definition is not None else None
     )
+    axes = main_axes
+    is_temporary = False
+    temporary_config = None
 
     if override_json is not None:
         if branch in branches and branch != "main":
             raise ValueError("--override is only supported on main or temporary branches")
-
-        final_config = config_from_init(pipeline.Config, merge_override(raw_main, override_json))
-        temporary_config = _snapshot(final_config)
-        if cli_out is not None:
-            main_base = Path(cli_out)
-        else:
-            main_config = config_from_init(pipeline.Config, raw_main)
-            main_base = pipeline.default_output_root(main_config)
-        temporary_axes = main_axes
-        resolved_branch = (
-            override_branch_name(temporary_config, temporary_axes) if branch == "main" else branch
+        config = config_from_init(pipeline.Config, merge_override(raw_main, override_json))
+        temporary_config = _snapshot(config)
+        main_base = output_base or pipeline.default_output_root(
+            config_from_init(pipeline.Config, raw_main)
         )
-        validate_branch_name(resolved_branch)
-
-        manifest = Store(main_base / ".tmp" / resolved_branch).read_manifest()
-        if manifest is not None:
-            if manifest.temporary_config is None:
-                raise ValueError(f"Unknown varve branch {resolved_branch!r}")
-            assert_same_config(manifest.temporary_config, temporary_config, branch=resolved_branch)
-            stored_axes = {
-                name: tuple(values) for name, values in (manifest.temporary_axes or {}).items()
-            }
-            if stored_axes != temporary_axes:
-                raise ValueError(
-                    f"Temporary varve branch {resolved_branch!r} was created with different axes"
-                )
-
-        return ResolvedBranch(
-            config=final_config,
-            branch=resolved_branch,
-            is_temporary=True,
-            output_base=main_base,
-            temporary_config=temporary_config,
-            axes=temporary_axes,
-            temporary_axes=temporary_axes,
-        )
-
-    if branch in branches:
+        branch = override_branch_name(temporary_config, main_axes) if branch == "main" else branch
+        validate_branch_name(branch)
+        _validate_temporary_store(main_base, branch, temporary_config, axes)
+        output_base = main_base
+        is_temporary = True
+    elif branch in branches:
         definition = branches[branch]
         axes = normalize_axes(pipeline, definition.axes)
         config = config_from_init(pipeline.Config, definition.config)
-        temporary_config = _snapshot(config) if definition.is_temporary else None
-        temporary_axes = axes if definition.is_temporary else None
-        if definition.is_temporary:
-            assert temporary_config is not None
-            main_base = (
-                Path(cli_out) if cli_out is not None else pipeline.default_output_root(config)
-            )
-            manifest = Store(main_base / ".tmp" / branch).read_manifest()
-            if manifest is not None:
-                if manifest.temporary_config is None:
-                    raise ValueError(f"Unknown varve branch {branch!r}")
-                assert_same_config(manifest.temporary_config, temporary_config, branch=branch)
-                stored_axes = {
-                    name: tuple(values) for name, values in (manifest.temporary_axes or {}).items()
-                }
-                if stored_axes != axes:
-                    raise ValueError(
-                        f"Temporary varve branch {branch!r} was created with different axes"
-                    )
-        return ResolvedBranch(
-            config=config,
-            branch=branch,
-            is_temporary=definition.is_temporary,
-            output_base=Path(cli_out) if cli_out is not None else None,
-            axes=axes,
-            temporary_config=temporary_config,
-            temporary_axes=temporary_axes,
-        )
-    if branch == "main":
-        main_config = _main_config(
+        is_temporary = definition.is_temporary
+        if is_temporary:
+            temporary_config = _snapshot(config)
+            main_base = output_base or pipeline.default_output_root(config)
+            _validate_temporary_store(main_base, branch, temporary_config, axes)
+    elif branch == "main":
+        config = _main_config(
             pipeline,
             raw_main,
             cli_out=cli_out,
             allow_bare_output_root=allow_bare_output_root,
         )
-        return ResolvedBranch(
-            config=main_config,
-            branch="main",
-            is_temporary=False,
-            output_base=Path(cli_out) if cli_out is not None else None,
-            axes=main_axes,
-        )
-
-    if cli_out is not None:
-        main_base = Path(cli_out)
     else:
-        main_config = _main_config(
-            pipeline,
-            raw_main,
-            cli_out=None,
-            allow_bare_output_root=False,
+        main_base = output_base or pipeline.default_output_root(
+            _main_config(
+                pipeline,
+                raw_main,
+                cli_out=None,
+                allow_bare_output_root=False,
+            )
         )
-        main_base = pipeline.default_output_root(main_config)
-    temporary_config, temporary_axes = _temporary_from_manifest(main_base, branch)
+        temporary_config, axes = _temporary_from_manifest(main_base, branch)
+        config = pipeline.Config.model_validate(temporary_config)
+        output_base = main_base
+        is_temporary = True
     return ResolvedBranch(
-        config=pipeline.Config.model_validate(temporary_config),
+        config=config,
         branch=branch,
-        is_temporary=True,
-        output_base=main_base,
+        is_temporary=is_temporary,
+        output_base=output_base,
         temporary_config=temporary_config,
-        axes=temporary_axes,
-        temporary_axes=temporary_axes,
+        axes=axes,
+        temporary_axes=axes if is_temporary else None,
     )

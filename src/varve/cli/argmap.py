@@ -18,6 +18,26 @@ _DEST_PREFIX = "__varve_args__."
 # CLI sentinel that maps an optional scalar field to None, matching the default
 # pydantic-settings `cli_parse_none_str`.
 _NONE_TOKEN = "null"
+STAGE_SELECTOR_HELP = (
+    "Base selects all active cells; omitted axes are wildcards; full coordinates select one cell."
+)
+
+
+def add_stage_selection(
+    parser: argparse.ArgumentParser,
+    selector_help: str | None = None,
+    *,
+    verb: str | None = None,
+) -> None:
+    group = parser.add_mutually_exclusive_group()
+    descriptions = {
+        "upto": "the selector and all upstream stages",
+        "downstream": "the selector and all downstream stages",
+        "only": "only the selector",
+    }
+    for option, description in descriptions.items():
+        help_text = selector_help if verb is None else f"{verb} {description}. {selector_help}"
+        group.add_argument(f"--{option}", metavar="STAGE_SELECTOR", help=help_text)
 
 
 def _unwrap_optional(annotation: Any) -> Any:
@@ -85,39 +105,28 @@ def args_option_arities(
     return result
 
 
-def _metavar(dotted: str, annotation: Any) -> str:
-    inner = _unwrap_optional(annotation)
-    origin = get_origin(inner)
-    if origin is list or inner is list:
-        return "JSON"
-    return dotted.replace(".", "_").upper()
-
-
 def _help_text(dotted: str, description: str | None) -> str:
     return description or f"Set Args.{dotted}."
 
 
 def _register_scalar(
     parser: argparse.ArgumentParser,
-    *,
-    flag: str,
     dotted: str,
-    annotation: Any,
-    description: str | None,
-    is_optional: bool,
+    field: Any,
     choices: tuple[Any, ...] | list[Any] | None = None,
 ) -> None:
     """Register a single-value option, folding in optional-null and choices."""
+    flag = "--" + dotted.replace("_", "-")
     if not _option_is_available(parser, flag):
         return
     kwargs: dict[str, Any] = {
         "dest": _dest(dotted),
         "default": argparse.SUPPRESS,
-        "help": _help_text(dotted, description),
-        "metavar": _metavar(dotted, annotation),
+        "help": _help_text(dotted, field.description),
+        "metavar": dotted.replace(".", "_").upper(),
     }
     resolved = list(choices) if choices is not None else None
-    if is_optional:
+    if _is_optional(field.annotation):
         # `--field null` parses to None before argparse checks choices, so the
         # sentinel must be a valid choice when choices are constrained.
         kwargs["type"] = _parse_optional
@@ -138,7 +147,6 @@ def register_args(
     for name, field in args_type.model_fields.items():
         dotted = f"{prefix}{name}"
         flag = "--" + dotted.replace("_", "-")
-        is_optional = _is_optional(field.annotation)
         inner = _unwrap_optional(field.annotation)
         origin = get_origin(inner)
 
@@ -168,39 +176,16 @@ def register_args(
                 default=argparse.SUPPRESS,
                 help=_help_text(dotted, field.description),
             )
-        elif origin is Literal:
-            values = get_args(inner)
-            choices = values if all(isinstance(value, str) for value in values) else None
-            _register_scalar(
-                parser,
-                flag=flag,
-                dotted=dotted,
-                annotation=field.annotation,
-                description=field.description,
-                is_optional=is_optional,
-                choices=choices,
-            )
-        elif _is_str_enum(inner):
-            _register_scalar(
-                parser,
-                flag=flag,
-                dotted=dotted,
-                annotation=field.annotation,
-                description=field.description,
-                is_optional=is_optional,
-                choices=[member.value for member in inner],
-            )
-        elif origin in _MAPPING_ORIGINS or origin in _UNION_ORIGINS or origin is not None:
-            _reject(dotted, field.annotation)
         else:
-            _register_scalar(
-                parser,
-                flag=flag,
-                dotted=dotted,
-                annotation=field.annotation,
-                description=field.description,
-                is_optional=is_optional,
-            )
+            choices = None
+            if origin is Literal:
+                values = get_args(inner)
+                choices = values if all(isinstance(value, str) for value in values) else None
+            elif _is_str_enum(inner):
+                choices = [member.value for member in inner]
+            elif origin in _MAPPING_ORIGINS or origin in _UNION_ORIGINS or origin is not None:
+                _reject(dotted, field.annotation)
+            _register_scalar(parser, dotted, field, choices)
 
 
 def collect_cli_args_namespace(
@@ -224,3 +209,7 @@ def collect_cli_args_namespace(
             if dest in raw_namespace:
                 result[name] = raw_namespace[dest]
     return result
+
+
+def model_from_namespace(namespace: argparse.Namespace, args_type: type[BaseModel]) -> BaseModel:
+    return args_type.model_validate(collect_cli_args_namespace(namespace, args_type))

@@ -13,14 +13,6 @@ from rich.text import Text
 from varve.status import PipelineStatus, StageStatus, StageStatusGroup
 from varve.style import format_elapsed, status_text
 
-_COMPACT_REASON_PREFIXES = (
-    ("global referenced by ", "global reference"),
-    ("closure referenced by ", "closure reference"),
-    ("default value declared by ", "default value"),
-    ("module attribute referenced by ", "module attribute"),
-    ("base class of ", "base class"),
-)
-_REMOVED_PREVIEW_LIMIT = 5
 _REASON_KEYWORD_STYLES = {
     "changed": "yellow",
     "added": "green",
@@ -31,6 +23,7 @@ _REASON_KEYWORD_STYLES = {
     "no cache": "yellow",
     "forced": "yellow",
 }
+_SUMMARY_HEADERS = ("STAGE", "STATUS", "CELLS", "DURATION", "NEEDS", "REASON")
 
 
 def format_needs(needs: tuple[str, ...]) -> str:
@@ -39,13 +32,6 @@ def format_needs(needs: tuple[str, ...]) -> str:
     visible = ", ".join(needs[:2])
     hidden = len(needs) - 2
     return f"{visible} · +{hidden} more" if hidden > 0 else visible
-
-
-def compact_reason(reason: str) -> str:
-    for prefix, compact in _COMPACT_REASON_PREFIXES:
-        if reason.startswith(prefix):
-            return compact
-    return reason
 
 
 def reason_text(reason: str) -> Text:
@@ -107,81 +93,57 @@ def format_group_duration(group: StageStatusGroup) -> str:
     return duration if recorded == total else f"{duration} · {recorded}/{total}"
 
 
+def _group_values(group: StageStatusGroup) -> tuple[str | Text, ...]:
+    return (
+        group.base_name,
+        status_text(group.status),
+        format_group_cells(group) if group.is_matrix else "-",
+        format_group_duration(group),
+        format_needs(group.logical_needs),
+        reason_text(group.reason),
+    )
+
+
+def _text_len(value: str | Text) -> int:
+    return len(value if isinstance(value, str) else value.plain)
+
+
+def _summary_widths(groups: tuple[StageStatusGroup, ...]) -> tuple[int, ...]:
+    values = tuple(_group_values(group) for group in groups)
+    return tuple(
+        max(len(header), *(_text_len(row[index]) for row in values))
+        for index, header in enumerate(_SUMMARY_HEADERS)
+    )
+
+
 def _summary_table(console: Console, groups: tuple[StageStatusGroup, ...]) -> Table:
     has_matrix = any(group.is_matrix for group in groups)
     fold_core = console.width < 80
-    core_overflow = "fold" if fold_core else "ignore"
     table = Table(box=None, padding=(0, 1), header_style="bold")
-    stage_width = max((len(group.base_name) for group in groups), default=5) if has_matrix else None
-    stage_width = max(stage_width or 0, len("STAGE")) if has_matrix else None
-    table.add_column(
-        "STAGE",
-        style="bold",
-        width=stage_width,
-        min_width=stage_width,
-        no_wrap=has_matrix or not fold_core,
-        overflow="ellipsis" if has_matrix else core_overflow,
-    )
-    status_width = max((len(group.status) for group in groups), default=6) if has_matrix else None
-    status_width = max(status_width or 0, len("STATUS")) if has_matrix else None
-    table.add_column(
-        "STATUS",
-        width=status_width,
-        min_width=status_width,
-        no_wrap=has_matrix or not fold_core,
-        overflow="ellipsis" if has_matrix else core_overflow,
-    )
-    if has_matrix:
-        cells_width = max(
-            len(format_group_cells(group).plain) if group.is_matrix else 1 for group in groups
-        )
-        table.add_column(
-            "CELLS",
-            width=max(cells_width, len("CELLS")),
-            min_width=max(cells_width, len("CELLS")),
-            no_wrap=True,
-            overflow="ellipsis",
-        )
-    duration_width = (
-        max(len(format_group_duration(group)) for group in groups) if has_matrix else None
-    )
-    duration_width = max(duration_width or 0, len("DURATION")) if has_matrix else None
-    table.add_column(
-        "DURATION",
-        justify="right",
-        width=duration_width,
-        min_width=duration_width,
-        no_wrap=has_matrix or not fold_core,
-        overflow="ellipsis" if has_matrix else core_overflow,
-    )
-    table.add_column(
-        "NEEDS",
-        style="dim",
-        min_width=5 if has_matrix else None,
-        no_wrap=has_matrix,
-        overflow="ellipsis" if has_matrix else "fold",
-    )
-    table.add_column(
-        "REASON",
-        min_width=6 if has_matrix else None,
-        no_wrap=has_matrix,
-        overflow="ellipsis" if has_matrix else "fold",
-    )
+    widths = _summary_widths(groups) if has_matrix else (None,) * len(_SUMMARY_HEADERS)
+    headers = _SUMMARY_HEADERS if has_matrix else tuple(h for h in _SUMMARY_HEADERS if h != "CELLS")
+    for header in headers:
+        index = _SUMMARY_HEADERS.index(header)
+        kwargs = {
+            "style": "bold" if header == "STAGE" else "dim" if header == "NEEDS" else None,
+            "justify": "right" if header == "DURATION" else "left",
+            "no_wrap": has_matrix or (header in {"STAGE", "STATUS", "DURATION"} and not fold_core),
+            "overflow": (
+                "ellipsis"
+                if has_matrix
+                else "ignore"
+                if header in {"STAGE", "STATUS", "DURATION"} and not fold_core
+                else "fold"
+            ),
+        }
+        if has_matrix and header in {"STAGE", "STATUS", "CELLS", "DURATION"}:
+            kwargs.update(width=widths[index], min_width=widths[index])
+        elif has_matrix:
+            kwargs["min_width"] = len(header)
+        table.add_column(header, **kwargs)
     for group in groups:
-        row: list[RenderableType] = [
-            group.base_name,
-            status_text(group.status),
-        ]
-        if has_matrix:
-            row.append(format_group_cells(group) if group.is_matrix else "-")
-        row.extend(
-            [
-                format_group_duration(group),
-                format_needs(group.logical_needs),
-            ]
-        )
-        row.append(reason_text(group.reason))
-        table.add_row(*row)
+        values = _group_values(group)
+        table.add_row(*(values if has_matrix else values[:2] + values[3:]))
     return table
 
 
@@ -206,46 +168,35 @@ def _compact_row(parts: tuple[tuple[str | Text, int, str | None], ...]) -> Text:
 
 
 def _compact_matrix_summary(console: Console, groups: tuple[StageStatusGroup, ...]) -> None:
-    stage_width = max(len("STAGE"), *(len(group.base_name) for group in groups))
-    status_width = max(len("STATUS"), *(len(group.status) for group in groups))
-    cells_width = min(
-        20,
-        max(
-            len("CELLS"),
-            *(len(format_group_cells(group).plain) if group.is_matrix else 1 for group in groups),
-        ),
-    )
-    duration_width = max(len("DURATION"), *(len(format_group_duration(group)) for group in groups))
+    stage_width, status_width, cells_width, duration_width, _, _ = _summary_widths(groups)
+    cells_width = min(20, cells_width)
     fixed_width = stage_width + status_width + cells_width + duration_width + 10
     flexible_width = max(console.width - fixed_width, 10)
     needs_width = max(5, flexible_width * 3 // 5)
     reason_width = max(5, flexible_width - needs_width)
+    widths = (
+        stage_width,
+        status_width,
+        cells_width,
+        duration_width,
+        needs_width,
+        reason_width,
+    )
     console.print(
         _compact_row(
-            (
-                ("STAGE", stage_width, "bold"),
-                ("STATUS", status_width, "bold"),
-                ("CELLS", cells_width, "bold"),
-                ("DURATION", duration_width, "bold"),
-                ("NEEDS", needs_width, "bold"),
-                ("REASON", reason_width, "bold"),
-            )
+            tuple((header, width, "bold") for header, width in zip(_SUMMARY_HEADERS, widths))
         )
     )
     for group in groups:
         console.print(
             _compact_row(
-                (
-                    (group.base_name, stage_width, "bold"),
-                    (status_text(group.status), status_width, None),
-                    (
-                        format_group_cells(group) if group.is_matrix else "-",
-                        cells_width,
-                        None,
-                    ),
-                    (format_group_duration(group), duration_width, None),
-                    (format_needs(group.logical_needs), needs_width, "dim"),
-                    (reason_text(group.reason), reason_width, None),
+                tuple(
+                    zip(
+                        _group_values(group),
+                        widths,
+                        ("bold", None, None, None, "dim", None),
+                        strict=True,
+                    )
                 )
             )
         )
@@ -331,26 +282,18 @@ def key_inputs_table(stage: StageStatus) -> Table:
     table = Table(box=None, show_header=False, padding=(0, 2))
     table.add_column(style="dim", no_wrap=True)
     table.add_column()
-    table.add_row(
-        "Config",
-        ", ".join(f"{name}={value!r}" for name, value in stage.key_inputs.config.items()) or "-",
-    )
-    table.add_row("Inputs", ", ".join(stage.key_inputs.inputs) or "-")
-    table.add_row(
-        "Values",
-        ", ".join(f"{name}={value!r}" for name, value in stage.key_inputs.values.items()) or "-",
-    )
-    table.add_row("Upstream", ", ".join(stage.key_inputs.upstreams) or "-")
+    values = {
+        "Config": ", ".join(f"{name}={value!r}" for name, value in stage.key_inputs.config.items()),
+        "Inputs": ", ".join(stage.key_inputs.inputs),
+        "Values": ", ".join(f"{name}={value!r}" for name, value in stage.key_inputs.values.items()),
+        "Upstream": ", ".join(stage.key_inputs.upstreams),
+    }
+    for label, value in values.items():
+        table.add_row(label, value or "-")
     return table
 
 
-def render_stage_status(
-    console: Console,
-    stage: StageStatus,
-    *,
-    depth: int | None,
-    show_keys: bool,
-) -> None:
+def render_stage_status(console: Console, stage: StageStatus) -> None:
     heading = Text(stage.name, style="varve.dependency.stage")
     heading.append("  ")
     heading.append_text(status_text(stage.status))
@@ -369,13 +312,12 @@ def render_stage_status(
     overview.add_row("Reason", reason_text(detail_reason))
     if stage.failure is not None:
         overview.add_row("Failure", stage.failure)
-    source = Text()
-    if stage.source_relationship == "not-applicable":
-        source.append("not recorded", style="dim")
-    elif stage.source_relationship == "current":
-        source.append("current", style="green")
-    else:
-        source.append("changed", style="yellow")
+    source_label, source_style = {
+        "not-applicable": ("not recorded", "dim"),
+        "current": ("current", "green"),
+        "changed": ("changed", "yellow"),
+    }[stage.source_relationship]
+    source = Text(source_label, style=source_style)
     overview.add_row("Source", source)
     if stage.source_relationship == "changed":
         review = {
@@ -385,9 +327,8 @@ def render_stage_status(
         }[stage.review_decision]
         overview.add_row("Review", review)
     overview.add_row("Needs", ", ".join(stage.needs) if stage.needs else "-")
-    if show_keys:
-        overview.add_row("Decision key", stage.decision_key or "unavailable")
-        overview.add_row("Stored key", stage.stored_key or "-")
+    overview.add_row("Decision key", stage.decision_key or "unavailable")
+    overview.add_row("Stored key", stage.stored_key or "-")
 
     content: list[RenderableType] = [overview]
     if stage.key_inputs is None:
@@ -426,12 +367,7 @@ def render_status(
     for index, stage in enumerate(status.stages):
         if index:
             console.print()
-        render_stage_status(
-            console,
-            stage,
-            depth=dependency_depth,
-            show_keys=True,
-        )
+        render_stage_status(console, stage)
 
 
 def status_view(status: PipelineStatus, *, expand: bool) -> Literal["summary", "cells", "detail"]:

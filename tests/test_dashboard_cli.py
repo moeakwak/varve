@@ -91,7 +91,6 @@ def _stage_status(
         name=name,
         base_name=name,
         cell=(),
-        kind="single",
         needs=(),
         logical_needs=(),
         status=status,
@@ -139,7 +138,9 @@ def test_top_level_help_lists_only_unified_commands(capsys) -> None:
     with pytest.raises(SystemExit) as exc_info:
         main(["--help"])
     assert exc_info.value.code == 0
-    output = capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    output = captured.out
     for command in ("ls", "status", "run", "accept", "reject", "plan", "clean"):
         assert command in output
     assert "\n  show " not in output
@@ -221,8 +222,10 @@ def test_status_requires_module_and_points_to_overview(capsys) -> None:
 def test_module_and_all_are_mutually_exclusive_and_required(command: str) -> None:
     with pytest.raises(SystemExit):
         main([command])
-    with pytest.raises(SystemExit):
-        main([command, "pkg.demo", "--all"])
+    for arguments in (("pkg.demo", "--all"), ("--all", "pkg.demo")):
+        with pytest.raises(SystemExit) as exc_info:
+            main([command, *arguments])
+        assert exc_info.value.code == 2
 
 
 def test_single_run_registers_pipeline_args_after_module_resolution(
@@ -232,11 +235,11 @@ def test_single_run_registers_pipeline_args_after_module_resolution(
     _run_demo(tmp_path / "demo" / "out")
     captured = []
 
-    def fake_run(entry, pipeline, pipeline_args, **kwargs):
-        captured.append((entry, pipeline, pipeline_args, kwargs))
-        return 0
+    def fake_run(context, **kwargs):
+        captured.append((context, kwargs))
+        return []
 
-    monkeypatch.setattr("varve.dashboard.cli.run_command", fake_run)
+    monkeypatch.setattr("varve.cli.commands.execute_run", fake_run)
     assert (
         main(
             [
@@ -253,9 +256,9 @@ def test_single_run_registers_pipeline_args_after_module_resolution(
         )
         == 0
     )
-    assert captured[0][2] == Args(workers=4)
-    assert captured[0][3]["only"] == "sample"
-    assert captured[0][3]["force"] is True
+    assert captured[0][0].args == Args(workers=4)
+    assert captured[0][1]["only"] == "sample"
+    assert captured[0][1]["force"] is True
 
     with pytest.raises(SystemExit) as exc_info:
         main(
@@ -378,8 +381,8 @@ def test_dynamic_value_matching_existing_module_and_typo_target_execute_nothing(
     entry = _run_demo(tmp_path / "demo" / "out")
     executed = []
     monkeypatch.setattr(
-        "varve.dashboard.cli.run_command",
-        lambda *args, **kwargs: executed.append((args, kwargs)) or 0,
+        "varve.cli.commands.execute_run",
+        lambda *args, **kwargs: executed.append((args, kwargs)) or [],
     )
 
     with pytest.raises(SystemExit) as ordering_error:
@@ -644,7 +647,7 @@ def test_bulk_review_continues_after_entry_failure_and_uses_default_args(
             raise RuntimeError("locked")
         return CliDemo
 
-    monkeypatch.setattr("varve.dashboard.state.import_entry_pipeline", fake_import)
+    monkeypatch.setattr(commands, "import_entry_pipeline", fake_import)
     seen_args = []
 
     def fake_context(entry, pipeline, args):
@@ -653,12 +656,18 @@ def test_bulk_review_continues_after_entry_failure_and_uses_default_args(
             "Context",
             (),
             {
-                "config": Config(),
                 "args": args,
-                "output_base": tmp_path,
-                "branch": "main",
-                "is_temporary": False,
-                "axes": None,
+                "resolved": type(
+                    "Resolved",
+                    (),
+                    {
+                        "config": Config(),
+                        "output_base": tmp_path,
+                        "branch": "main",
+                        "is_temporary": False,
+                        "axes": None,
+                    },
+                )(),
                 "graph": pipeline.graph(),
             },
         )()
@@ -690,7 +699,7 @@ def test_bulk_review_continues_after_entry_failure_and_uses_default_args(
         backend_sessions.append(kwargs["_keying_session"])
         return result
 
-    monkeypatch.setattr(commands, "record_source_review", fake_review)
+    monkeypatch.setattr(commands, "execute_review", fake_review)
 
     assert (
         commands.bulk_review_command(
@@ -736,7 +745,7 @@ def test_bulk_run_skips_hit_and_review_runs_eligible_then_rechecks(
         return _state(entry, "needs-run" if reads[entry.pipeline_id] == 1 else "hit")
 
     monkeypatch.setattr(commands, "load_state", fake_load)
-    monkeypatch.setattr("varve.dashboard.state.import_entry_pipeline", lambda entry: CliDemo)
+    monkeypatch.setattr(commands, "import_entry_pipeline", lambda entry: CliDemo)
     monkeypatch.setattr(commands, "resolve_entry_context", lambda *args: object())
     ran = []
     monkeypatch.setattr(commands, "_run_context", lambda context, rehash: ran.append(context))
@@ -792,7 +801,7 @@ def test_bulk_run_mixed_failure_returns_one_and_preserves_all_groups(
             entry, "needs-review" if entry.pipeline_id == "review" else "failed"
         ),
     )
-    monkeypatch.setattr("varve.dashboard.state.import_entry_pipeline", lambda entry: CliDemo)
+    monkeypatch.setattr(commands, "import_entry_pipeline", lambda entry: CliDemo)
     monkeypatch.setattr(commands, "resolve_entry_context", lambda *args: object())
     monkeypatch.setattr(commands, "_run_context", lambda *args, **kwargs: None)
 

@@ -99,6 +99,14 @@ class SuccessRecord(VarveModel):
     committed_at: str
     elapsed: float | None = None
 
+    @property
+    def paths(self) -> list[str]:
+        if self.kind == "single":
+            assert self.produces is not None
+            return [item.path for item in self.produces]
+        assert self.outputs is not None
+        return [item.path for item in sorted(self.outputs, key=lambda item: item.index)]
+
     @model_validator(mode="after")
     def validate_outputs_shape(self) -> SuccessRecord:
         if self.kind == "batch":

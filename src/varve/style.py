@@ -44,13 +44,9 @@ REVIEW_STYLES: dict[str, str] = {
 }
 
 
-# Style for the bracketed stage name in the live run log, e.g. "[render_ablation]".
-STAGE_STYLE = "bold"
-
 # Leading glyph and styling for a bulk `run <module> --branch <branch>` header.
 # The header groups the stage lines that follow it, so it gets its own accent.
 BULK_RUN_MARKER = "▸"
-BULK_RUN_STYLE = "bold cyan"
 
 DEPENDENCY_STYLES = {
     "stage": "bold cyan",
@@ -75,7 +71,7 @@ _THEME = Theme(
     {f"varve.{_theme_key(status)}": style for status, style in STATUS_STYLES.items()}
     | {f"varve.dependency.{kind}": style for kind, style in DEPENDENCY_STYLES.items()}
     | {f"varve.review.{name}": style for name, style in REVIEW_STYLES.items()}
-    | {"varve.stage": STAGE_STYLE, "varve.bulk_run": BULK_RUN_STYLE}
+    | {"varve.stage": "bold", "varve.bulk_run": "bold cyan"}
 )
 
 

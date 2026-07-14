@@ -44,37 +44,30 @@ class FingerprintSession:
         input_path = str(expanded)
         snapshot = self._snapshots.get(input_path)
         if snapshot is None:
-            normalized_path = expanded.resolve()
-            normalized = str(normalized_path)
+            normalized = str(expanded.resolve())
             snapshot = self._snapshots.get(normalized)
             if snapshot is None:
                 try:
-                    stat = normalized_path.stat()
+                    stat = Path(normalized).stat()
                 except FileNotFoundError as error:
                     raise FileNotFoundError(
-                        f"Key input file does not exist: {normalized_path}"
+                        f"Key input file does not exist: {normalized}"
                     ) from error
-                snapshot = _FileSnapshot(
-                    path=normalized,
-                    inode=stat.st_ino,
-                    size=stat.st_size,
-                    mtime_ns=stat.st_mtime_ns,
-                )
+                snapshot = _FileSnapshot(normalized, stat.st_ino, stat.st_size, stat.st_mtime_ns)
                 self._snapshots[normalized] = snapshot
             self._snapshots[input_path] = snapshot
-        if snapshot.hashed is not None and not force_rehash and not self.force_rehash:
+        rehash = force_rehash or self.force_rehash
+        if snapshot.hashed is not None and not rehash:
             return snapshot.hashed
         if cached is None and cached_by_path is not None:
             cached = cached_by_path.get(snapshot.path)
         if (
             cached is not None
             and cached.path == snapshot.path
-            and not self.force_rehash
-            and not force_rehash
-            and cached.inode == snapshot.inode
-            and cached.size == snapshot.size
-            and cached.mtime_ns == snapshot.mtime_ns
             and cached.algorithm == "sha256"
+            and not rehash
+            and (cached.inode, cached.size, cached.mtime_ns)
+            == (snapshot.inode, snapshot.size, snapshot.mtime_ns)
         ):
             return cached
 
@@ -107,9 +100,11 @@ def _stable_sha256_file(path: Path, *, retries: int = 2) -> tuple[str, os.stat_r
         before = path.stat()
         digest = _sha256_file(path)
         after = path.stat()
-        token_before = (before.st_ino, before.st_size, before.st_mtime_ns)
-        token_after = (after.st_ino, after.st_size, after.st_mtime_ns)
-        if token_before == token_after:
+        if (before.st_ino, before.st_size, before.st_mtime_ns) == (
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
             return digest, after
         if attempt == retries:
             raise OSError(f"File changed while hashing: {path}")
@@ -120,15 +115,12 @@ def _normalize_for_json(value: Any) -> JSON:
     if isinstance(value, BaseModel):
         return _normalize_for_json(value.model_dump(mode="json"))
     if isinstance(value, dict):
-        normalized: dict[str, JSON] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError(
-                    "JSON objects used in varve keys must have string keys; "
-                    f"got {type(key).__name__}"
-                )
-            normalized[key] = _normalize_for_json(item)
-        return normalized
+        invalid_type = next((type(key).__name__ for key in value if not isinstance(key, str)), None)
+        if invalid_type is not None:
+            raise TypeError(
+                f"JSON objects used in varve keys must have string keys; got {invalid_type}"
+            )
+        return {key: _normalize_for_json(item) for key, item in value.items()}
     if isinstance(value, list | tuple):
         return [_normalize_for_json(item) for item in value]
     if isinstance(value, str | int | float | bool) or value is None:
@@ -177,12 +169,6 @@ def file_fingerprint(
     return (session or FingerprintSession()).fingerprint(path, cached)
 
 
-def _coerce_paths(value: Path | Sequence[Path]) -> list[Path]:
-    if isinstance(value, Path):
-        return [value]
-    return list(value)
-
-
 def assert_no_symlink_path(path: Path, *, description: str) -> None:
     """Reject a symlink at any component of an explicitly supplied path."""
 
@@ -190,6 +176,30 @@ def assert_no_symlink_path(path: Path, *, description: str) -> None:
     for component in reversed((absolute, *absolute.parents)):
         if component.is_symlink():
             raise ValueError(f"Symlinks are not supported in {description}: {component}")
+
+
+def _tree_entries(
+    root: Path,
+    *,
+    label: str,
+    symlink_description: str,
+    root_is_entry: bool = False,
+) -> list[tuple[Path, str]]:
+    if not root.exists():
+        raise FileNotFoundError(f"{label} does not exist: {root}")
+    if not (root.is_file() or root.is_dir()):
+        suffix = " entry" if root_is_entry else ""
+        raise ValueError(f"Unsupported {label.lower()}{suffix}: {root}")
+    members = [root] if root.is_file() else [root, *sorted(root.rglob("*"))]
+    result = []
+    for member in members:
+        if member.is_symlink():
+            raise ValueError(f"Symlinks are not supported in {symlink_description}: {member}")
+        if member.is_file() or member.is_dir():
+            result.append((member, "file" if member.is_file() else "dir"))
+        else:
+            raise ValueError(f"Unsupported {label.lower()} entry: {member}")
+    return result
 
 
 def files_fingerprints(
@@ -205,23 +215,16 @@ def files_fingerprints(
     for name, resolve_paths in sorted(files_spec.items()):
         cached_by_path = {item.path: item for item in cached_by_name.get(name, [])}
         members = {}
-        for path in _coerce_paths(resolve_paths(ctx)):
+        resolved_paths = resolve_paths(ctx)
+        for path in [resolved_paths] if isinstance(resolved_paths, Path) else resolved_paths:
             assert_no_symlink_path(path, description="input dependencies")
             expanded = path.expanduser().resolve()
-            if not expanded.exists():
-                raise FileNotFoundError(f"Input dependency does not exist: {expanded}")
-            if expanded.is_file():
-                fingerprint = session.fingerprint(expanded, cached_by_path=cached_by_path)
-                members[fingerprint.path] = fingerprint
-                continue
-            if not expanded.is_dir():
-                raise ValueError(f"Unsupported input dependency: {expanded}")
-            for member in (expanded, *sorted(expanded.rglob("*"))):
-                if member.is_symlink():
-                    raise ValueError(f"Symlinks are not supported in input dependencies: {member}")
-                if member.is_file():
+            for member, kind in _tree_entries(
+                expanded, label="Input dependency", symlink_description="input dependencies"
+            ):
+                if kind == "file":
                     fingerprint = session.fingerprint(member, cached_by_path=cached_by_path)
-                elif member.is_dir():
+                else:
                     stat = member.stat()
                     fingerprint = FileFingerprint(
                         path=str(member),
@@ -231,8 +234,6 @@ def files_fingerprints(
                         mtime_ns=stat.st_mtime_ns,
                         content_hash=json_sha256({"entry": "dir"}),
                     )
-                else:
-                    raise ValueError(f"Unsupported input dependency entry: {member}")
                 members[fingerprint.path] = fingerprint
         results[name] = [members[path] for path in sorted(members)]
     return results
@@ -261,51 +262,35 @@ def artifact_fingerprint(
         relative_root = resolved.relative_to(root).as_posix()
     except ValueError as error:
         raise ValueError(f"Managed artifact must be under the output root: {resolved}") from error
-    if not resolved.exists():
-        raise FileNotFoundError(f"Managed artifact does not exist: {resolved}")
-    cached_files = (
-        {
-            entry.fingerprint.path: entry.fingerprint
-            for entry in cached.manifest
-            if entry.fingerprint is not None
-        }
-        if cached is not None
-        else {}
-    )
+    cached_files = {
+        entry.fingerprint.path: entry.fingerprint
+        for entry in (() if cached is None else cached.manifest)
+        if entry.fingerprint is not None
+    }
+    kind = "file" if resolved.is_file() else "dir"
     entries: list[ArtifactManifestEntry] = []
-    if resolved.is_file():
-        fingerprint = session.fingerprint(
-            resolved,
-            cached_by_path=cached_files,
-            force_rehash=force_rehash,
-        )
-        entries.append(ArtifactManifestEntry(path=".", kind="file", fingerprint=fingerprint))
-        kind = "file"
-    elif resolved.is_dir():
-        kind = "dir"
-        entries.append(ArtifactManifestEntry(path=".", kind="dir"))
-        for member in sorted(resolved.rglob("*")):
-            if member.is_symlink():
-                raise ValueError(f"Symlinks are not supported in managed artifacts: {member}")
-            relative = member.relative_to(resolved).as_posix()
-            if member.is_dir():
-                entries.append(ArtifactManifestEntry(path=relative, kind="dir"))
-            elif member.is_file():
-                entries.append(
-                    ArtifactManifestEntry(
-                        path=relative,
-                        kind="file",
-                        fingerprint=session.fingerprint(
-                            member,
-                            cached_by_path=cached_files,
-                            force_rehash=force_rehash,
-                        ),
-                    )
+    tree = _tree_entries(
+        resolved,
+        label="Managed artifact",
+        symlink_description="managed artifacts",
+        root_is_entry=True,
+    )
+    for member, member_kind in tree:
+        relative = member.relative_to(resolved).as_posix()
+        if member_kind == "dir":
+            entries.append(ArtifactManifestEntry(path=relative, kind="dir"))
+        else:
+            entries.append(
+                ArtifactManifestEntry(
+                    path=relative,
+                    kind="file",
+                    fingerprint=session.fingerprint(
+                        member,
+                        cached_by_path=cached_files,
+                        force_rehash=force_rehash,
+                    ),
                 )
-            else:
-                raise ValueError(f"Unsupported managed artifact entry: {member}")
-    else:
-        raise ValueError(f"Unsupported managed artifact entry: {resolved}")
+            )
     digest_view = [
         {
             "path": entry.path,

@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from varve.context import Ctx, StageDisplay
+from varve.context import Ctx
 from varve.decorators import ProducesItem, ProducesSpec
 from varve.dependencies import merge_dependencies
 from varve.engine.review import (
@@ -33,8 +33,9 @@ from varve.engine.run_display import (
 from varve.engine.state import (
     Decision,
     SourceReviewState,
-    decide_batch,
-    decide_single,
+    decide,
+    effective_reason,
+    effective_status,
 )
 from varve.keying.config_access import ConfigAccess, RecordingConfig, project_config
 from varve.keying.fingerprint import (
@@ -51,7 +52,6 @@ from varve.keying.source import SourceFingerprintSession
 from varve.matrix import Cell, PipelineGraph, build_graph, cell_output_path
 from varve.models import (
     SCHEMA_VERSION,
-    ArtifactFingerprint,
     AttemptMarker,
     BatchRecord,
     FailureRecord,
@@ -78,6 +78,8 @@ class StageProbe:
     source_review: SourceReviewState
     failure: FailureRecord | None = None
     unavailable_reason: str | None = None
+    _partial: dict[int, BatchRecord] | None = field(default=None, repr=False)
+    _artifacts_match: bool = field(default=True, repr=False)
 
 
 @dataclass
@@ -151,6 +153,38 @@ class _KeyingSession:
         )
 
 
+@dataclass(frozen=True)
+class _Runtime:
+    pipeline: type[Pipeline]
+    graph: PipelineGraph
+    config: Any
+    args: Any
+    out: Path
+    store: Store
+    keying: _KeyingSession
+
+    def context(
+        self,
+        stage_spec,
+        *,
+        config: Any = None,
+        resume_skip: set[int] | frozenset[int] = frozenset(),
+    ) -> Ctx[Any, Any]:
+        return Ctx(
+            config=self.config if config is None else config,
+            args=self.args,
+            out=self.out,
+            store=self.store,
+            resume_skip=frozenset(resume_skip),
+            stage_name=stage_spec.name,
+            stage_display=tuple(axis.id_of(value) for axis, value in stage_spec.cell),
+            declared_needs=frozenset(stage_spec.logical_needs),
+            cell=Cell(stage_spec.cell),
+            cell_out=cell_output_path(self.out, stage_spec),
+            need_cells=stage_spec.need_cells,
+        )
+
+
 _RECORD_UNOBSERVED = object()
 _RECORD_MISSING = object()
 
@@ -170,18 +204,17 @@ def _now() -> str:
 
 
 def _record_stage_failure(
-    store: Store,
-    pipeline: type[Pipeline],
+    runtime: _Runtime,
     stage_name: str,
     error: Exception,
 ) -> None:
-    attempt = store.read_attempt(stage_name)
+    attempt = runtime.store.read_attempt(stage_name)
     if attempt is None:
         return
-    store.write_failure(
+    runtime.store.write_failure(
         stage_name,
         FailureRecord(
-            pipeline=pipeline.__name__,
+            pipeline=runtime.pipeline.__name__,
             stage=stage_name,
             input_key=attempt.input_key,
             source_fingerprint=attempt.source_fingerprint,
@@ -189,13 +222,6 @@ def _record_stage_failure(
             message=str(error),
             failed_at=_now(),
         ),
-    )
-
-
-def _stage_display(stage_spec) -> StageDisplay:
-    return StageDisplay(
-        base_name=stage_spec.base_name or stage_spec.name,
-        cell_values=tuple(axis.id_of(value) for axis, value in stage_spec.cell),
     )
 
 
@@ -232,12 +258,30 @@ def _cwd_relative_path_hint(path: Path, out: Path) -> str | None:
     )
 
 
+def _managed_output(
+    path: Path,
+    ctx: Ctx[Any, Any],
+    description: str,
+    *,
+    matrix_description: str | None = None,
+    cwd_hint: bool = False,
+) -> tuple[Path, str]:
+    absolute = path if path.is_absolute() else ctx.cell_out / path
+    if not absolute.exists():
+        hint = _cwd_relative_path_hint(path, ctx.cell_out) if cwd_hint else None
+        if hint is not None:
+            raise ValueError(hint)
+        raise FileNotFoundError(f"{description} does not exist: {absolute}")
+    if ctx.cell:
+        _relative_to_out(absolute, ctx.cell_out, description=matrix_description or description)
+    return absolute, _relative_to_out(absolute, ctx.out, description=description)
+
+
 def _refresh_fingerprint_cache(
     *,
-    store: Store,
+    runtime: _Runtime,
     previous: SuccessRecord | None,
     components: KeyComponents,
-    keying_session: _KeyingSession,
 ) -> None:
     """Rewrite a hit stage's success record when input fingerprints drifted.
 
@@ -260,7 +304,7 @@ def _refresh_fingerprint_cache(
             )
         }
     )
-    keying_session.write_success(store, refreshed)
+    runtime.keying.write_success(runtime.store, refreshed)
 
 
 def _produced_paths(
@@ -274,12 +318,7 @@ def _produced_paths(
     result = []
     for item in paths:
         declared = Path(item)
-        path = declared if declared.is_absolute() else ctx.cell_out / declared
-        if not path.exists():
-            raise FileNotFoundError(f"Declared varve output does not exist: {path}")
-        if ctx.cell:
-            _relative_to_out(path, ctx.cell_out, description="Declared varve output")
-        relative = _relative_to_out(path, ctx.out, description="Declared varve output")
+        path, relative = _managed_output(declared, ctx, "Declared varve output")
         result.append(
             ProducedPath(
                 path=relative,
@@ -305,19 +344,16 @@ def _validate_static_produces_location(produces: ProducesSpec, ctx: Ctx[Any, Any
             )
 
 
-def _success_outputs_exist(record: SuccessRecord, out: Path) -> bool:
-    if record.kind == "single":
-        assert record.produces is not None
-        return all((out / item.path).exists() for item in record.produces)
-    assert record.outputs is not None
-    return all((out / item.path).exists() for item in record.outputs)
+def _success_outputs_exist(runtime: _Runtime, record: SuccessRecord) -> bool:
+    return all((runtime.out / path).exists() for path in record.paths)
 
 
 def _current_artifacts(
+    runtime: _Runtime,
     record: SuccessRecord,
-    out: Path,
-    session: FingerprintSession,
-) -> tuple[list[ArtifactFingerprint], str]:
+) -> str:
+    out = runtime.out
+    session = runtime.keying.fingerprints
     if record.kind == "single":
         produced = record.produces or []
         recorded = [item.artifact for item in produced]
@@ -335,48 +371,23 @@ def _current_artifacts(
         artifact_fingerprint(out / item.root, out, cached=item, session=session)
         for item in recorded
     ]
-    return current, artifacts_root_fingerprint(current, positions=positions)
+    return artifacts_root_fingerprint(current, positions=positions)
 
 
 def _source_review(
-    store: Store,
+    runtime: _Runtime,
     stage_name: str,
     previous: SuccessRecord | None,
     current: SourceFingerprint,
-    keying_session: _KeyingSession,
 ) -> SourceReviewState:
     if previous is None:
         return SourceReviewState("not-applicable")
     if previous.executed_source_fingerprint.fingerprint == current.fingerprint:
         return SourceReviewState("current")
-    review = keying_session.read_review(store, stage_name)
+    review = runtime.keying.read_review(runtime.store, stage_name)
     if review is None or review.source_fingerprint != current.fingerprint:
         return SourceReviewState("changed")
     return SourceReviewState("changed", review.decision)
-
-
-def _stage_sets(
-    graph: PipelineGraph,
-) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    stages = graph.stages
-    ancestors = {name: set(spec.needs) for name, spec in stages.items()}
-    descendants = {name: set() for name in stages}
-    for name, spec in stages.items():
-        for upstream in spec.needs:
-            descendants[upstream].add(name)
-    return ancestors, descendants
-
-
-def _closure(seed: str, graph: dict[str, set[str]]) -> set[str]:
-    seen: set[str] = set()
-    stack = [seed]
-    while stack:
-        item = stack.pop()
-        if item in seen:
-            continue
-        seen.add(item)
-        stack.extend(graph[item])
-    return seen
 
 
 def selected_stages(
@@ -396,9 +407,8 @@ def selected_stages(
 
 
 def _upstream_keys(
+    runtime: _Runtime,
     stage_spec,
-    store: Store,
-    keying_session: _KeyingSession,
     known_upstream_fingerprints: dict[str, str] | None = None,
 ) -> dict[str, str]:
     keys: dict[str, str] = {}
@@ -406,50 +416,14 @@ def _upstream_keys(
         if known_upstream_fingerprints is not None and name in known_upstream_fingerprints:
             keys[name] = known_upstream_fingerprints[name]
             continue
-        record = keying_session.read_success(store, name)
+        record = runtime.keying.read_success(runtime.store, name)
         if record is None:
             raise ValueError(f"Upstream stage has no success record: {name}")
-        if _success_outputs_exist(record, store.output_root):
-            _, keys[name] = _current_artifacts(
-                record, store.output_root, keying_session.fingerprints
-            )
+        if _success_outputs_exist(runtime, record):
+            keys[name] = _current_artifacts(runtime, record)
         else:
             keys[name] = record.artifact_fingerprint
     return keys
-
-
-def _batch_outputs_from_records(
-    *,
-    previous: SuccessRecord | None,
-    partial: dict[int, BatchRecord] | None,
-    out: Path,
-    force: bool,
-) -> dict[int, list[str]]:
-    if force:
-        return {}
-    outputs: dict[int, list[str]] = {}
-    if previous is not None and previous.outputs is not None:
-        grouped: dict[int, list[str]] = {}
-        for item in previous.outputs:
-            grouped.setdefault(item.index, []).append(item.path)
-        for index, paths in grouped.items():
-            if all((out / path).exists() for path in paths):
-                outputs[index] = list(paths)
-    if partial is not None:
-        for index, batch in partial.items():
-            if all((out / path).exists() for path in batch.yielded):
-                outputs[index] = list(batch.yielded)
-    return outputs
-
-
-def _batch_artifact_positions(outputs: list[OutputHandle]) -> list[tuple[int, int]]:
-    ordinals: dict[int, int] = {}
-    positions = []
-    for output in outputs:
-        ordinal = ordinals.get(output.index, 0)
-        positions.append((output.index, ordinal))
-        ordinals[output.index] = ordinal + 1
-    return positions
 
 
 def _validated_partial(
@@ -503,106 +477,114 @@ def _merge_config_access(
     return sorted(set(prev_access) | set(recorded))
 
 
-def _commit_components(
-    probe: KeyComponents,
-    config: Any,
-    committed_access: list[str] | None,
-) -> KeyComponents:
-    """Reproject a probe's components onto the config fields actually read."""
-
-    return probe.model_copy(
-        update={
-            "config": project_config(config_data(config), committed_access),
-            "config_access": committed_access,
-        }
-    )
+_INFER_CONFIG_ACCESS = object()
 
 
-def _probe_stage(
-    pipeline_type: type[Pipeline],
-    graph: PipelineGraph,
-    stage_name: str,
-    *,
-    config: Any,
-    args: Any,
-    out: Path,
-    store: Store,
-    known_upstream_fingerprints: dict[str, str],
-    source_fingerprint: SourceFingerprint,
-    keying_session: _KeyingSession,
-) -> StageProbe:
-    stage_spec = graph.stages[stage_name]
-    previous = keying_session.read_success(store, stage_name)
-    review = _source_review(store, stage_name, previous, source_fingerprint, keying_session)
-    upstream_keys = _upstream_keys(stage_spec, store, keying_session, known_upstream_fingerprints)
-    cached_inputs = previous.key_components.inputs if previous is not None else None
-    previous_access = (
-        previous.key_components.config_access
-        if previous is not None
-        and not (review.relationship == "changed" and review.decision == "reject")
-        else None
-    )
-    ctx_for_key = Ctx(
-        config=config,
-        args=args,
-        out=out,
-        store=store,
-        stage_name=stage_name,
-        stage_display=_stage_display(stage_spec),
-        declared_needs=frozenset(stage_spec.logical_needs),
-        cell=Cell(stage_spec.cell),
-        cell_out=cell_output_path(out, stage_spec),
-        need_cells=stage_spec.need_cells,
-    )
-    components = compute_key_components(
-        stage_spec,
-        ctx_for_key,
-        upstream_keys,
-        cached_inputs,
-        config_access=previous_access,
-        dependencies=merge_dependencies(pipeline_type.depends, stage_spec.depends),
-        fingerprint_session=keying_session.fingerprints,
-    )
-    decision_key = input_key(components)
-    attempt = store.read_attempt(stage_name)
-    failure = store.read_failure(stage_name)
-    if previous is None and attempt is not None and failure is None and stage_spec.kind == "single":
-        try:
-            _produced_paths(stage_spec.produces, ctx_for_key)
-        except FileNotFoundError:
-            pass
-    artifacts_match = True
-    if previous is not None and _success_outputs_exist(previous, out):
-        _, current_artifact_root = _current_artifacts(previous, out, keying_session.fingerprints)
-        artifacts_match = current_artifact_root == previous.artifact_fingerprint
-    if stage_spec.kind == "single":
+def _decision_for_key(
+    runtime: _Runtime,
+    stage_spec,
+    current_key: str,
+    components: KeyComponents,
+    previous: SuccessRecord | None,
+    artifacts_match: bool,
+) -> tuple[Decision, dict[int, BatchRecord] | None, FailureRecord | None]:
+    attempt = runtime.store.read_attempt(stage_spec.name)
+    failure = runtime.store.read_failure(stage_spec.name)
+    partial = None
+    options: dict[str, Any]
+    if stage_spec.kind == "batch":
+        partial = _validated_partial(
+            runtime.store.read_partial(stage_spec.name, current_key),
+            runtime.out,
+            runtime.keying.fingerprints,
+        )
+        options = {"partial": partial, "output_exists": lambda path: (runtime.out / path).exists()}
+    else:
         produces = previous.produces if previous is not None else []
         assert produces is not None
-        decision = decide_single(
-            current_key=decision_key,
+        options = {"produces_exist": all((runtime.out / item.path).exists() for item in produces)}
+    return (
+        decide(
+            kind=stage_spec.kind,
+            current_key=current_key,
             current_components=components,
             success=previous,
             attempt=attempt,
-            produces_exist=all((out / item.path).exists() for item in produces),
             artifacts_match=artifacts_match,
             failure=failure,
-        )
-    else:
-        partial = _validated_partial(
-            store.read_partial(stage_name, decision_key), out, keying_session.fingerprints
-        )
-        decision = decide_batch(
-            current_key=decision_key,
-            current_components=components,
-            success=previous,
-            partial=partial,
-            attempt=attempt,
-            output_exists=lambda path: (out / path).exists(),
-            artifacts_match=artifacts_match,
-            failure=failure,
-        )
+            **options,
+        ),
+        partial,
+        failure,
+    )
+
+
+def _unavailable_probe(
+    stage: str,
+    decision: Decision,
+    unavailable_reason: str,
+    source: SourceFingerprint,
+    *,
+    previous: SuccessRecord | None = None,
+    review: SourceReviewState = SourceReviewState("not-applicable"),
+    failure: FailureRecord | None = None,
+) -> StageProbe:
     return StageProbe(
-        stage=stage_name,
+        stage=stage,
+        decision=decision,
+        decision_key=None,
+        components=None,
+        previous=previous,
+        source_fingerprint=source,
+        source_review=review,
+        failure=failure,
+        unavailable_reason=unavailable_reason,
+    )
+
+
+def _stage_decision(
+    runtime: _Runtime,
+    stage_spec,
+    *,
+    source_fingerprint: SourceFingerprint,
+    known_upstream_fingerprints: dict[str, str] | None = None,
+    source_review: SourceReviewState | None = None,
+    config_access: list[str] | None | object = _INFER_CONFIG_ACCESS,
+) -> StageProbe:
+    previous = runtime.keying.read_success(runtime.store, stage_spec.name)
+    review = source_review or _source_review(runtime, stage_spec.name, previous, source_fingerprint)
+    if config_access is _INFER_CONFIG_ACCESS:
+        config_access = (
+            previous.key_components.config_access
+            if previous is not None
+            and not (review.relationship == "changed" and review.decision == "reject")
+            else None
+        )
+    ctx = runtime.context(stage_spec)
+    components = compute_key_components(
+        stage_spec,
+        ctx,
+        _upstream_keys(runtime, stage_spec, known_upstream_fingerprints),
+        previous.key_components.inputs if previous is not None else None,
+        config_access=config_access,  # type: ignore[arg-type]
+        dependencies=merge_dependencies(runtime.pipeline.depends, stage_spec.depends),
+        fingerprint_session=runtime.keying.fingerprints,
+    )
+    decision_key = input_key(components)
+    artifacts_match = True
+    if previous is not None and _success_outputs_exist(runtime, previous):
+        artifact_root = _current_artifacts(runtime, previous)
+        artifacts_match = artifact_root == previous.artifact_fingerprint
+    decision, partial, failure = _decision_for_key(
+        runtime,
+        stage_spec,
+        decision_key,
+        components,
+        previous,
+        artifacts_match,
+    )
+    return StageProbe(
+        stage=stage_spec.name,
         decision=decision,
         decision_key=decision_key,
         components=components,
@@ -610,7 +592,37 @@ def _probe_stage(
         source_fingerprint=source_fingerprint,
         source_review=review,
         failure=failure,
+        _partial=partial,
+        _artifacts_match=artifacts_match,
     )
+
+
+def _probe_stage(
+    runtime: _Runtime,
+    stage_name: str,
+    *,
+    known_upstream_fingerprints: dict[str, str],
+    source_fingerprint: SourceFingerprint,
+) -> StageProbe:
+    stage_spec = runtime.graph.stages[stage_name]
+    probe = _stage_decision(
+        runtime,
+        stage_spec,
+        known_upstream_fingerprints=known_upstream_fingerprints,
+        source_fingerprint=source_fingerprint,
+    )
+    attempt = runtime.store.read_attempt(stage_name)
+    if (
+        probe.previous is None
+        and attempt is not None
+        and runtime.store.read_failure(stage_name) is None
+        and stage_spec.kind == "single"
+    ):
+        try:
+            _produced_paths(stage_spec.produces, runtime.context(stage_spec))
+        except FileNotFoundError:
+            pass
+    return probe
 
 
 def probe_pipeline(
@@ -634,6 +646,7 @@ def probe_pipeline(
     keying_session = _keying_session or _KeyingSession(
         fingerprints=FingerprintSession(force_rehash=force_rehash)
     )
+    runtime = _Runtime(pipeline_type, graph, config, args, out, store, keying_session)
     topo_order = graph.topo_order()
     if _stage_names is not None:
         unknown = _stage_names.difference(graph.stages)
@@ -648,33 +661,23 @@ def probe_pipeline(
             source_fingerprint = keying_session.source_fingerprint(pipeline_type, stage_spec, store)
         except Exception as error:  # noqa: BLE001 - status must retain evaluation errors.
             probes.append(
-                StageProbe(
-                    stage=stage_name,
-                    decision=Decision("error", str(error)),
-                    decision_key=None,
-                    components=None,
+                _unavailable_probe(
+                    stage_name,
+                    Decision("error", str(error)),
+                    str(error),
+                    SourceFingerprint(fingerprint="error", files=[]),
                     previous=keying_session.read_success(store, stage_name),
-                    source_fingerprint=SourceFingerprint(fingerprint="error", files=[]),
-                    source_review=SourceReviewState("not-applicable"),
-                    unavailable_reason=str(error),
                 )
             )
             continue
         if schema_migration:
             assert manifest is not None
             probes.append(
-                StageProbe(
-                    stage=stage_name,
-                    decision=Decision("needs-run", "schema-migration"),
-                    decision_key=None,
-                    components=None,
-                    previous=None,
-                    source_fingerprint=source_fingerprint,
-                    source_review=SourceReviewState("not-applicable"),
-                    unavailable_reason=(
-                        f"store schema {manifest.schema_version} must be rebuilt as "
-                        f"schema {SCHEMA_VERSION}"
-                    ),
+                _unavailable_probe(
+                    stage_name,
+                    Decision("needs-run", "schema-migration"),
+                    f"store schema {manifest.schema_version} must be rebuilt as schema {SCHEMA_VERSION}",
+                    source_fingerprint,
                 )
             )
             continue
@@ -685,56 +688,38 @@ def probe_pipeline(
         if missing_upstream is not None:
             previous = keying_session.read_success(store, stage_name)
             probes.append(
-                StageProbe(
-                    stage=stage_name,
-                    decision=Decision("needs-run", "no-cache"),
-                    decision_key=None,
-                    components=None,
+                _unavailable_probe(
+                    stage_name,
+                    Decision("needs-run", "no-cache"),
+                    f"upstream {missing_upstream} has no success record",
+                    source_fingerprint,
                     previous=previous,
-                    source_fingerprint=source_fingerprint,
-                    source_review=_source_review(
-                        store,
-                        stage_name,
-                        previous,
-                        source_fingerprint,
-                        keying_session,
-                    ),
-                    unavailable_reason=f"upstream {missing_upstream} has no success record",
+                    review=_source_review(runtime, stage_name, previous, source_fingerprint),
                 )
             )
             continue
         previous = keying_session.read_success(store, stage_name)
-        review = _source_review(store, stage_name, previous, source_fingerprint, keying_session)
+        review = _source_review(runtime, stage_name, previous, source_fingerprint)
         try:
             probe = _probe_stage(
-                pipeline_type,
-                graph,
+                runtime,
                 stage_name,
-                config=config,
-                args=args,
-                out=out,
-                store=store,
                 known_upstream_fingerprints=known_upstream_fingerprints,
                 source_fingerprint=source_fingerprint,
-                keying_session=keying_session,
             )
         except Exception as error:  # noqa: BLE001 - status must retain evaluation errors.
-            probe = StageProbe(
-                stage=stage_name,
-                decision=Decision("error", str(error)),
-                decision_key=None,
-                components=None,
+            probe = _unavailable_probe(
+                stage_name,
+                Decision("error", str(error)),
+                str(error),
+                source_fingerprint,
                 previous=previous,
-                source_fingerprint=source_fingerprint,
-                source_review=review,
+                review=review,
                 failure=store.read_failure(stage_name),
-                unavailable_reason=str(error),
             )
         probes.append(probe)
-        if probe.previous is not None and _success_outputs_exist(probe.previous, out):
-            _, known_upstream_fingerprints[stage_name] = _current_artifacts(
-                probe.previous, out, keying_session.fingerprints
-            )
+        if probe.previous is not None and _success_outputs_exist(runtime, probe.previous):
+            known_upstream_fingerprints[stage_name] = _current_artifacts(runtime, probe.previous)
     return tuple(probes)
 
 
@@ -757,26 +742,36 @@ async def _execute_batch(instance, stage_spec, ctx: Ctx):
             yield ctx._current_batch_index, [Path(yielded)]
 
 
-async def _drive(
-    pipeline_type: type[Pipeline],
+def _display(
     graph: PipelineGraph,
-    config,
+    selected: set[str],
+    store: Store,
+    mode: RunDisplayMode,
+    reporter: RunReporter | None = None,
+) -> tuple[Any, RunReporter]:
+    if reporter is None:
+        plan = build_run_display_plan(graph, selected, store, mode=mode)
+        reporter = RunReporter(plan, logging.getLogger("varve"))
+    return reporter.plan, reporter
+
+
+async def _drive(
+    runtime: _Runtime,
     *,
-    args,
-    out: Path,
     upto: str | None,
     downstream: str | None,
     only: str | None,
     force: bool,
-    execute: bool,
     display_mode: RunDisplayMode,
     reporter: RunReporter | None = None,
     slices: tuple[str, ...] = (),
-    keying_session: _KeyingSession | None = None,
-    record_callback: Callable[[str, SuccessRecord | None], None] | None = None,
 ) -> list[StageOutcome]:
-    store = Store(out)
-    keying_session = keying_session or _KeyingSession()
+    graph, store, out, keying_session = (
+        runtime.graph,
+        runtime.store,
+        runtime.out,
+        runtime.keying,
+    )
     selected = selected_stages(
         graph,
         upto=upto,
@@ -784,263 +779,109 @@ async def _drive(
         only=only,
         slices=slices,
     )
-    if reporter is None:
-        display_plan = build_run_display_plan(graph, selected, store, mode=display_mode)
-        reporter = RunReporter(display_plan, logging.getLogger("varve"))
-    else:
-        display_plan = reporter.plan
-    preflight_by_stage: dict[str, StageProbe] = {}
-    execution_source_reviews: dict[str, SourceReviewState] = {}
-    if execute:
-        ancestors, _ = _stage_sets(graph)
-        preflight_names = set(selected)
-        for selected_name in selected:
-            preflight_names.update(_closure(selected_name, ancestors))
-        preflight = probe_pipeline(
-            pipeline_type,
-            config,
-            args=args,
-            out=out,
-            graph=graph,
-            _keying_session=keying_session,
-            _stage_names=preflight_names,
+    display_plan, reporter = _display(graph, selected, store, display_mode, reporter)
+    preflight_names = graph.closure(selected)
+    preflight = probe_pipeline(
+        runtime.pipeline,
+        runtime.config,
+        args=runtime.args,
+        out=out,
+        graph=graph,
+        _keying_session=keying_session,
+        _stage_names=preflight_names,
+    )
+    preflight_by_stage = {probe.stage: probe for probe in preflight}
+    external = preflight_names.difference(selected)
+    pending = [
+        probe.stage
+        for probe in preflight
+        if probe.source_review.relationship == "changed" and probe.source_review.decision == "none"
+        if not force or probe.stage in external
+    ]
+    if pending:
+        raise ReviewRequiredError(pending)
+    errors = [probe for probe in preflight if probe.decision.status == "error"]
+    if errors:
+        details = "; ".join(f"{probe.stage}: {probe.decision.reason}" for probe in errors)
+        raise ValueError(f"Cannot evaluate selected stages: {details}")
+    unavailable_external = [
+        (probe, status, effective_reason(probe.decision.reason, probe.source_review))
+        for probe in preflight
+        if probe.stage in external
+        and (status := effective_status(probe.decision.status, probe.source_review)) != "hit"
+    ]
+    if unavailable_external:
+        details = "; ".join(
+            f"{probe.stage}: {status}: {reason}" for probe, status, reason in unavailable_external
         )
-        preflight_by_stage = {probe.stage: probe for probe in preflight}
-        pending_all = [
-            probe.stage
-            for probe in preflight
-            if probe.source_review.relationship == "changed"
-            and probe.source_review.decision == "none"
-        ]
-        if pending_all and not force:
-            raise ReviewRequiredError(pending_all)
-        external = preflight_names.difference(selected)
-        pending_external = [stage for stage in pending_all if stage in external]
-        if pending_external:
-            raise ReviewRequiredError(pending_external)
-        errors = [probe for probe in preflight if probe.decision.status == "error"]
-        if errors:
-            details = "; ".join(f"{probe.stage}: {probe.decision.reason}" for probe in errors)
-            raise ValueError(f"Cannot evaluate selected stages: {details}")
-        unavailable_external = [
-            probe
-            for probe in preflight
-            if probe.stage in external
-            and (
-                probe.decision.status != "hit"
-                or (
-                    probe.source_review.relationship == "changed"
-                    and probe.source_review.decision == "reject"
-                )
-            )
-        ]
-        if unavailable_external:
-            details = "; ".join(
-                f"{probe.stage}: "
-                + (
-                    "needs-run: source-changed"
-                    if probe.source_review.relationship == "changed"
-                    and probe.source_review.decision == "reject"
-                    else f"{probe.decision.status}: {probe.decision.reason}"
-                )
-                for probe in unavailable_external
-            )
-            raise ValueError(f"Upstream stage is not current: {details}")
-        if force:
-            candidates = tuple(
-                ReviewCandidate(
-                    stage=probe.stage,
-                    base_stage=graph.stages[probe.stage].base_name or probe.stage,
-                    source_fingerprint=probe.source_fingerprint,
-                    source_review=probe.source_review,
-                )
-                for probe in preflight
-                if probe.stage in selected
-            )
-            writes = plan_review_writes(candidates, "reject")
-            apply_review_writes(store, writes, _now())
-        execution_source_reviews = {
-            probe.stage: (
-                SourceReviewState("changed", "reject")
-                if force and probe.source_review.relationship == "changed"
-                else probe.source_review
+        raise ValueError(f"Upstream stage is not current: {details}")
+    if force:
+        candidates = tuple(
+            ReviewCandidate(
+                stage=probe.stage,
+                source_fingerprint=probe.source_fingerprint,
+                source_review=probe.source_review,
             )
             for probe in preflight
             if probe.stage in selected
-        }
-
-    instance = pipeline_type()
+        )
+        apply_review_writes(store, plan_review_writes(candidates, "reject"), _now())
+    execution_source_reviews = {
+        probe.stage: (
+            SourceReviewState("changed", "reject")
+            if force and probe.source_review.relationship == "changed"
+            else probe.source_review
+        )
+        for probe in preflight
+        if probe.stage in selected
+    }
+    instance = runtime.pipeline()
     outcomes: list[StageOutcome] = []
-    known_upstream_fingerprints: dict[str, str] = {}
-    known_success: dict[str, bool] = {}
-    reporter.log_plan(graph.topo_order())
+    reporter.log_plan()
 
     for stage_name in graph.topo_order():
         if stage_name not in selected:
             continue
         stage_spec = graph.stages[stage_name]
         reporter.start(stage_name)
-        if not execute:
-            for name in stage_spec.needs:
-                if name not in known_success:
-                    known_success[name] = keying_session.read_success(store, name) is not None
-            missing_upstream = any(not known_success[name] for name in stage_spec.needs)
-            if missing_upstream:
-                previous = keying_session.read_success(store, stage_name)
-                known_success[stage_name] = previous is not None
-                if record_callback is not None:
-                    record_callback(stage_name, previous)
-                    keying_session.discard_success(store, stage_name)
-                outcome = display_plan.outcome(stage_name, "needs-run", "no-cache", None)
-                outcomes.append(outcome)
-                reporter.record(outcome)
-                continue
-            source_fingerprint = keying_session.source_fingerprint(pipeline_type, stage_spec, store)
-            probe = _probe_stage(
-                pipeline_type,
-                graph,
-                stage_name,
-                config=config,
-                args=args,
-                out=out,
-                store=store,
-                known_upstream_fingerprints=known_upstream_fingerprints,
-                source_fingerprint=source_fingerprint,
-                keying_session=keying_session,
-            )
-            assert probe.decision_key is not None
-            if probe.previous is not None and _success_outputs_exist(probe.previous, out):
-                _, known_upstream_fingerprints[stage_name] = _current_artifacts(
-                    probe.previous, out, keying_session.fingerprints
-                )
-            known_success[stage_name] = probe.previous is not None
-            if record_callback is not None:
-                record_callback(stage_name, probe.previous)
-                keying_session.discard_success(store, stage_name)
-            reporter.lifecycle(stage_name, probe.decision.status, probe.decision.reason)
-            reporter.input_key(stage_name, probe.decision_key)
-            outcome = display_plan.outcome(
-                stage_name, probe.decision.status, probe.decision.reason, None
-            )
-            outcomes.append(outcome)
-            reporter.record(outcome)
-            continue
         source_fingerprint = preflight_by_stage[stage_name].source_fingerprint
-        upstream_keys = _upstream_keys(stage_spec, store, keying_session)
-        previous = keying_session.read_success(store, stage_name)
         review = execution_source_reviews[stage_name]
-        cached_inputs = previous.key_components.inputs if previous is not None else None
-        previous_access = (
-            previous.key_components.config_access
-            if previous is not None
-            and not (review.relationship == "changed" and review.decision == "reject")
-            else None
-        )
-        declared_needs = frozenset(stage_spec.logical_needs)
-        ctx_for_key = Ctx(
-            config=config,
-            args=args,
-            out=out,
-            store=store,
-            stage_name=stage_name,
-            stage_display=_stage_display(stage_spec),
-            declared_needs=declared_needs,
-            cell=Cell(stage_spec.cell),
-            cell_out=cell_output_path(out, stage_spec),
-            need_cells=stage_spec.need_cells,
-        )
-        # Probe key: project config onto the fields the previous run read (whole
-        # config when there is no prior record). The committed key below is
-        # reprojected onto this run's actual reads.
-        components = compute_key_components(
+        probe = _stage_decision(
+            runtime,
             stage_spec,
-            ctx_for_key,
-            upstream_keys,
-            cached_inputs,
-            config_access=previous_access,
-            dependencies=merge_dependencies(pipeline_type.depends, stage_spec.depends),
-            fingerprint_session=keying_session.fingerprints,
+            source_fingerprint=source_fingerprint,
+            source_review=review,
         )
-        current_key = input_key(components)
-        attempt = store.read_attempt(stage_name)
-        artifacts_match = True
-        if previous is not None and _success_outputs_exist(previous, out):
-            _, current_artifact_root = _current_artifacts(
-                previous, out, keying_session.fingerprints
-            )
-            artifacts_match = current_artifact_root == previous.artifact_fingerprint
-        failure = store.read_failure(stage_name)
-
-        partial: dict[int, BatchRecord] | None = None
+        previous = probe.previous
+        previous_access = probe.components.config_access if probe.components is not None else None
+        components = probe.components
+        current_key = probe.decision_key
+        assert components is not None and current_key is not None
         partial_adoption: tuple[str, str, dict[int, BatchRecord]] | None = None
-        if stage_spec.kind == "single":
-            produces = []
-            if previous is not None:
-                assert previous.produces is not None
-                produces = previous.produces
-            produces_exist = all((out / item.path).exists() for item in produces)
-            decision = decide_single(
-                current_key=current_key,
-                current_components=components,
-                success=previous,
-                attempt=attempt,
-                produces_exist=produces_exist,
-                artifacts_match=artifacts_match,
-                failure=failure,
-            )
-        else:
-            partial = _validated_partial(
-                store.read_partial(stage_name, current_key), out, keying_session.fingerprints
-            )
-            decision = decide_batch(
-                current_key=current_key,
-                current_components=components,
-                success=previous,
-                partial=partial,
-                attempt=attempt,
-                output_exists=lambda path: (out / path).exists(),
-                artifacts_match=artifacts_match,
-                failure=failure,
-            )
+        decision, partial, failure = probe.decision, probe._partial, probe.failure
 
         probe_key = current_key
         probe_partial = partial
-        source_changed = (
-            previous is not None
-            and previous.executed_source_fingerprint.fingerprint != source_fingerprint.fingerprint
-        )
-        if source_changed and previous_access is not None and (decision.status != "hit" or force):
+        if (
+            review.relationship == "changed"
+            and previous_access is not None
+            and (decision.status != "hit" or force)
+        ):
             # An accepted source change may continue using the old access set
             # while probing a reusable materialization. Once this run will
             # actually execute, use the whole Config as the conservative input
             # basis and let the execution record a new access set.
-            components = compute_key_components(
+            probe = _stage_decision(
+                runtime,
                 stage_spec,
-                ctx_for_key,
-                upstream_keys,
-                cached_inputs,
+                source_fingerprint=source_fingerprint,
+                source_review=review,
                 config_access=None,
-                dependencies=merge_dependencies(pipeline_type.depends, stage_spec.depends),
-                fingerprint_session=keying_session.fingerprints,
             )
-            current_key = input_key(components)
-            attempt = store.read_attempt(stage_name)
-            if stage_spec.kind == "single":
-                decision = decide_single(
-                    current_key=current_key,
-                    current_components=components,
-                    success=previous,
-                    attempt=attempt,
-                    produces_exist=produces_exist,
-                    artifacts_match=artifacts_match,
-                    failure=failure,
-                )
-            else:
-                full_key_partial = _validated_partial(
-                    store.read_partial(stage_name, current_key),
-                    out,
-                    keying_session.fingerprints,
-                )
+            components, current_key = probe.components, probe.decision_key
+            assert components is not None and current_key is not None
+            decision, full_key_partial, failure = probe.decision, probe._partial, probe.failure
+            if stage_spec.kind == "batch":
                 if (
                     review.relationship == "changed"
                     and review.decision == "accept"
@@ -1052,16 +893,18 @@ async def _drive(
                     partial_adoption = (probe_key, current_key, partial)
                 else:
                     partial = full_key_partial
-                decision = decide_batch(
-                    current_key=current_key,
-                    current_components=components,
-                    success=previous,
-                    partial=partial,
-                    attempt=attempt,
-                    output_exists=lambda path: (out / path).exists(),
-                    artifacts_match=artifacts_match,
-                    failure=failure,
-                )
+                if partial is not full_key_partial:
+                    decision = decide(
+                        kind="batch",
+                        current_key=current_key,
+                        current_components=components,
+                        success=previous,
+                        partial=partial,
+                        attempt=store.read_attempt(stage_name),
+                        output_exists=lambda path: (out / path).exists(),
+                        artifacts_match=probe._artifacts_match,
+                        failure=failure,
+                    )
 
         # `failed` is the read-only state of the last attempt. Once a run has
         # been requested, retry it using any validated batch checkpoints.
@@ -1081,21 +924,25 @@ async def _drive(
             decision = Decision("needs-run", "source-changed")
         if force:
             decision = Decision("needs-run", "forced")
-        if execute and decision.status == "hit":
+        if decision.status == "hit":
             _refresh_fingerprint_cache(
-                store=store,
+                runtime=runtime,
                 previous=previous,
                 components=components,
-                keying_session=keying_session,
             )
-        if decision.status == "hit":
             reporter.lifecycle(stage_name, decision.status, decision.reason)
             reporter.input_key(stage_name, current_key)
             outcome = display_plan.outcome(stage_name, decision.status, decision.reason, None)
             outcomes.append(outcome)
             reporter.record(outcome)
             continue
-        _validate_static_produces_location(stage_spec.produces, ctx_for_key)
+        access = ConfigAccess()
+        ctx = runtime.context(
+            stage_spec,
+            config=RecordingConfig(runtime.config, access),
+            resume_skip=decision.resume_skip,
+        )
+        _validate_static_produces_location(stage_spec.produces, ctx)
         if partial_adoption is not None:
             old_key, new_key, adopted = partial_adoption
             for batch in adopted.values():
@@ -1118,56 +965,23 @@ async def _drive(
                 touched_existing=previous is not None,
             ),
         )
-        access = ConfigAccess()
-        ctx = Ctx(
-            config=RecordingConfig(config, access),
-            args=args,
-            out=out,
-            store=store,
-            resume_skip=decision.resume_skip,
-            stage_name=stage_name,
-            stage_display=_stage_display(stage_spec),
-            declared_needs=declared_needs,
-            cell=Cell(stage_spec.cell),
-            cell_out=cell_output_path(out, stage_spec),
-            need_cells=stage_spec.need_cells,
-        )
         if stage_spec.kind == "single":
             try:
                 await _execute_stage(instance, stage_spec, ctx)
             except Exception as error:
-                _record_stage_failure(store, pipeline_type, stage_name, error)
+                _record_stage_failure(runtime, stage_name, error)
                 raise
             produces = _produced_paths(stage_spec.produces, ctx)
-            elapsed = time.monotonic() - started
-            committed_access = _merge_config_access(previous, source_fingerprint, access.resolve())
-            commit_components = _commit_components(components, config, committed_access)
-            keying_session.write_success(
-                store,
-                SuccessRecord(
-                    pipeline=pipeline_type.__name__,
-                    stage=stage_name,
-                    kind="single",
-                    input_key=input_key(commit_components),
-                    key_components=commit_components,
-                    executed_source_fingerprint=source_fingerprint,
-                    artifact_fingerprint=artifacts_root_fingerprint(
-                        [item.artifact for item in produces]
-                    ),
-                    produces=produces,
-                    committed_at=_now(),
-                    elapsed=elapsed,
-                ),
-            )
+            outputs = None
+            artifact_root = artifacts_root_fingerprint([item.artifact for item in produces])
         else:
+            produces = None
             partial_for_outputs = partial if decision.resume_skip else None
-            outputs_by_index = _batch_outputs_from_records(
-                previous=None,
-                partial=partial_for_outputs,
-                out=out,
-                force=force,
-            )
-            warned_without_resume = False
+            outputs_by_index = {
+                index: list(batch.yielded)
+                for index, batch in (partial_for_outputs or {}).items()
+                if all((out / path).exists() for path in batch.yielded)
+            }
             partial_enabled = True
             saw_yield = False
             batch_iterator = _execute_batch(instance, stage_spec, ctx).__aiter__()
@@ -1177,37 +991,30 @@ async def _drive(
                 except StopAsyncIteration:
                     break
                 except Exception as error:
-                    _record_stage_failure(store, pipeline_type, stage_name, error)
+                    _record_stage_failure(runtime, stage_name, error)
                     raise
                 saw_yield = True
-                if not ctx._used_resume and not warned_without_resume:
+                if not ctx._used_resume and partial_enabled:
                     warnings.warn(
                         f"batch stage {stage_name!r} yielded without iterating ctx.resume; "
                         "its outputs are not resumable. Wrap your iterable in ctx.resume(...) "
                         "to enable per-batch checkpoint resume.",
                         stacklevel=2,
                     )
-                    warned_without_resume = True
-                if not ctx._used_resume and partial_enabled:
                     store.clear_partial(stage_name, current_key)
                     outputs_by_index.clear()
                     partial_enabled = False
                 index = yielded_index if yielded_index is not None else len(outputs_by_index)
                 yielded = []
                 for path in index_paths:
-                    absolute = path if path.is_absolute() else ctx.cell_out / path
-                    if not absolute.exists():
-                        hint = _cwd_relative_path_hint(path, ctx.cell_out)
-                        if hint is not None:
-                            raise ValueError(hint)
-                        raise FileNotFoundError(f"Yielded varve output does not exist: {absolute}")
-                    if stage_spec.cell:
-                        _relative_to_out(
-                            absolute,
-                            ctx.cell_out,
-                            description="Yielded matrix stage output",
-                        )
-                    yielded.append(_relative_to_out(absolute, out))
+                    _, relative = _managed_output(
+                        path,
+                        ctx,
+                        "Yielded varve output",
+                        matrix_description="Yielded matrix stage output",
+                        cwd_hint=True,
+                    )
+                    yielded.append(relative)
                 if partial_enabled:
                     store.write_batch(
                         stage_name,
@@ -1247,27 +1054,38 @@ async def _drive(
                 for index, paths in sorted(outputs_by_index.items())
                 for path in paths
             ]
-            elapsed = time.monotonic() - started
-            committed_access = _merge_config_access(previous, source_fingerprint, access.resolve())
-            commit_components = _commit_components(components, config, committed_access)
-            keying_session.write_success(
-                store,
-                SuccessRecord(
-                    pipeline=pipeline_type.__name__,
-                    stage=stage_name,
-                    kind="batch",
-                    input_key=input_key(commit_components),
-                    key_components=commit_components,
-                    executed_source_fingerprint=source_fingerprint,
-                    artifact_fingerprint=artifacts_root_fingerprint(
-                        [item.artifact for item in outputs],
-                        positions=_batch_artifact_positions(outputs),
-                    ),
-                    outputs=outputs,
-                    committed_at=_now(),
-                    elapsed=elapsed,
-                ),
+            artifact_root = artifacts_root_fingerprint(
+                [item.artifact for item in outputs],
+                positions=[
+                    (index, ordinal)
+                    for index, paths in sorted(outputs_by_index.items())
+                    for ordinal, _ in enumerate(paths)
+                ],
             )
+        elapsed = time.monotonic() - started
+        committed_access = _merge_config_access(previous, source_fingerprint, access.resolve())
+        commit_components = components.model_copy(
+            update={
+                "config": project_config(config_data(runtime.config), committed_access),
+                "config_access": committed_access,
+            }
+        )
+        keying_session.write_success(
+            store,
+            SuccessRecord(
+                pipeline=runtime.pipeline.__name__,
+                stage=stage_name,
+                kind=stage_spec.kind,
+                input_key=input_key(commit_components),
+                key_components=commit_components,
+                executed_source_fingerprint=source_fingerprint,
+                artifact_fingerprint=artifact_root,
+                produces=produces,
+                outputs=outputs,
+                committed_at=_now(),
+                elapsed=elapsed,
+            ),
+        )
         store.clear_attempt(stage_name)
         store.clear_failure(stage_name)
         store.clear_review(stage_name)
@@ -1331,25 +1149,19 @@ def run(
             build_run_display_plan(graph, selected, store, mode=display_mode),
             logging.getLogger("varve"),
         )
+        keying = _KeyingSession(fingerprints=FingerprintSession(force_rehash=rehash))
+        runtime = _Runtime(pipeline, graph, config, args, out, store, keying)
         try:
             return asyncio.run(
                 _drive(
-                    pipeline,
-                    graph,
-                    config,
-                    args=args,
-                    out=out,
+                    runtime,
                     upto=upto,
                     downstream=downstream,
                     only=only,
                     force=force,
-                    execute=True,
                     display_mode=display_mode,
                     reporter=reporter,
                     slices=slices,
-                    keying_session=_KeyingSession(
-                        fingerprints=FingerprintSession(force_rehash=rehash)
-                    ),
                 )
             )
         except Exception as error:
@@ -1392,7 +1204,6 @@ def record_source_review(
         candidates = tuple(
             ReviewCandidate(
                 stage=probe.stage,
-                base_stage=graph.stages[probe.stage].base_name or probe.stage,
                 source_fingerprint=probe.source_fingerprint,
                 source_review=probe.source_review,
             )
@@ -1433,20 +1244,36 @@ def evaluate_state(
         is_temporary=is_temporary,
     )
     graph = graph or build_graph(pipeline, axes)
-    return asyncio.run(
-        _drive(
-            pipeline,
-            graph,
-            config,
-            args=args,
-            out=out,
-            upto=upto,
-            downstream=downstream,
-            only=only,
-            force=False,
-            execute=False,
-            display_mode="expand",
-            keying_session=_keying_session,
-            record_callback=_record_callback,
-        )
+    keying = _keying_session or _KeyingSession()
+    store = Store(out)
+    selected = selected_stages(graph, upto=upto, downstream=downstream, only=only)
+    probes = probe_pipeline(
+        pipeline,
+        config,
+        args=args,
+        out=out,
+        graph=graph,
+        _keying_session=keying,
+        _stage_names=selected,
     )
+    by_stage = {probe.stage: probe for probe in probes}
+    display_plan, reporter = _display(graph, selected, store, "expand")
+    outcomes = []
+    reporter.log_plan()
+    for stage_name in graph.topo_order():
+        if stage_name not in selected:
+            continue
+        probe = by_stage[stage_name]
+        reporter.start(stage_name)
+        if _record_callback is not None:
+            _record_callback(stage_name, probe.previous)
+            keying.discard_success(store, stage_name)
+        if probe.decision_key is not None:
+            reporter.lifecycle(stage_name, probe.decision.status, probe.decision.reason)
+            reporter.input_key(stage_name, probe.decision_key)
+        outcome = display_plan.outcome(
+            stage_name, probe.decision.status, probe.decision.reason, None
+        )
+        outcomes.append(outcome)
+        reporter.record(outcome)
+    return outcomes

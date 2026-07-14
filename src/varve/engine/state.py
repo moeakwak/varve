@@ -56,20 +56,16 @@ EFFECTIVE_STATUS_SEVERITY: tuple[EffectiveStatus, ...] = (
     "failed",
     "error",
 )
-_EXECUTION_STATUS_SEVERITY = {
-    status: index for index, status in enumerate(EXECUTION_STATUS_SEVERITY)
-}
-_EFFECTIVE_STATUS_SEVERITY = {
-    status: index for index, status in enumerate(EFFECTIVE_STATUS_SEVERITY)
-}
+
+
+def _aggregate_status(statuses, severity):
+    return max(statuses, key=severity.index) if statuses else "hit"
 
 
 def aggregate_execution_status(statuses: Sequence[ExecutionStatus]) -> ExecutionStatus:
     """Return the most severe execution status, treating no stages as a hit."""
 
-    if not statuses:
-        return "hit"
-    return max(statuses, key=_EXECUTION_STATUS_SEVERITY.__getitem__)
+    return _aggregate_status(statuses, EXECUTION_STATUS_SEVERITY)
 
 
 def aggregate_effective_status(statuses: Sequence[EffectiveStatus]) -> EffectiveStatus:
@@ -77,9 +73,7 @@ def aggregate_effective_status(statuses: Sequence[EffectiveStatus]) -> Effective
 
     if "needs-review" in statuses:
         return "needs-review"
-    if not statuses:
-        return "hit"
-    return max(statuses, key=_EFFECTIVE_STATUS_SEVERITY.__getitem__)
+    return _aggregate_status(statuses, EFFECTIVE_STATUS_SEVERITY)
 
 
 def effective_status(
@@ -101,13 +95,6 @@ def effective_reason(execution_reason: str, source_review: SourceReviewState) ->
     if source_review.relationship == "changed" and source_review.decision != "accept":
         return "source-changed"
     return execution_reason
-
-
-# Kept until the shared status/dashboard model is migrated in Phase 3. Engine
-# execution code must use the explicit names above.
-Status = ExecutionStatus
-STATUS_SEVERITY = EXECUTION_STATUS_SEVERITY
-aggregate_status = aggregate_execution_status
 
 
 @dataclass(frozen=True)
@@ -132,97 +119,62 @@ class Decision:
         return f"{self.reason} · resume {progress}"
 
 
-def _partial_total(partial: dict[int, BatchRecord] | None) -> int | None:
-    totals = {record.total for record in (partial or {}).values() if record.total is not None}
-    return next(iter(totals)) if len(totals) == 1 else None
-
-
-def decide_single(
+def decide(
     *,
+    kind: Literal["single", "batch"],
     current_key: str,
     current_components: KeyComponents,
     success: SuccessRecord | None,
     attempt: AttemptMarker | None,
-    produces_exist: bool,
+    produces_exist: bool = True,
+    partial: dict[int, BatchRecord] | None = None,
+    output_exists: Callable[[str], bool] | None = None,
     artifacts_match: bool = True,
     failure: object | None = None,
 ) -> Decision:
+    outputs_exist = produces_exist
+    if kind == "batch" and success is not None and success.input_key == current_key:
+        assert success.outputs is not None
+        assert output_exists is not None
+        outputs_exist = all(output_exists(output.path) for output in success.outputs)
+    skip = frozenset(partial or ())
+    totals = {record.total for record in (partial or {}).values() if record.total is not None}
+    total = next(iter(totals)) if len(totals) == 1 else None
     if failure is not None:
-        return Decision("failed", "stage-failed")
+        return Decision("failed", "stage-failed", skip, total)
     if attempt is not None:
-        return Decision("needs-run", "interrupted")
-    if success is None:
-        return Decision("needs-run", "no-cache")
-    if success.input_key == current_key and produces_exist:
+        return (
+            Decision("resume", "resume", skip, total)
+            if partial
+            else Decision("needs-run", "interrupted")
+        )
+    if success is not None and success.input_key == current_key:
+        if not outputs_exist:
+            return Decision("needs-run", "artifact-missing")
         return (
             Decision("hit", "hit") if artifacts_match else Decision("needs-run", "artifact-changed")
         )
-    if success.input_key == current_key:
-        return Decision("needs-run", "artifact-missing")
-    return Decision("needs-run", invalidation_reason(success.key_components, current_components))
-
-
-def decide_batch(
-    *,
-    current_key: str,
-    current_components: KeyComponents,
-    success: SuccessRecord | None,
-    partial: dict[int, BatchRecord] | None,
-    attempt: AttemptMarker | None,
-    output_exists: Callable[[str], bool],
-    artifacts_match: bool = True,
-    failure: object | None = None,
-) -> Decision:
-    if failure is not None:
-        skip = frozenset(partial) if partial is not None else frozenset()
-        return Decision("failed", "stage-failed", skip, _partial_total(partial))
-    if attempt is not None:
-        if partial:
-            return Decision(
-                "resume",
-                "resume",
-                frozenset(partial),
-                _partial_total(partial),
-            )
-        return Decision("needs-run", "interrupted")
-
-    if success is not None:
-        if success.input_key == current_key:
-            assert success.outputs is not None
-            output_paths_by_index: dict[int, list[str]] = {}
-            for output in success.outputs:
-                output_paths_by_index.setdefault(output.index, []).append(output.path)
-            existing = {
-                index
-                for index, paths in output_paths_by_index.items()
-                if all(output_exists(path) for path in paths)
-            }
-            if len(existing) == len(output_paths_by_index):
-                return (
-                    Decision("hit", "hit")
-                    if artifacts_match
-                    else Decision("needs-run", "artifact-changed")
-                )
-            return Decision("needs-run", "artifact-missing")
-
     if partial:
-        skip = {
+        assert output_exists is not None
+        skip = frozenset(
             index
             for index, batch in partial.items()
             if all(output_exists(path) for path in batch.yielded)
-        }
-        return Decision("resume", "resume", frozenset(skip), _partial_total(partial))
-    if success is not None:
-        return Decision(
-            "needs-run", invalidation_reason(success.key_components, current_components)
         )
-    return Decision("needs-run", "no-cache")
+        return Decision("resume", "resume", skip, total)
+    if success is None:
+        return Decision("needs-run", "no-cache")
+    return Decision("needs-run", invalidation_reason(success.key_components, current_components))
 
 
 def invalidation_reason(old: KeyComponents, new: KeyComponents) -> str:
-    for name in sorted(set(old.config) | set(new.config)):
-        if old.config.get(name) != new.config.get(name):
-            return f"config: {name} {old.config.get(name)!r} -> {new.config.get(name)!r}"
+    for label, before, after in (
+        ("config", old.config, new.config),
+        ("value", old.values, new.values),
+    ):
+        for name in sorted(set(before) | set(after)):
+            if before.get(name) != after.get(name):
+                return f"{label}: {name} {before.get(name)!r} -> {after.get(name)!r}"
     old_files = file_digest_view(old.inputs)
     new_files = file_digest_view(new.inputs)
     if old_files != new_files:
@@ -230,9 +182,6 @@ def invalidation_reason(old: KeyComponents, new: KeyComponents) -> str:
             if old_files.get(name) != new_files.get(name):
                 return f"input: {name} changed"
         return "inputs-changed"
-    for name in sorted(set(old.values) | set(new.values)):
-        if old.values.get(name) != new.values.get(name):
-            return f"value: {name} {old.values.get(name)!r} -> {new.values.get(name)!r}"
     for name in sorted(set(old.upstreams) | set(new.upstreams)):
         if old.upstreams.get(name) != new.upstreams.get(name):
             return f"upstream '{name}' changed"

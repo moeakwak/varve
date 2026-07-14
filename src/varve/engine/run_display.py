@@ -36,7 +36,6 @@ class StageOutcome:
 class RunDisplayGroup:
     base_name: str
     stages: tuple[str, ...]
-    is_matrix: bool
     compact: bool
 
 
@@ -45,21 +44,16 @@ class RunDisplayPlan:
     groups: tuple[RunDisplayGroup, ...]
     by_stage: Mapping[str, RunDisplayGroup]
 
-    def plan_entries(self, topo_order: list[str]) -> tuple[str, ...]:
-        entries: list[str] = []
-        emitted_groups: set[str] = set()
-        for stage_name in topo_order:
-            group = self.by_stage.get(stage_name)
-            if group is None:
-                continue
-            if not group.compact:
-                entries.append(stage_name)
-                continue
-            if group.base_name in emitted_groups:
-                continue
-            emitted_groups.add(group.base_name)
-            entries.append(f"{group.base_name} ({len(group.stages)} cells)")
-        return tuple(entries)
+    def plan_entries(self) -> tuple[str, ...]:
+        return tuple(
+            entry
+            for group in self.groups
+            for entry in (
+                (f"{group.base_name} ({len(group.stages)} cells)",)
+                if group.compact
+                else group.stages
+            )
+        )
 
     def outcome(
         self,
@@ -94,17 +88,15 @@ def build_run_display_plan(
 
     ordered = [stage for stage in graph.topo_order() if stage in selected]
     grouped: dict[str, list[str]] = {}
-    is_matrix: dict[str, bool] = {}
     for stage_name in ordered:
         spec = graph.stages[stage_name]
         base_name = spec.base_name or spec.name
         grouped.setdefault(base_name, []).append(stage_name)
-        is_matrix[base_name] = bool(spec.cell)
 
     groups: list[RunDisplayGroup] = []
     by_stage: dict[str, RunDisplayGroup] = {}
     for base_name, stages in grouped.items():
-        matrix_group = is_matrix[base_name]
+        matrix_group = bool(graph.stages[stages[0]].cell)
         if not matrix_group or mode == "expand":
             compact = False
         elif mode == "compact":
@@ -117,12 +109,7 @@ def build_run_display_plan(
                 for stage in stages
             )
             compact = len(stages) >= AUTO_COMPACT_MIN_CELLS and not has_slow_history
-        group = RunDisplayGroup(
-            base_name=base_name,
-            stages=tuple(stages),
-            is_matrix=matrix_group,
-            compact=compact,
-        )
+        group = RunDisplayGroup(base_name, tuple(stages), compact)
         groups.append(group)
         by_stage.update((stage, group) for stage in stages)
     return RunDisplayPlan(tuple(groups), MappingProxyType(by_stage))
@@ -149,8 +136,8 @@ class RunReporter:
         self._completed: dict[str, list[StageOutcome]] = {}
         self.active_stage: str | None = None
 
-    def log_plan(self, topo_order: list[str]) -> None:
-        self.logger.info("plan: %s", " -> ".join(self.plan.plan_entries(topo_order)))
+    def log_plan(self) -> None:
+        self.logger.info("plan: %s", " -> ".join(self.plan.plan_entries()))
 
     def start(self, stage: str) -> None:
         self.active_stage = stage
@@ -169,13 +156,10 @@ class RunReporter:
     def input_key(self, stage: str, value: str) -> None:
         self.logger.debug("[%s] input_key %s", stage, value)
 
-    def failure(self, stage: str, error: BaseException) -> None:
-        # Failures are always concrete, even for compact groups.
-        self.logger.error("[%s] error · %s", stage, error)
-
     def failure_current(self, error: BaseException) -> None:
         if self.active_stage is not None:
-            self.failure(self.active_stage, error)
+            # Failures are always concrete, even for compact groups.
+            self.logger.error("[%s] error · %s", self.active_stage, error)
 
     def record(self, outcome: StageOutcome) -> None:
         group = self.plan.by_stage[outcome.stage]
@@ -214,14 +198,11 @@ class RunOutcomeRow:
 def outcome_rows(outcomes: list[StageOutcome]) -> tuple[RunOutcomeRow, ...]:
     """Fold outcomes using the display decision captured before execution."""
 
-    compact: dict[str, list[StageOutcome]] = {}
-    for outcome in outcomes:
-        if outcome.display_compact:
-            assert outcome.display_base is not None
-            compact.setdefault(outcome.display_base, []).append(outcome)
-
+    compact = {
+        base: [item for item in outcomes if item.display_base == base]
+        for base in dict.fromkeys(item.display_base for item in outcomes if item.display_compact)
+    }
     rows: list[RunOutcomeRow] = []
-    emitted: set[str] = set()
     for outcome in outcomes:
         if not outcome.display_compact:
             rows.append(
@@ -238,10 +219,9 @@ def outcome_rows(outcomes: list[StageOutcome]) -> tuple[RunOutcomeRow, ...]:
             )
             continue
         assert outcome.display_base is not None
-        if outcome.display_base in emitted:
+        group = compact.pop(outcome.display_base, None)
+        if group is None:
             continue
-        emitted.add(outcome.display_base)
-        group = compact[outcome.display_base]
         ran = sum(item.elapsed is not None for item in group)
         rows.append(
             RunOutcomeRow(

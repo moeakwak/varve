@@ -44,11 +44,15 @@ class PipelineState(BaseModel):
 
     @property
     def status(self) -> EffectiveStatus:
-        return "error" if self.error is not None else self._status.status
+        return "error" if self.pipeline_status is None else self.pipeline_status.status
 
     @property
     def complete(self) -> bool:
-        return self.error is None and self._status.complete
+        return (
+            self.error is None
+            and self.pipeline_status is not None
+            and self.pipeline_status.complete
+        )
 
     @property
     def duration(self) -> float | None:
@@ -57,9 +61,3 @@ class PipelineState(BaseModel):
     @property
     def last_run(self) -> datetime | None:
         return None if self.pipeline_status is None else self.pipeline_status.last_run
-
-    @property
-    def _status(self) -> PipelineStatus:
-        if self.pipeline_status is None:
-            raise RuntimeError("Pipeline state has no exact status")
-        return self.pipeline_status

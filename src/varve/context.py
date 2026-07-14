@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Iterable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, TypeVar, cast
 
@@ -12,14 +11,6 @@ from varve.store.store import Store
 
 ConfigT = TypeVar("ConfigT")
 ArgsT = TypeVar("ArgsT")
-
-
-@dataclass(frozen=True)
-class StageDisplay:
-    """Structured stage metadata used only for runtime labels."""
-
-    base_name: str
-    cell_values: tuple[str, ...] = ()
 
 
 def _len_or_none(iterable: Iterable[Any]) -> int | None:
@@ -41,27 +32,6 @@ def _make_tqdm_progress(
     return tqdm(total=total, initial=initial, desc=desc, unit=unit)
 
 
-class _ResumeProgress:
-    def __init__(
-        self,
-        *,
-        desc: str,
-        total: int | None,
-        initial: int,
-        unit: str,
-    ) -> None:
-        self._bar = _make_tqdm_progress(desc=desc, total=total, initial=initial, unit=unit)
-
-    def update(self) -> None:
-        self._bar.update(1)
-
-    def set_postfix(self, text: str) -> None:
-        self._bar.set_postfix_str(text)
-
-    def close(self) -> None:
-        self._bar.close()
-
-
 class Ctx(Generic[ConfigT, ArgsT]):
     """Runtime context passed to stage methods.
 
@@ -79,7 +49,7 @@ class Ctx(Generic[ConfigT, ArgsT]):
         store: Store,
         resume_skip: frozenset[int] | None = None,
         stage_name: str | None = None,
-        stage_display: StageDisplay | None = None,
+        stage_display: tuple[str, ...] = (),
         declared_needs: frozenset[str] | None = None,
         cell: Cell | None = None,
         cell_out: Path | None = None,
@@ -119,15 +89,7 @@ class Ctx(Generic[ConfigT, ArgsT]):
             record = self._store.read_success(concrete_name)
             if record is None:
                 raise ValueError(f"Upstream stage has no success record: {concrete_name}")
-            if record.kind == "single":
-                assert record.produces is not None
-                paths.extend(self.out / item.path for item in record.produces)
-            else:
-                assert record.outputs is not None
-                paths.extend(
-                    self.out / item.path
-                    for item in sorted(record.outputs, key=lambda item: item.index)
-                )
+            paths.extend(self.out / path for path in record.paths)
         return paths
 
     def input(self, stage: str) -> Path:
@@ -171,12 +133,12 @@ class Ctx(Generic[ConfigT, ArgsT]):
         self._used_resume = True
         inferred_total = total if total is not None else _len_or_none(iterable)
         self._resume_total = inferred_total
-        progress_handle: _ResumeProgress | None = None
+        progress_handle = None
         if progress:
             if desc is not None:
                 label = desc
-            elif self._stage_display is not None and self._stage_display.cell_values:
-                label = " / ".join(self._stage_display.cell_values)
+            elif self._stage_display:
+                label = " / ".join(self._stage_display)
             else:
                 label = self._stage_name or "batch"
             initial = (
@@ -184,7 +146,7 @@ class Ctx(Generic[ConfigT, ArgsT]):
                 if inferred_total is not None
                 else 0
             )
-            progress_handle = _ResumeProgress(
+            progress_handle = _make_tqdm_progress(
                 desc=label,
                 total=inferred_total,
                 initial=initial,
@@ -198,8 +160,8 @@ class Ctx(Generic[ConfigT, ArgsT]):
                 yield index, item
                 if progress_handle is not None:
                     if postfix is not None:
-                        progress_handle.set_postfix(postfix(item))
-                    progress_handle.update()
+                        progress_handle.set_postfix_str(postfix(item))
+                    progress_handle.update(1)
         finally:
             if progress_handle is not None:
                 progress_handle.close()

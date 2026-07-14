@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from typing import Any, Protocol
+from collections.abc import Mapping
+from typing import Any
 
 from pydantic import BaseModel
 
+from varve.decorators import StageSpec
 from varve.dependencies import Dependencies, DependencyContext
 from varve.keying.config_access import project_config
 from varve.keying.fingerprint import (
@@ -21,20 +22,6 @@ _MATRIX_LAYOUT_KEY = "__varve_matrix_layout__"
 _MATRIX_LAYOUT_VERSION = 2
 
 
-class StageSpecLike(Protocol):
-    @property
-    def func(self) -> Callable[..., Any]: ...
-
-    @property
-    def depends(self) -> Dependencies: ...
-
-    @property
-    def needs(self) -> tuple[str, ...]: ...
-
-    @property
-    def cell(self) -> tuple[tuple[Any, Any], ...]: ...
-
-
 def config_data(config: Any) -> dict[str, Any]:
     if isinstance(config, BaseModel):
         return config.model_dump(mode="json")
@@ -44,7 +31,7 @@ def config_data(config: Any) -> dict[str, Any]:
 
 
 def compute_key_components(
-    stage_spec: StageSpecLike,
+    stage_spec: StageSpec,
     ctx: Any,
     upstream_keys: Mapping[str, str],
     cached_inputs: Mapping[str, list[FileFingerprint]] | None = None,

@@ -13,12 +13,7 @@ def configure_cli_logging(verbose: bool = False, *, quiet: bool = False) -> None
     logger = logging.getLogger("varve")
     # The live per-stage progress log is a `run` concern. Read-only commands like
     # `status` already print a table, so they stay quiet unless `-v` is given.
-    if verbose:
-        level = logging.DEBUG
-    elif quiet:
-        level = logging.WARNING
-    else:
-        level = logging.INFO
+    level = logging.DEBUG if verbose else logging.WARNING if quiet else logging.INFO
     logger.setLevel(level)
     if not logger.handlers:
         # RichHandler adds a colored timestamp column and lets the highlighter

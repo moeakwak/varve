@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import varve.context
-from varve.context import Ctx, StageDisplay
+from varve.context import Ctx
 from varve.models import (
     ArtifactFingerprint,
     KeyComponents,
@@ -193,10 +193,7 @@ def test_resume_progress_matrix_default_uses_canonical_values(
     ctx = _ctx(
         tmp_path,
         stage_name="score@bench=ocrbench-v2-formula,model=qwen3-vl-8b-instruct",
-        stage_display=StageDisplay(
-            base_name="score",
-            cell_values=("ocrbench-v2-formula", "qwen3-vl-8b-instruct"),
-        ),
+        stage_display=("ocrbench-v2-formula", "qwen3-vl-8b-instruct"),
     )
 
     _collect(ctx, ["item"])
@@ -211,7 +208,7 @@ def test_resume_progress_explicit_desc_is_unchanged_for_matrix_cell(
     ctx = _ctx(
         tmp_path,
         stage_name="score@bench=a,model=b",
-        stage_display=StageDisplay(base_name="score", cell_values=("a", "b")),
+        stage_display=("a", "b"),
     )
 
     _collect(ctx, ["item"], desc="custom axis-aware description")

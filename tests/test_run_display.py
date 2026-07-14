@@ -200,7 +200,7 @@ def test_compact_runner_aggregates_live_hits_runs_and_outcomes(tmp_path: Path, c
 def test_compact_cli_outcome_table_has_one_group_row(tmp_path: Path, capsys) -> None:
     outcomes = run(LargeMatrix, Config(), cli_out=tmp_path)
 
-    render_run_outcomes(make_console(), outcomes, elapsed=True)
+    render_run_outcomes(make_console(), outcomes)
 
     output = capsys.readouterr().out
     assert "STAGE" in output
@@ -242,7 +242,7 @@ def test_compact_cli_outcome_table_styles_each_status_token(
         ),
     ]
 
-    render_run_outcomes(make_console(), outcomes, elapsed=True)
+    render_run_outcomes(make_console(), outcomes)
 
     assert called == ["hit", "needs-run"]
     assert "1 hit, 1 needs-run" in capsys.readouterr().out

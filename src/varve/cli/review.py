@@ -26,11 +26,10 @@ class BulkReviewFailure:
 
 
 def _words(decision: ReviewAction) -> tuple[str, str]:
-    if decision == "accept":
-        return "Accepted", "accepted"
-    if decision == "reject":
-        return "Rejected", "rejected"
-    raise ValueError(f"Unknown source review decision: {decision}")
+    try:
+        return {"accept": ("Accepted", "accepted"), "reject": ("Rejected", "rejected")}[decision]
+    except KeyError as error:
+        raise ValueError(f"Unknown source review decision: {decision}") from error
 
 
 def _action_style(decision: ReviewAction, kind: str) -> str:
@@ -42,39 +41,36 @@ def _append_count(text: Text, value: int, label: str, decision: ReviewAction) ->
     text.append(f" {label}")
 
 
+def _plural(value: int, singular: str, plural: str | None = None) -> str:
+    return singular if value == 1 else plural or f"{singular}s"
+
+
 def _group_line(group: ReviewGroupResult, decision: ReviewAction) -> Text:
     _, past = _words(decision)
     line = Text()
     line.append(group.canonical_target, style="varve.review.stage")
     line.append(": ")
-    clauses: list[Text] = []
     if group.recorded:
-        clause = Text()
         _append_count(
-            clause,
+            line,
             len(group.recorded),
-            "decision recorded" if len(group.recorded) == 1 else "decisions recorded",
+            _plural(len(group.recorded), "decision recorded", "decisions recorded"),
             decision,
         )
-        clauses.append(clause)
     if group.already_decided:
-        clause = Text()
-        clause.append(str(len(group.already_decided)), style=_action_style(decision, "already"))
-        clause.append(f" already {past}", style=_action_style(decision, "already"))
-        clauses.append(clause)
-    for index, clause in enumerate(clauses):
-        if index:
+        if group.recorded:
             line.append(", ")
-        line.append_text(clause)
+        line.append(str(len(group.already_decided)), style=_action_style(decision, "already"))
+        line.append(f" already {past}", style=_action_style(decision, "already"))
     if group.did_not_need_review:
-        if clauses:
+        if group.recorded or group.already_decided:
             line.append("; ")
         line.append(
             f"{len(group.did_not_need_review)} "
-            + (
-                "cell did not need review"
-                if len(group.did_not_need_review) == 1
-                else "cells did not need review"
+            + _plural(
+                len(group.did_not_need_review),
+                "cell did not need review",
+                "cells did not need review",
             ),
             style="varve.review.noop",
         )
@@ -121,7 +117,7 @@ def render_source_review(console: Console, result: SourceReviewResult) -> None:
         _append_count(
             total,
             len(result.recorded),
-            "review decision" if len(result.recorded) == 1 else "review decisions",
+            _plural(len(result.recorded), "review decision"),
             result.decision,
         )
         total.append(" across ")
@@ -129,16 +125,10 @@ def render_source_review(console: Console, result: SourceReviewResult) -> None:
             str(len(result.source_changed_cells)),
             style=_action_style(result.decision, "action"),
         )
-        total.append(
-            " source-changed cell."
-            if len(result.source_changed_cells) == 1
-            else " source-changed cells."
-        )
+        total.append(f" {_plural(len(result.source_changed_cells), 'source-changed cell')}.")
         console.print(total)
-    elif result.has_source_changes:
-        console.print("No review decisions changed.", style="varve.review.noop")
     else:
-        console.print("No source changes require review.", style="varve.review.noop")
+        console.print("No review decisions changed.", style="varve.review.noop")
 
 
 def render_bulk_source_review(
@@ -164,27 +154,20 @@ def render_bulk_source_review(
         line.append(" [")
         line.append(entry.branch, style="varve.review.branch")
         line.append("]: ")
-        parts = []
         if entry.result.recorded:
-            parts.append(
-                (
-                    len(entry.result.recorded),
-                    "decision recorded"
-                    if len(entry.result.recorded) == 1
-                    else "decisions recorded",
-                    "action",
-                )
+            count = len(entry.result.recorded)
+            _append_count(
+                line,
+                count,
+                _plural(count, "decision recorded", "decisions recorded"),
+                decision,
             )
         if entry.result.already_decided:
-            parts.append((len(entry.result.already_decided), f"already {past}", "already"))
-        for index, (count, label, style_kind) in enumerate(parts):
-            if index:
+            if entry.result.recorded:
                 line.append("; ")
-            line.append(str(count), style=_action_style(decision, style_kind))
-            line.append(
-                f" {label}",
-                style=_action_style(decision, style_kind) if style_kind == "already" else "",
-            )
+            style = _action_style(decision, "already")
+            line.append(str(len(entry.result.already_decided)), style=style)
+            line.append(f" already {past}", style=style)
         line.append(".")
         console.print(line)
     for failure in failures:
@@ -202,25 +185,26 @@ def render_bulk_source_review(
         _append_count(
             total,
             recorded,
-            "review decision" if recorded == 1 else "review decisions",
+            _plural(recorded, "review decision"),
             decision,
         )
         total.append(" across ")
         total.append(str(len(changed_entries)), style=_action_style(decision, "action"))
-        total.append(" pipeline branch." if len(changed_entries) == 1 else " pipeline branches.")
+        total.append(f" {_plural(len(changed_entries), 'pipeline branch', 'pipeline branches')}.")
         console.print(total)
     elif changed_entries:
         console.print("No review decisions changed.", style="varve.review.noop")
     if no_source_count:
         console.print(
             f"{no_source_count} "
-            + ("pipeline branch had" if no_source_count == 1 else "pipeline branches had")
+            + _plural(no_source_count, "pipeline branch had", "pipeline branches had")
             + " no source changes.",
             style="varve.review.noop",
         )
     if failures:
         console.print(
             f"{len(failures)} "
-            + ("pipeline branch failed." if len(failures) == 1 else "pipeline branches failed."),
+            + _plural(len(failures), "pipeline branch failed", "pipeline branches failed")
+            + ".",
             style="varve.review.error",
         )

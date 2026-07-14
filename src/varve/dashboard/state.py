@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from varve.branch_config import ResolvedBranch, resolve_branch
@@ -14,15 +12,6 @@ from varve.engine.runner import _KeyingSession
 from varve.matrix import PipelineGraph, build_graph
 from varve.pipeline import Pipeline
 from varve.status import collect_pipeline_status
-
-
-@dataclass(frozen=True)
-class ResolvedEntryTarget:
-    """A discovered branch and graph without operational Args."""
-
-    resolved: ResolvedBranch
-    output_root: Path
-    graph: PipelineGraph
 
 
 def load_state(entry: PipelineEntry, session: _KeyingSession | None = None) -> PipelineState:
@@ -105,16 +94,11 @@ def import_entry_pipeline(entry: PipelineEntry) -> type[Pipeline]:
         raise ValueError("Manifest is missing pipeline")
     if entry.module is None:
         raise ValueError("Manifest is missing module")
-    return _import_pipeline(entry.module, entry.pipeline_name)
-
-
-def resolve_entry_branch(entry: PipelineEntry, pipeline: type[Pipeline]) -> ResolvedBranch:
-    return resolve_branch(
-        pipeline,
-        branch=entry.branch,
-        override_json=None,
-        cli_out=_output_base(entry),
-    )
+    module = importlib.import_module(entry.module)
+    value = getattr(module, entry.pipeline_name)
+    if not isinstance(value, type) or not issubclass(value, Pipeline):
+        raise TypeError(f"{entry.module}.{entry.pipeline_name} is not a varve Pipeline")
+    return value
 
 
 def resolve_entry_context(
@@ -124,23 +108,31 @@ def resolve_entry_context(
 ) -> ResolvedCommandContext:
     """Restore a discovered store's exact output identity as a shared context."""
 
-    target = resolve_entry_target(entry, pipeline)
-    context = resolved_command_context(
+    resolved, graph = resolve_entry_target(entry, pipeline)
+    return resolved_command_context(
         pipeline,
-        target.resolved,
+        resolved,
         args,
-        graph=target.graph,
+        graph=graph,
     )
-    return context
 
 
 def resolve_entry_target(
     entry: PipelineEntry,
     pipeline: type[Pipeline],
-) -> ResolvedEntryTarget:
+) -> tuple[ResolvedBranch, PipelineGraph]:
     """Resolve only the branch, exact output identity, and graph."""
 
-    resolved = resolve_entry_branch(entry, pipeline)
+    resolved = resolve_branch(
+        pipeline,
+        branch=entry.branch,
+        override_json=None,
+        cli_out=(
+            entry.output_root.parent.parent
+            if entry.output_root.parent.name == ".tmp"
+            else entry.output_root.parent
+        ),
+    )
     output_root = pipeline.output_root(
         resolved.config,
         cli_out=resolved.output_base,
@@ -151,25 +143,7 @@ def resolve_entry_target(
         raise ValueError(
             f"Resolved output root {output_root} does not match manifest anchor {entry.output_root}"
         )
-    return ResolvedEntryTarget(
-        resolved=resolved,
-        output_root=output_root,
-        graph=build_graph(pipeline, resolved.axes),
-    )
-
-
-def _import_pipeline(module_name: str, class_name: str) -> type[Pipeline]:
-    module = importlib.import_module(module_name)
-    value = getattr(module, class_name)
-    if not isinstance(value, type) or not issubclass(value, Pipeline):
-        raise TypeError(f"{module_name}.{class_name} is not a varve Pipeline")
-    return value
-
-
-def _output_base(entry: PipelineEntry) -> Path:
-    if entry.output_root.parent.name == ".tmp":
-        return entry.output_root.parent.parent
-    return entry.output_root.parent
+    return resolved, build_graph(pipeline, resolved.axes)
 
 
 def _ambiguity(module: str, branch: str, candidates: list[PipelineEntry]) -> str:

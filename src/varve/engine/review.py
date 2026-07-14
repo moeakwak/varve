@@ -22,7 +22,6 @@ class ReviewCandidate:
     """A source observation complete enough to make a review decision."""
 
     stage: str
-    base_stage: str
     source_fingerprint: SourceFingerprint
     source_review: SourceReviewState
 
@@ -41,13 +40,9 @@ class ReviewGroupResult:
     """Natural-language summary data for one base stage or broad selector."""
 
     canonical_target: str
-    base_stage: str
-    matched_cells: tuple[str, ...]
-    source_changed_cells: tuple[str, ...]
     recorded: tuple[str, ...]
     already_decided: tuple[str, ...]
     did_not_need_review: tuple[str, ...]
-    failed_cells: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -62,15 +57,10 @@ class SourceReviewResult:
     already_decided: tuple[str, ...]
     did_not_need_review: tuple[str, ...]
     exact_target: str | None = None
-    failed_cells: tuple[str, ...] = ()
 
     @property
     def has_source_changes(self) -> bool:
         return bool(self.source_changed_cells)
-
-    @property
-    def changed_decisions(self) -> bool:
-        return bool(self.recorded)
 
     def __len__(self) -> int:
         """Return the number of decisions recorded by this command."""
@@ -98,10 +88,9 @@ def apply_review_writes(
     store: ReviewStore,
     writes: Sequence[ReviewWrite],
     decided_at: str,
-) -> tuple[str, ...]:
+) -> None:
     """Atomically replace each planned record, preserving per-record integrity."""
 
-    written: list[str] = []
     for write in writes:
         store.write_review(
             write.stage,
@@ -112,8 +101,6 @@ def apply_review_writes(
                 decided_at=decided_at,
             ),
         )
-        written.append(write.stage)
-    return tuple(written)
 
 
 def plan_source_review(
@@ -141,22 +128,14 @@ def plan_source_review(
     writes = plan_review_writes(selected_candidates, decision)
     recorded_set = {write.stage for write in writes}
 
-    source_changed = tuple(
-        candidate.stage
-        for candidate in selected_candidates
-        if candidate.source_review.relationship == "changed"
-    )
-    already = tuple(
-        candidate.stage
-        for candidate in selected_candidates
-        if candidate.source_review.relationship == "changed"
-        and candidate.source_review.decision == decision
-    )
-    did_not_need = tuple(
-        candidate.stage
-        for candidate in selected_candidates
-        if candidate.source_review.relationship != "changed"
-    )
+    source_changed, already, did_not_need = [], [], []
+    for candidate in selected_candidates:
+        if candidate.source_review.relationship != "changed":
+            did_not_need.append(candidate.stage)
+        else:
+            source_changed.append(candidate.stage)
+            if candidate.source_review.decision == decision:
+                already.append(candidate.stage)
     recorded = tuple(stage for stage in selected if stage in recorded_set)
 
     selectors_by_base: dict[str, list[ResolvedStageSelector]] = {}
@@ -177,15 +156,16 @@ def plan_source_review(
         ):
             canonical_target = base_selectors[0].canonical
         base_set = set(base_selected)
+
+        def members(stages: Sequence[str]) -> tuple[str, ...]:
+            return tuple(stage for stage in stages if stage in base_set)
+
         groups.append(
             ReviewGroupResult(
                 canonical_target=canonical_target,
-                base_stage=base_stage,
-                matched_cells=base_selected,
-                source_changed_cells=tuple(stage for stage in source_changed if stage in base_set),
-                recorded=tuple(stage for stage in recorded if stage in base_set),
-                already_decided=tuple(stage for stage in already if stage in base_set),
-                did_not_need_review=tuple(stage for stage in did_not_need if stage in base_set),
+                recorded=members(recorded),
+                already_decided=members(already),
+                did_not_need_review=members(did_not_need),
             )
         )
 
@@ -196,9 +176,9 @@ def plan_source_review(
         decision=decision,
         groups=tuple(groups),
         matched_cells=selected,
-        source_changed_cells=source_changed,
+        source_changed_cells=tuple(source_changed),
         recorded=recorded,
-        already_decided=already,
-        did_not_need_review=did_not_need,
+        already_decided=tuple(already),
+        did_not_need_review=tuple(did_not_need),
         exact_target=exact_target,
     )

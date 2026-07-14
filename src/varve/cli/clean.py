@@ -9,10 +9,17 @@ from typing import Any
 
 from varve.engine.runner import selected_stages
 from varve.matrix import PipelineGraph, build_graph
-from varve.models import Manifest
 from varve.pipeline import Pipeline
 from varve.store.lock import OutputLock
 from varve.store.store import Store
+
+
+def default_confirm(message: str) -> bool:
+    try:
+        answer = input(f"{message} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
 
 
 def _validate_destructive(root: Path, allowed_roots: list[Path] | None = None) -> None:
@@ -36,32 +43,23 @@ def _confirm(message: str, yes: bool, confirm: Callable[[str], bool] | None) -> 
     raise ValueError("Clean requires confirmation or yes=True")
 
 
-def _read_manifest_anchor(store: Store, pipeline: type[Pipeline]) -> Manifest:
+def _read_manifest_anchor(store: Store, pipeline: type[Pipeline]) -> None:
     manifest_path = store.root / "manifest.json"
     manifest = store.read_manifest()
     if manifest is None:
         raise ValueError(f"Missing varve manifest anchor: {manifest_path}")
     if manifest.pipeline != pipeline.__name__:
         raise ValueError(f"Varve manifest belongs to {manifest.pipeline}, not {pipeline.__name__}")
-    return manifest
-
-
-def _record_paths(record) -> list[str]:
-    if record.kind == "single":
-        assert record.produces is not None
-        return [item.path for item in record.produces]
-    assert record.outputs is not None
-    return [item.path for item in record.outputs]
 
 
 def _validate_record_paths(root: Path, records: dict[str, Any]) -> None:
-    outside = []
     resolved_root = root.resolve()
-    for record in records.values():
-        for relative in _record_paths(record):
-            path = root / relative
-            if not path.resolve().is_relative_to(resolved_root):
-                outside.append(path)
+    outside = [
+        root / relative
+        for record in records.values()
+        for relative in record.paths
+        if not (root / relative).resolve().is_relative_to(resolved_root)
+    ]
     if outside:
         listed = ", ".join(str(path) for path in outside)
         raise ValueError(f"Refusing to clean output outside root: {listed}")
@@ -98,16 +96,16 @@ def clean(
             return
 
         stage_names = selected_stages(graph or build_graph(pipeline, axes), downstream=target)
-        records = {}
-        for stage_name in stage_names:
-            record = store.read_success(stage_name)
-            if record is not None:
-                records[stage_name] = record
+        records = {
+            stage_name: record
+            for stage_name in stage_names
+            if (record := store.read_success(stage_name)) is not None
+        }
         _validate_record_paths(root, records)
         _confirm(f"Clean varve stage subtree {target}?", yes, confirm)
 
         for stage_name, record in records.items():
-            for relative in _record_paths(record):
+            for relative in record.paths:
                 path = root / relative
                 if path.is_dir():
                     shutil.rmtree(path, ignore_errors=True)

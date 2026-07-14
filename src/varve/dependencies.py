@@ -45,14 +45,11 @@ class Dependencies:
 def merge_dependencies(base: Dependencies, stage: Dependencies) -> Dependencies:
     """Merge pipeline and stage declarations, rejecting ambiguous names."""
 
-    duplicate_inputs = set(base.inputs) & set(stage.inputs)
-    duplicate_values = set(base.values) & set(stage.values)
-    if duplicate_inputs or duplicate_values:
-        details = []
-        if duplicate_inputs:
-            details.append(f"inputs {sorted(duplicate_inputs)!r}")
-        if duplicate_values:
-            details.append(f"values {sorted(duplicate_values)!r}")
+    duplicates = {
+        "inputs": set(base.inputs) & set(stage.inputs),
+        "values": set(base.values) & set(stage.values),
+    }
+    if details := [f"{kind} {sorted(names)!r}" for kind, names in duplicates.items() if names]:
         raise ValueError("Duplicate pipeline and stage dependencies: " + ", ".join(details))
     sources = tuple(dict.fromkeys((*base.sources, *stage.sources)))
     return Dependencies(

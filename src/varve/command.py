@@ -17,12 +17,7 @@ class ResolvedCommandContext:
 
     pipeline: type[Pipeline]
     resolved: ResolvedBranch
-    config: Any
     args: Any
-    branch: str
-    is_temporary: bool
-    axes: dict[str, tuple[str, ...]] | None
-    output_base: Path | None
     output_root: Path
     graph: PipelineGraph
 
@@ -45,12 +40,7 @@ def resolved_command_context(
     return ResolvedCommandContext(
         pipeline=pipeline,
         resolved=resolved,
-        config=resolved.config,
         args=args,
-        branch=resolved.branch,
-        is_temporary=resolved.is_temporary,
-        axes=resolved.axes,
-        output_base=resolved.output_base,
         output_root=output_root,
         graph=graph or build_graph(pipeline, resolved.axes),
     )

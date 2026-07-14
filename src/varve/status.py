@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 from varve.command import ResolvedCommandContext
 from varve.engine.runner import _KeyingSession, probe_pipeline
 from varve.engine.state import (
-    EFFECTIVE_STATUS_SEVERITY,
     EffectiveStatus,
     ExecutionStatus,
     ReviewDecision,
@@ -21,17 +21,9 @@ from varve.engine.state import (
     effective_status,
 )
 from varve.matrix import ResolvedStageSelector
-from varve.models import FileFingerprint
+from varve.models import KeyComponents
 
 SourceChange = Literal["changed", "added", "removed"]
-
-
-@dataclass(frozen=True)
-class KeyInputs:
-    config: dict[str, Any]
-    inputs: dict[str, list[FileFingerprint]]
-    values: dict[str, Any]
-    upstreams: dict[str, dict[str, str]]
 
 
 @dataclass(frozen=True)
@@ -45,7 +37,6 @@ class StageStatus:
     name: str
     base_name: str
     cell: tuple[CellCoordinate, ...]
-    kind: str
     needs: tuple[str, ...]
     logical_needs: tuple[str, ...]
     status: EffectiveStatus
@@ -59,7 +50,7 @@ class StageStatus:
     committed_at: datetime | None
     decision_key: str | None
     stored_key: str | None
-    key_inputs: KeyInputs | None
+    key_inputs: KeyComponents | None
     source_changes: dict[str, SourceChange]
     unavailable_reason: str | None
     failure: str | None = None
@@ -82,10 +73,7 @@ class StageStatusGroup:
 
     @property
     def status_counts(self) -> tuple[tuple[EffectiveStatus, int], ...]:
-        counts = {status: 0 for status in EFFECTIVE_STATUS_SEVERITY}
-        counts["needs-review"] = 0
-        for cell in self.cells:
-            counts[cell.status] += 1
+        counts = Counter(cell.status for cell in self.cells)
         order = ("needs-review", "hit", "needs-run", "resume", "failed", "error")
         return tuple((status, counts[status]) for status in order if counts[status])
 
@@ -204,7 +192,7 @@ def collect_pipeline_status(
     selected_names = None if resolved_selector is None else set(resolved_selector.concrete_stages)
     probes = probe_pipeline(
         context.pipeline,
-        context.config,
+        context.resolved.config,
         args=context.args,
         out=context.output_root,
         graph=context.graph,
@@ -219,17 +207,6 @@ def collect_pipeline_status(
     stages: list[StageStatus] = []
     for probe in selected_probes:
         spec = context.graph.stages[probe.stage]
-        components = probe.components
-        key_inputs = (
-            None
-            if components is None
-            else KeyInputs(
-                config=components.config,
-                inputs=components.inputs,
-                values=components.values,
-                upstreams=components.upstreams,
-            )
-        )
         previous = probe.previous
         source_changes: dict[str, SourceChange] = {}
         if probe.source_review.relationship == "changed" and previous is not None:
@@ -249,7 +226,6 @@ def collect_pipeline_status(
                     CellCoordinate(axis=axis.name, value_id=axis.id_of(value))
                     for axis, value in spec.cell
                 ),
-                kind=spec.kind,
                 needs=spec.needs,
                 logical_needs=spec.logical_needs,
                 status=status,
@@ -263,7 +239,7 @@ def collect_pipeline_status(
                 committed_at=_committed_at(None if previous is None else previous.committed_at),
                 decision_key=probe.decision_key,
                 stored_key=previous.input_key if previous is not None else None,
-                key_inputs=key_inputs,
+                key_inputs=probe.components,
                 source_changes=source_changes,
                 unavailable_reason=probe.unavailable_reason,
                 failure=(
@@ -276,7 +252,7 @@ def collect_pipeline_status(
     return PipelineStatus(
         pipeline=context.pipeline.__name__,
         module=context.pipeline.import_module_name(),
-        branch=context.branch,
+        branch=context.resolved.branch,
         output_root=context.output_root,
         stages=tuple(stages),
         selector=resolved_selector,

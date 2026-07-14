@@ -5,97 +5,30 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
 
 from pydantic import BaseModel
 
 from varve.branch_config import resolve_branch
 from varve.cli import argmap
-from varve.cli.clean import clean
-from varve.cli.review import render_source_review
-from varve.cli.run import render_run_outcomes
-from varve.cli.status import render_status, status_view
+from varve.cli.clean import default_confirm
+from varve.cli.commands import (
+    dispatch_command,
+    render_plan,
+)
 from varve.cli.structure import render_structure
 from varve.command import resolved_command_context
-from varve.engine.review import ReviewAction
-from varve.engine.runner import ReviewRequiredError, record_source_review, run, selected_stages
 from varve.log import configure_cli_logging
 from varve.matrix import build_graph
 from varve.pipeline import Pipeline
-from varve.status import collect_pipeline_status
 from varve.style import make_console
 
-_CONFIG_COMMANDS = {"run", "status", "clean", "accept", "reject"}
 _NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
-_COMMAND_OPTION_ARITIES = {
-    "run": {
-        "--branch": 1,
-        "--override": 1,
-        "--upto": 1,
-        "--downstream": 1,
-        "--only": 1,
-        "--slice": 1,
-        "--force": 0,
-        "--rehash": 0,
-        "-f": 0,
-        "--expand": 0,
-        "--compact": 0,
-        "--out": 1,
-    },
-    "status": {
-        "--branch": 1,
-        "--out": 1,
-        "--expand": 0,
-        "--rehash": 0,
-    },
-    "clean": {
-        "--branch": 1,
-        "--downstream": 1,
-        "--out": 1,
-        "--yes": 0,
-        "-y": 0,
-    },
-    "accept": {"--branch": 1, "--out": 1, "--stage": 1},
-    "reject": {"--branch": 1, "--out": 1, "--stage": 1},
-    "plan": {"--upto": 1, "--downstream": 1, "--only": 1, "--branch": 1, "--out": 1},
-}
-
-
-def _args_from_namespace(
-    pipeline: type[Pipeline],
-    namespace: argparse.Namespace,
-) -> BaseModel:
-    init_kwargs = argmap.collect_cli_args_namespace(namespace, pipeline.Args)
-    return pipeline.Args.model_validate(init_kwargs)
-
-
-def _print_plan(
-    graph,
-    *,
-    upto: str | None,
-    downstream: str | None,
-    only: str | None,
-) -> None:
-    selected = selected_stages(graph, upto=upto, downstream=downstream, only=only)
-    print(" -> ".join(name for name in graph.topo_order() if name in selected))
-
-
-def _default_confirm(message: str) -> bool:
-    try:
-        answer = input(f"{message} [y/N] ").strip().lower()
-    except EOFError:
-        return False
-    return answer in {"y", "yes"}
 
 
 def _selected_command_index(argv: list[str]) -> int | None:
-    index = 0
-    while index < len(argv):
-        token = argv[index]
+    for index, token in enumerate(argv):
         if token in {"-v", "--verbose"}:
-            index += 1
             continue
         if token == "--":
             next_index = index + 1
@@ -106,27 +39,22 @@ def _selected_command_index(argv: list[str]) -> int | None:
     return None
 
 
-def _option_name(token: str) -> str:
-    if token.startswith("--"):
-        return token.split("=", 1)[0]
-    return token
-
-
 def _looks_like_option(token: str) -> bool:
     return token.startswith("-") and token != "-" and _NEGATIVE_NUMBER_RE.match(token) is None
 
 
 def _has_unknown_option_before_config_registration(
     *,
-    command: str,
+    parser: argparse.ArgumentParser,
     command_args: list[str],
     args_type: type[BaseModel],
 ) -> bool:
     option_arities = argmap.args_option_arities(args_type)
-    option_arities.update(_COMMAND_OPTION_ARITIES[command])
-    # Let argparse handle help instead of failing the strict precheck.
-    option_arities.setdefault("--help", 0)
-    option_arities.setdefault("-h", 0)
+    option_arities.update(
+        (option, 0 if action.nargs == 0 else 1)
+        for action in parser._actions
+        for option in action.option_strings
+    )
 
     index = 0
     while index < len(command_args):
@@ -136,7 +64,7 @@ def _has_unknown_option_before_config_registration(
         if not token.startswith("-") or token == "-":
             index += 1
             continue
-        option = _option_name(token)
+        option = token.split("=", 1)[0] if token.startswith("--") else token
         arity = option_arities.get(option)
         if arity is None:
             return True
@@ -170,24 +98,8 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         metavar="JSON",
         help="Merge JSON over main Config and run a temporary branch.",
     )
-    run_stage = run_parser.add_mutually_exclusive_group()
-    selector_help = (
-        "Base selects all active cells; omitted axes are wildcards; "
-        "full coordinates select one cell."
-    )
-    run_stage.add_argument(
-        "--upto",
-        metavar="STAGE_SELECTOR",
-        help=f"Run the selector and all upstream stages. {selector_help}",
-    )
-    run_stage.add_argument(
-        "--downstream",
-        metavar="STAGE_SELECTOR",
-        help=f"Run the selector and all downstream stages. {selector_help}",
-    )
-    run_stage.add_argument(
-        "--only", metavar="STAGE_SELECTOR", help=f"Run only the selector. {selector_help}"
-    )
+    selector_help = argmap.STAGE_SELECTOR_HELP
+    argmap.add_stage_selection(run_parser, selector_help, verb="Run")
     run_parser.add_argument(
         "--slice", action="append", default=[], metavar="AXIS=ID", help="Slice a temporary branch."
     )
@@ -253,42 +165,29 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         review_parsers[command] = review_parser
 
     plan_parser = subparsers.add_parser("plan", help="print selected stage order")
-    plan_stage = plan_parser.add_mutually_exclusive_group()
-    plan_stage.add_argument(
-        "--upto",
-        metavar="STAGE_SELECTOR",
-        help=f"Print the selector and all upstream stages. {selector_help}",
-    )
-    plan_stage.add_argument(
-        "--downstream",
-        metavar="STAGE_SELECTOR",
-        help=f"Print the selector and all downstream stages. {selector_help}",
-    )
-    plan_stage.add_argument(
-        "--only", metavar="STAGE_SELECTOR", help=f"Print only the selector. {selector_help}"
-    )
+    argmap.add_stage_selection(plan_parser, selector_help, verb="Print")
     plan_parser.add_argument("--branch", default="main", metavar="NAME")
     plan_parser.add_argument("--out", type=Path, metavar="PATH")
 
     subparsers.add_parser("ls", help="list branch-independent pipeline structure")
+    config_parsers = {
+        "run": run_parser,
+        "status": status_parser,
+        "clean": clean_parser,
+        **review_parsers,
+    }
 
-    if selected_command in _CONFIG_COMMANDS and selected_command_index is not None:
+    if selected_command in config_parsers and selected_command_index is not None:
         command_args = raw_argv[selected_command_index + 1 :]
         if _has_unknown_option_before_config_registration(
-            command=selected_command,
+            parser=config_parsers[selected_command],
             command_args=command_args,
             args_type=pipeline.Args,
         ):
             parser.error("unknown option or missing option value")
 
-    if selected_command == "run":
-        argmap.register_args(run_parser, pipeline.Args)
-    if selected_command == "status":
-        argmap.register_args(status_parser, pipeline.Args)
-    if selected_command == "clean":
-        argmap.register_args(clean_parser, pipeline.Args)
-    if selected_command in review_parsers:
-        argmap.register_args(review_parsers[selected_command], pipeline.Args)
+    if selected_command in config_parsers:
+        argmap.register_args(config_parsers[selected_command], pipeline.Args)
 
     namespace = parser.parse_args(raw_argv)
     configure_cli_logging(namespace.verbose, quiet=namespace.command != "run")
@@ -300,13 +199,12 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         resolved = resolve_branch(
             pipeline, branch=namespace.branch, override_json=None, cli_out=namespace.out
         )
-        _print_plan(
+        return render_plan(
             build_graph(pipeline, resolved.axes),
             upto=namespace.upto,
             downstream=namespace.downstream,
             only=namespace.only,
         )
-        return 0
 
     resolved = resolve_branch(
         pipeline,
@@ -318,91 +216,18 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     graph = build_graph(pipeline, resolved.axes)
     if namespace.command == "run" and namespace.slice and not resolved.is_temporary:
         raise ValueError("--slice is only allowed on temporary branches")
-    args = _args_from_namespace(pipeline, namespace)
+    args = argmap.model_from_namespace(namespace, pipeline.Args)
     context = resolved_command_context(pipeline, resolved, args, graph=graph)
-    if namespace.command in {"accept", "reject"}:
-        decision: ReviewAction = "accept" if namespace.command == "accept" else "reject"
-        try:
-            result = record_source_review(
-                context.pipeline,
-                context.config,
-                decision=decision,
-                args=context.args,
-                targets=tuple(namespace.stage),
-                cli_out=context.output_base,
-                branch=context.branch,
-                is_temporary=context.is_temporary,
-                axes=context.axes,
-                graph=context.graph,
-            )
-        except ValueError as error:
+    try:
+        return dispatch_command(
+            context,
+            namespace,
+            confirm=default_confirm,
+            review_targets=(
+                tuple(namespace.stage) if namespace.command in {"accept", "reject"} else ()
+            ),
+        )
+    except ValueError as error:
+        if namespace.command in {"accept", "reject", "status"}:
             parser.error(str(error))
-        render_source_review(make_console(), result)
-    elif namespace.command == "status":
-        console = make_console()
-        loading = (
-            console.status("Evaluating pipeline status…", spinner="dots")
-            if console.is_terminal
-            else nullcontext()
-        )
-        with loading:
-            try:
-                status = collect_pipeline_status(
-                    context,
-                    selector=namespace.stage,
-                    rehash=namespace.rehash,
-                )
-            except ValueError as error:
-                parser.error(str(error))
-        render_status(
-            console,
-            status,
-            view=status_view(status, expand=namespace.expand),
-            dependency_depth=0,
-        )
-    elif namespace.command == "clean":
-        allowed_roots = (
-            None
-            if isinstance(context.config, SimpleNamespace)
-            else context.pipeline.clean_roots(context.config)
-        )
-        clean(
-            context.pipeline,
-            context.config,
-            cli_out=context.output_base,
-            branch=context.branch,
-            is_temporary=context.is_temporary,
-            target=namespace.downstream,
-            yes=namespace.yes,
-            allowed_roots=allowed_roots,
-            confirm=_default_confirm,
-            axes=context.axes,
-            graph=context.graph,
-        )
-    elif namespace.command == "run":
-        display_mode = "expand" if namespace.expand else "compact" if namespace.compact else "auto"
-        try:
-            outcomes = run(
-                context.pipeline,
-                context.config,
-                args=context.args,
-                upto=namespace.upto,
-                downstream=namespace.downstream,
-                force=namespace.force,
-                cli_out=context.output_base,
-                branch=context.branch,
-                is_temporary=context.is_temporary,
-                temporary_config=context.resolved.temporary_config,
-                axes=context.axes,
-                temporary_axes=context.resolved.temporary_axes,
-                only=namespace.only,
-                slices=tuple(namespace.slice),
-                graph=context.graph,
-                display_mode=display_mode,
-                rehash=namespace.rehash,
-            )
-        except ReviewRequiredError as error:
-            print(str(error), file=sys.stderr)
-            return 2
-        render_run_outcomes(make_console(), outcomes, elapsed=True)
-    return 0
+        raise

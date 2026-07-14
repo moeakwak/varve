@@ -37,7 +37,7 @@ class Pipeline:
     def stages(cls) -> dict[str, StageSpec]:
         collected: dict[str, StageSpec] = {}
         for base in reversed(cls.__mro__):
-            for _, value in base.__dict__.items():
+            for value in base.__dict__.values():
                 spec = getattr(value, "__varve_stage__", None)
                 if spec is not None:
                     if spec.name in collected and collected[spec.name].func is not spec.func:
@@ -47,11 +47,11 @@ class Pipeline:
         if not collected:
             raise ValueError(f"{cls.__name__} declares no varve stages")
 
-        missing: dict[str, tuple[str, ...]] = {}
-        for spec in collected.values():
-            unknown = tuple(name for name in spec.needs if name not in collected)
-            if unknown:
-                missing[spec.name] = unknown
+        missing = {
+            spec.name: unknown
+            for spec in collected.values()
+            if (unknown := tuple(name for name in spec.needs if name not in collected))
+        }
         if missing:
             details = ", ".join(
                 f"{stage_name} needs {sorted(unknown)!r}"
