@@ -21,6 +21,7 @@ from varve.pipeline import Pipeline
 from varve.style import make_console
 
 _NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
+_REHASH_HELP = "Ignore persisted stat shortcuts while keying."
 
 
 def _selected_command_index(argv: list[str]) -> int | None:
@@ -53,23 +54,21 @@ def _has_unknown_option_before_config_registration(
         for option in action.option_strings
     )
 
-    index = 0
-    while index < len(command_args):
-        token = command_args[index]
+    for index, token in enumerate(command_args):
         if token == "--":
             return False
-        if not token.startswith("-") or token == "-":
-            index += 1
+        if not _looks_like_option(token):
             continue
         option = token.split("=", 1)[0] if token.startswith("--") else token
         arity = option_arities.get(option)
         if arity is None:
             return True
-        index += 1
-        if arity == 1 and "=" not in token:
-            if index >= len(command_args) or _looks_like_option(command_args[index]):
-                return True
-            index += 1
+        if (
+            arity == 1
+            and "=" not in token
+            and (index + 1 == len(command_args) or _looks_like_option(command_args[index + 1]))
+        ):
+            return True
     return False
 
 
@@ -103,9 +102,7 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     run_parser.add_argument(
         "--force", "-f", action="store_true", help="Ignore cache for selected stages."
     )
-    run_parser.add_argument(
-        "--rehash", action="store_true", help="Ignore persisted stat shortcuts while keying."
-    )
+    run_parser.add_argument("--rehash", action="store_true", help=_REHASH_HELP)
     run_view = run_parser.add_mutually_exclusive_group()
     run_view.add_argument(
         "--expand", action="store_true", help="Show every selected concrete matrix cell."
@@ -124,11 +121,8 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     )
     status_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
     status_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
+    status_parser.add_argument("--rehash", action="store_true", help=_REHASH_HELP)
     status_parser.add_argument(
-        "--rehash", action="store_true", help="Ignore persisted stat shortcuts while keying."
-    )
-    status_display = status_parser.add_mutually_exclusive_group()
-    status_display.add_argument(
         "--expand",
         action="store_true",
         help="Show concrete matrix cells or detailed stage state.",
@@ -144,22 +138,16 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     clean_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
     clean_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation.")
 
-    review_parsers = {}
+    config_parsers = {"run": run_parser, "status": status_parser, "clean": clean_parser}
     for command, help_text in (
         ("reuse", "Keep existing materializations reusable after source changes."),
         ("invalidate", "Mark existing materializations as needing a rerun after source changes."),
     ):
         review_parser = subparsers.add_parser(command, help=help_text)
-        review_parser.add_argument(
-            "--stage",
-            action="append",
-            default=[],
-            metavar="BASE_STAGE",
-            help="Review this base Stage; repeat to take a union. Coordinates are not accepted.",
-        )
+        argmap.add_review_selection(review_parser)
         review_parser.add_argument("--branch", default="main", metavar="NAME")
         review_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
-        review_parsers[command] = review_parser
+        config_parsers[command] = review_parser
 
     plan_parser = subparsers.add_parser(
         "plan", help="show selected logical stage topology with exact status"
@@ -167,18 +155,10 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     argmap.add_stage_selection(plan_parser, selector_help, verb="Show")
     plan_parser.add_argument("--branch", default="main", metavar="NAME")
     plan_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
-    plan_parser.add_argument(
-        "--rehash", action="store_true", help="Ignore persisted stat shortcuts while keying."
-    )
+    plan_parser.add_argument("--rehash", action="store_true", help=_REHASH_HELP)
+    config_parsers["plan"] = plan_parser
 
     subparsers.add_parser("ls", help="list branch-independent pipeline structure")
-    config_parsers = {
-        "run": run_parser,
-        "status": status_parser,
-        "plan": plan_parser,
-        "clean": clean_parser,
-        **review_parsers,
-    }
 
     if selected_command in config_parsers and selected_command_index is not None:
         command_args = raw_argv[selected_command_index + 1 :]

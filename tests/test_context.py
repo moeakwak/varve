@@ -4,8 +4,8 @@ import asyncio
 from pathlib import Path
 
 import pytest
+import tqdm.auto
 
-import varve.context
 from varve.context import Ctx
 from varve.models import (
     ArtifactFingerprint,
@@ -48,7 +48,7 @@ def captured_bars(monkeypatch) -> list[FakeBar]:
         created.append(bar)
         return bar
 
-    monkeypatch.setattr(varve.context, "_make_tqdm_progress", fake_make_tqdm_progress)
+    monkeypatch.setattr(tqdm.auto, "tqdm", fake_make_tqdm_progress)
     return created
 
 

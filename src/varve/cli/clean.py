@@ -36,11 +36,8 @@ def _validate_destructive(root: Path, allowed_roots: list[Path] | None = None) -
 
 
 def _confirm(message: str, yes: bool, confirm: Callable[[str], bool] | None) -> None:
-    if yes:
-        return
-    if confirm is not None and confirm(message):
-        return
-    raise ValueError("Clean requires confirmation or yes=True")
+    if not yes and (confirm is None or not confirm(message)):
+        raise ValueError("Clean requires confirmation or yes=True")
 
 
 def _read_manifest_anchor(store: Store, pipeline: type[Pipeline]) -> None:

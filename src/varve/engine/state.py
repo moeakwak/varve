@@ -49,13 +49,6 @@ EXECUTION_STATUS_SEVERITY: tuple[ExecutionStatus, ...] = (
     "failed",
     "error",
 )
-EFFECTIVE_STATUS_SEVERITY: tuple[EffectiveStatus, ...] = (
-    "hit",
-    "needs-run",
-    "resume",
-    "failed",
-    "error",
-)
 
 
 def _aggregate_status(statuses, severity):
@@ -73,7 +66,7 @@ def aggregate_effective_status(statuses: Sequence[EffectiveStatus]) -> Effective
 
     if "needs-review" in statuses:
         return "needs-review"
-    return _aggregate_status(statuses, EFFECTIVE_STATUS_SEVERITY)
+    return _aggregate_status(statuses, EXECUTION_STATUS_SEVERITY)
 
 
 def effective_status(
@@ -105,6 +98,14 @@ class Decision:
     resume_total: int | None = None
 
     @property
+    def progress(self) -> tuple[int, int] | None:
+        return (
+            (len(self.resume_skip), self.resume_total)
+            if self.resume_skip and self.resume_total is not None
+            else None
+        )
+
+    @property
     def display_reason(self) -> str:
         if not self.resume_skip:
             return self.reason
@@ -114,9 +115,7 @@ class Decision:
             if self.resume_total is not None
             else f"{completed} completed"
         )
-        if self.status == "resume":
-            return progress
-        return f"{self.reason} · resume {progress}"
+        return progress if self.status == "resume" else f"{self.reason} · resume {progress}"
 
 
 def decide(

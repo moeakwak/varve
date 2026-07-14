@@ -39,6 +39,7 @@ def test_pipeline_collects_and_sorts_stages() -> None:
 
     assert set(Demo.stages()) == {"sample", "summarize"}
     assert Demo.stages()["summarize"].kind == "single"
+    assert Demo.stages()["summarize"].with_wiring(("sample",), {}).needs == ("sample",)
     assert Demo.topo_order() == ["sample", "summarize"]
 
 

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
-
-from pydantic import BaseModel, ConfigDict
+from typing import Literal, NamedTuple
 
 from varve.engine.state import EffectiveStatus
 from varve.status import PipelineStatus
@@ -14,25 +12,22 @@ from varve.status import PipelineStatus
 ErrorPhase = Literal["manifest", "import", "resolve", "evaluate"]
 
 
-class StateError(BaseModel):
+class StateError(NamedTuple):
     phase: ErrorPhase
     message: str
 
 
-class PipelineEntry(BaseModel):
+class PipelineEntry(NamedTuple):
     output_root: Path
     pipeline_id: str
     pipeline_name: str | None
     branch: str
     module: str | None = None
     manifest_error: str | None = None
-    temporary: bool = False
 
 
-class PipelineState(BaseModel):
+class PipelineState(NamedTuple):
     """Discovery metadata around the canonical shared pipeline status."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     entry: PipelineEntry
     pipeline_status: PipelineStatus | None = None
@@ -49,8 +44,8 @@ class PipelineState(BaseModel):
     @property
     def complete(self) -> bool:
         return (
-            self.error is None
-            and self.pipeline_status is not None
+            self.pipeline_status is not None
+            and self.error is None
             and self.pipeline_status.complete
         )
 

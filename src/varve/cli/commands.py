@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,7 +17,7 @@ from varve.engine.run_display import StageOutcome
 from varve.engine.runner import ReviewRequiredError, record_source_review, run
 from varve.matrix import ResolvedStageSelector
 from varve.status import collect_pipeline_status
-from varve.style import make_console
+from varve.style import loading, make_console
 
 
 def _plan_selector(
@@ -51,12 +50,7 @@ def execute_plan(
     target_module: str | None = None,
 ) -> int:
     console = make_console()
-    loading = (
-        console.status("Evaluating pipeline plan…", spinner="dots")
-        if console.is_terminal
-        else nullcontext()
-    )
-    with loading:
+    with loading(console, "Evaluating pipeline plan…"):
         status = collect_pipeline_status(context, selector=selector, rehash=rehash)
     render_plan(console, status, target_module=target_module)
     return 0
@@ -70,16 +64,9 @@ def execute_review(
     **options: Any,
 ) -> SourceReviewResult:
     return record_source_review(
-        context.pipeline,
-        context.resolved.config,
+        **context.runner_kwargs(),
         decision=decision,
-        args=context.args,
         targets=targets,
-        cli_out=context.resolved.output_base,
-        branch=context.resolved.branch,
-        is_temporary=context.resolved.is_temporary,
-        axes=context.resolved.axes,
-        graph=context.graph,
         **options,
     )
 
@@ -89,16 +76,7 @@ def execute_run(
     **options: Any,
 ) -> list[StageOutcome]:
     return run(
-        context.pipeline,
-        context.resolved.config,
-        args=context.args,
-        cli_out=context.resolved.output_base,
-        branch=context.resolved.branch,
-        is_temporary=context.resolved.is_temporary,
-        temporary_config=context.resolved.temporary_config,
-        axes=context.resolved.axes,
-        temporary_axes=context.resolved.temporary_axes,
-        graph=context.graph,
+        **context.runner_kwargs(temporary_state=True),
         **options,
     )
 
@@ -122,12 +100,7 @@ def dispatch_command(
         )
     if namespace.command == "status":
         console = make_console()
-        loading = (
-            console.status("Evaluating pipeline status…", spinner="dots")
-            if console.is_terminal
-            else nullcontext()
-        )
-        with loading:
+        with loading(console, "Evaluating pipeline status…"):
             status = collect_pipeline_status(
                 context,
                 selector=namespace.stage,

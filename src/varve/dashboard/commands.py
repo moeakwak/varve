@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import sys
-from contextlib import nullcontext
 from pathlib import Path
+from typing import NamedTuple
 
 from rich.console import Console
 
@@ -16,7 +16,6 @@ from varve.cli.review import (
     BulkReviewFailure,
     render_bulk_source_review,
 )
-from varve.cli.structure import render_structure
 from varve.dashboard.discovery import discover_pipelines, filter_entries
 from varve.dashboard.models import PipelineEntry, PipelineState
 from varve.dashboard.render import render_bulk_run, render_no_status_matches, render_overview
@@ -24,7 +23,6 @@ from varve.dashboard.state import (
     import_entry_pipeline,
     load_state,
     resolve_entry_context,
-    resolve_structure_pipeline,
 )
 from varve.engine.review import ReviewAction
 from varve.engine.runner import _KeyingSession
@@ -32,55 +30,38 @@ from varve.engine.state import EffectiveStatus
 from varve.keying.fingerprint import FingerprintSession
 from varve.log import configure_cli_logging
 from varve.style import BULK_RUN_MARKER, make_console
+from varve.style import loading as _loading
 
 
-def discover_scope(
-    root: Path,
-    *,
-    prefix: str | None,
-    branch: str | None,
-    include_temp: bool,
-) -> list[PipelineEntry]:
-    entries = discover_pipelines(root, include_temporary=include_temp)
+class DiscoveryScope(NamedTuple):
+    root: Path
+    prefix: str | None
+    branch: str | None
+    include_temp: bool
+
+
+def discover_scope(scope: DiscoveryScope) -> list[PipelineEntry]:
+    entries = discover_pipelines(scope.root, include_temporary=scope.include_temp)
     return filter_entries(
         entries,
-        prefix=prefix,
-        branch=branch,
-        include_temporary=include_temp,
+        prefix=scope.prefix,
+        branch=scope.branch,
+        include_temporary=scope.include_temp,
     )
 
 
-def render_structure_command(
-    entries: list[PipelineEntry],
-    module: str,
-    *,
-    console: Console | None = None,
-) -> int:
-    pipeline, _ = resolve_structure_pipeline(entries, module)
-    render_structure(console or make_console(), pipeline)
-    return 0
-
-
 def overview_command(
-    root: Path,
+    scope: DiscoveryScope,
     *,
-    prefix: str | None,
-    branch: str | None,
-    include_temp: bool,
     rehash: bool,
     statuses: tuple[EffectiveStatus, ...],
     console: Console | None = None,
 ) -> int:
     console = console or make_console()
     with _loading(console, "Discovering pipelines…") as loading:
-        entries = discover_scope(
-            root,
-            prefix=prefix,
-            branch=branch,
-            include_temp=include_temp,
-        )
+        entries = discover_scope(scope)
         if not entries:
-            _print_empty_scope(root, prefix, branch, include_temp)
+            _print_empty_scope(scope)
             return 1
         session = _KeyingSession(fingerprints=FingerprintSession(force_rehash=rehash))
         states = []
@@ -97,18 +78,15 @@ def overview_command(
 
 
 def bulk_review_command(
-    root: Path,
+    scope: DiscoveryScope,
     *,
-    prefix: str | None,
-    branch: str | None,
-    include_temp: bool,
     decision: ReviewAction,
     console: Console | None = None,
 ) -> int:
     console = console or make_console()
-    entries = discover_scope(root, prefix=prefix, branch=branch, include_temp=include_temp)
+    entries = discover_scope(scope)
     if not entries:
-        _print_empty_scope(root, prefix, branch, include_temp)
+        _print_empty_scope(scope)
         return 1
     session = _KeyingSession()
     results: list[BulkReviewEntry] = []
@@ -133,18 +111,15 @@ def bulk_review_command(
 
 
 def bulk_run_command(
-    root: Path,
+    scope: DiscoveryScope,
     *,
-    prefix: str | None,
-    branch: str | None,
-    include_temp: bool,
     rehash: bool,
     console: Console | None = None,
 ) -> int:
     console = console or make_console()
-    entries = discover_scope(root, prefix=prefix, branch=branch, include_temp=include_temp)
+    entries = discover_scope(scope)
     if not entries:
-        _print_empty_scope(root, prefix, branch, include_temp)
+        _print_empty_scope(scope)
         return 1
     session = _KeyingSession(fingerprints=FingerprintSession(force_rehash=rehash))
     final_states: list[PipelineState] = []
@@ -179,19 +154,10 @@ def bulk_run_command(
     return 2 if all(state.status == "needs-review" for state in incomplete) else 1
 
 
-def _print_empty_scope(
-    root: Path,
-    prefix: str | None,
-    branch: str | None,
-    include_temp: bool,
-) -> None:
+def _print_empty_scope(scope: DiscoveryScope) -> None:
     print(
         "No pipelines match discovery scope: "
-        f"root={root}, prefix={prefix or '*'}, branch={branch or '*'}, "
-        f"temporary={'included' if include_temp else 'excluded'}",
+        f"root={scope.root}, prefix={scope.prefix or '*'}, branch={scope.branch or '*'}, "
+        f"temporary={'included' if scope.include_temp else 'excluded'}",
         file=sys.stderr,
     )
-
-
-def _loading(console: Console, message: str):
-    return console.status(message, spinner="dots") if console.is_terminal else nullcontext(None)

@@ -5,9 +5,8 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from varve.engine.state import EXECUTION_STATUS_SEVERITY, EffectiveStatus, ExecutionStatus
 from varve.matrix import PipelineGraph
@@ -21,8 +20,7 @@ AUTO_COMPACT_MIN_CELLS = 8
 AUTO_EXPAND_SLOW_SECONDS = 30.0
 
 
-@dataclass(frozen=True)
-class StageOutcome:
+class StageOutcome(NamedTuple):
     stage: str
     status: ExecutionStatus
     reason: str
@@ -32,47 +30,15 @@ class StageOutcome:
     display_cells: int = 1
 
 
-@dataclass(frozen=True)
-class RunDisplayGroup:
+class RunDisplayGroup(NamedTuple):
     base_name: str
     stages: tuple[str, ...]
     compact: bool
 
 
-@dataclass(frozen=True)
-class RunDisplayPlan:
+class RunDisplayPlan(NamedTuple):
     groups: tuple[RunDisplayGroup, ...]
     by_stage: Mapping[str, RunDisplayGroup]
-
-    def plan_entries(self) -> tuple[str, ...]:
-        """Legacy lifecycle/outcome helper; always folds Matrix groups."""
-
-        return tuple(
-            f"{group.base_name} ({len(group.stages)} cells)"
-            if len(group.stages) > 1 or group.compact
-            else group.stages[0]
-            if group.stages
-            else group.base_name
-            for group in self.groups
-        )
-
-    def outcome(
-        self,
-        stage: str,
-        status: ExecutionStatus,
-        reason: str,
-        elapsed: float | None,
-    ) -> StageOutcome:
-        group = self.by_stage[stage]
-        return StageOutcome(
-            stage=stage,
-            status=status,
-            reason=reason,
-            elapsed=elapsed,
-            display_base=group.base_name,
-            display_compact=group.compact,
-            display_cells=len(group.stages),
-        )
 
 
 def build_run_display_plan(
@@ -116,7 +82,7 @@ def build_run_display_plan(
     return RunDisplayPlan(tuple(groups), MappingProxyType(by_stage))
 
 
-def _status_counts(
+def status_counts(
     outcomes: list[StageOutcome],
 ) -> tuple[tuple[ExecutionStatus, int], ...]:
     counts = Counter(outcome.status for outcome in outcomes)
@@ -124,7 +90,7 @@ def _status_counts(
 
 
 def _status_distribution(outcomes: list[StageOutcome]) -> str:
-    return ", ".join(f"{count} {status}" for status, count in _status_counts(outcomes))
+    return ", ".join(f"{count} {status}" for status, count in status_counts(outcomes))
 
 
 def format_run_order_marker(
@@ -134,8 +100,7 @@ def format_run_order_marker(
     is_matrix: bool,
     forced: bool,
     status_by_stage: Mapping[str, EffectiveStatus],
-    batch_completed: int | None = None,
-    batch_total: int | None = None,
+    batch_progress: tuple[int, int] | None = None,
 ) -> str:
     """Build one base-stage token for the run-order summary line."""
 
@@ -150,24 +115,15 @@ def format_run_order_marker(
     status = status_by_stage.get(stages[0], "needs-run")
     if status == "hit":
         return f"{base_name} ✓"
-    if batch_completed is not None and batch_total is not None:
-        progress = f"{base_name} {batch_completed}/{batch_total}"
-        if status == "needs-review":
-            return f"{progress} · ! needs-review"
-        if status == "failed":
-            return f"{progress} · ✕ failed"
-        if status == "error":
-            return f"{progress} · ! error"
-        return progress
-    if status == "needs-review":
-        return f"{base_name} ! needs-review"
-    if status == "failed":
-        return f"{base_name} ✕ failed"
-    if status == "error":
-        return f"{base_name} ! error"
-    if status == "resume":
-        return f"{base_name} resume"
-    return f"{base_name} run"
+    alert = {
+        "needs-review": "! needs-review",
+        "failed": "✕ failed",
+        "error": "! error",
+    }.get(status)
+    if batch_progress is not None:
+        progress = f"{base_name} {batch_progress[0]}/{batch_progress[1]}"
+        return f"{progress} · {alert}" if alert else progress
+    return f"{base_name} {alert or ('resume' if status == 'resume' else 'run')}"
 
 
 class RunReporter:
@@ -185,7 +141,18 @@ class RunReporter:
         *,
         markers: tuple[str, ...] | None = None,
     ) -> None:
-        entries = markers if markers is not None else self.plan.plan_entries()
+        entries = (
+            markers
+            if markers is not None
+            else tuple(
+                f"{group.base_name} ({len(group.stages)} cells)"
+                if len(group.stages) > 1 or group.compact
+                else group.stages[0]
+                if group.stages
+                else group.base_name
+                for group in self.plan.groups
+            )
+        )
         self.logger.info("Run order: %s", " → ".join(entries))
 
     def start(self, stage: str) -> None:
@@ -210,6 +177,22 @@ class RunReporter:
             # Failures are always concrete, even for compact groups.
             self.logger.error("[%s] error · %s", self.active_stage, error)
 
+    def outcome(
+        self, stage: str, status: ExecutionStatus, reason: str, elapsed: float | None
+    ) -> StageOutcome:
+        group = self.plan.by_stage[stage]
+        outcome = StageOutcome(
+            stage,
+            status,
+            reason,
+            elapsed,
+            group.base_name,
+            group.compact,
+            len(group.stages),
+        )
+        self.record(outcome)
+        return outcome
+
     def record(self, outcome: StageOutcome) -> None:
         group = self.plan.by_stage[outcome.stage]
         if not group.compact:
@@ -230,58 +213,3 @@ class RunReporter:
             ran,
             elapsed,
         )
-
-
-@dataclass(frozen=True)
-class RunOutcomeRow:
-    stage: str
-    status: str
-    status_counts: tuple[tuple[ExecutionStatus, int], ...]
-    reason: str
-    cells: int
-    ran: int
-    elapsed: float | None
-    grouped: bool
-
-
-def outcome_rows(outcomes: list[StageOutcome]) -> tuple[RunOutcomeRow, ...]:
-    """Fold outcomes using the display decision captured before execution."""
-
-    compact = {
-        base: [item for item in outcomes if item.display_base == base]
-        for base in dict.fromkeys(item.display_base for item in outcomes if item.display_compact)
-    }
-    rows: list[RunOutcomeRow] = []
-    for outcome in outcomes:
-        if not outcome.display_compact:
-            rows.append(
-                RunOutcomeRow(
-                    stage=outcome.stage,
-                    status=outcome.status,
-                    status_counts=((outcome.status, 1),),
-                    reason=outcome.reason,
-                    cells=1,
-                    ran=int(outcome.elapsed is not None),
-                    elapsed=outcome.elapsed,
-                    grouped=False,
-                )
-            )
-            continue
-        assert outcome.display_base is not None
-        group = compact.pop(outcome.display_base, None)
-        if group is None:
-            continue
-        ran = sum(item.elapsed is not None for item in group)
-        rows.append(
-            RunOutcomeRow(
-                stage=outcome.display_base,
-                status=_status_distribution(group),
-                status_counts=_status_counts(group),
-                reason="-",
-                cells=outcome.display_cells,
-                ran=ran,
-                elapsed=sum(item.elapsed or 0.0 for item in group) if ran else None,
-                grouped=True,
-            )
-        )
-    return tuple(rows)

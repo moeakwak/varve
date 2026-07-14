@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,9 +19,7 @@ from varve.models import ArtifactFingerprint, ArtifactManifestEntry, FileFingerp
 @dataclass(slots=True)
 class _FileSnapshot:
     path: str
-    inode: int
-    size: int
-    mtime_ns: int
+    stat: os.stat_result
     hashed: FileFingerprint | None = None
 
 
@@ -53,7 +51,7 @@ class FingerprintSession:
                     raise FileNotFoundError(
                         f"Key input file does not exist: {normalized}"
                     ) from error
-                snapshot = _FileSnapshot(normalized, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                snapshot = _FileSnapshot(normalized, stat)
                 self._snapshots[normalized] = snapshot
             self._snapshots[input_path] = snapshot
         rehash = force_rehash or self.force_rehash
@@ -66,21 +64,18 @@ class FingerprintSession:
             and cached.path == snapshot.path
             and cached.algorithm == "sha256"
             and not rehash
-            and (cached.inode, cached.size, cached.mtime_ns)
-            == (snapshot.inode, snapshot.size, snapshot.mtime_ns)
+            and (cached.inode, cached.size, cached.mtime_ns) == _stat_token(snapshot.stat)
         ):
             return cached
 
         normalized_path = Path(snapshot.path)
         digest, stable_stat = _stable_sha256_file(normalized_path)
-        snapshot.inode = stable_stat.st_ino
-        snapshot.size = stable_stat.st_size
-        snapshot.mtime_ns = stable_stat.st_mtime_ns
+        snapshot.stat = stable_stat
         result = FileFingerprint(
             path=snapshot.path,
-            inode=snapshot.inode,
-            size=snapshot.size,
-            mtime_ns=snapshot.mtime_ns,
+            inode=stable_stat.st_ino,
+            size=stable_stat.st_size,
+            mtime_ns=stable_stat.st_mtime_ns,
             content_hash=digest,
         )
         snapshot.hashed = result
@@ -95,20 +90,18 @@ def _sha256_file(path: Path) -> str:
     return f"sha256:{hasher.hexdigest()}"
 
 
+def _stat_token(stat: Any) -> tuple[int, int, int]:
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
 def _stable_sha256_file(path: Path, *, retries: int = 2) -> tuple[str, os.stat_result]:
-    for attempt in range(retries + 1):
+    for _attempt in range(retries + 1):
         before = path.stat()
         digest = _sha256_file(path)
         after = path.stat()
-        if (before.st_ino, before.st_size, before.st_mtime_ns) == (
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-        ):
+        if _stat_token(before) == _stat_token(after):
             return digest, after
-        if attempt == retries:
-            raise OSError(f"File changed while hashing: {path}")
-    raise AssertionError("unreachable")
+    raise OSError(f"File changed while hashing: {path}")
 
 
 def _normalize_for_json(value: Any) -> JSON:
@@ -142,6 +135,9 @@ def canonical_json(obj: Any) -> bytes:
 def json_sha256(obj: Any) -> str:
     digest = hashlib.sha256(canonical_json(obj)).hexdigest()
     return f"sha256:{digest}"
+
+
+_DIRECTORY_CONTENT_HASH = json_sha256({"entry": "dir"})
 
 
 def file_digest_view(
@@ -184,22 +180,20 @@ def _tree_entries(
     label: str,
     symlink_description: str,
     root_is_entry: bool = False,
-) -> list[tuple[Path, str]]:
+) -> Iterator[tuple[Path, str]]:
     if not root.exists():
         raise FileNotFoundError(f"{label} does not exist: {root}")
     if not (root.is_file() or root.is_dir()):
         suffix = " entry" if root_is_entry else ""
         raise ValueError(f"Unsupported {label.lower()}{suffix}: {root}")
     members = [root] if root.is_file() else [root, *sorted(root.rglob("*"))]
-    result = []
     for member in members:
         if member.is_symlink():
             raise ValueError(f"Symlinks are not supported in {symlink_description}: {member}")
-        if member.is_file() or member.is_dir():
-            result.append((member, "file" if member.is_file() else "dir"))
-        else:
+        kind = "file" if member.is_file() else "dir" if member.is_dir() else None
+        if kind is None:
             raise ValueError(f"Unsupported {label.lower()} entry: {member}")
-    return result
+        yield member, kind
 
 
 def files_fingerprints(
@@ -232,7 +226,7 @@ def files_fingerprints(
                         inode=stat.st_ino,
                         size=0,
                         mtime_ns=stat.st_mtime_ns,
-                        content_hash=json_sha256({"entry": "dir"}),
+                        content_hash=_DIRECTORY_CONTENT_HASH,
                     )
                 members[fingerprint.path] = fingerprint
         results[name] = [members[path] for path in sorted(members)]
@@ -267,15 +261,14 @@ def artifact_fingerprint(
         for entry in (() if cached is None else cached.manifest)
         if entry.fingerprint is not None
     }
-    kind = "file" if resolved.is_file() else "dir"
     entries: list[ArtifactManifestEntry] = []
-    tree = _tree_entries(
+    kind = "file" if resolved.is_file() else "dir"
+    for member, member_kind in _tree_entries(
         resolved,
         label="Managed artifact",
         symlink_description="managed artifacts",
         root_is_entry=True,
-    )
-    for member, member_kind in tree:
+    ):
         relative = member.relative_to(resolved).as_posix()
         if member_kind == "dir":
             entries.append(ArtifactManifestEntry(path=relative, kind="dir"))
@@ -291,19 +284,24 @@ def artifact_fingerprint(
                     ),
                 )
             )
-    digest_view = [
-        {
-            "path": entry.path,
-            "kind": entry.kind,
-            **({"content_hash": entry.fingerprint.content_hash} if entry.fingerprint else {}),
-        }
-        for entry in entries
-    ]
     return ArtifactFingerprint(
         root=relative_root,
         kind=kind,
         manifest=entries,
-        fingerprint=json_sha256(digest_view),
+        fingerprint=json_sha256(
+            [
+                {
+                    "path": entry.path,
+                    "kind": entry.kind,
+                    **(
+                        {"content_hash": entry.fingerprint.content_hash}
+                        if entry.fingerprint
+                        else {}
+                    ),
+                }
+                for entry in entries
+            ]
+        ),
     )
 
 

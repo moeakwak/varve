@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import types
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from enum import Enum
 from typing import Any, Literal, Union, get_args, get_origin
 
@@ -38,6 +38,16 @@ def add_stage_selection(
     for option, description in descriptions.items():
         help_text = selector_help if verb is None else f"{verb} {description}. {selector_help}"
         group.add_argument(f"--{option}", metavar="STAGE_SELECTOR", help=help_text)
+
+
+def add_review_selection(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--stage",
+        action="append",
+        default=[],
+        metavar="BASE_STAGE",
+        help="Review this base Stage; repeat to take a union. Coordinates are not accepted.",
+    )
 
 
 def _unwrap_optional(annotation: Any) -> Any:
@@ -84,20 +94,22 @@ def _option_is_available(parser: argparse.ArgumentParser, *options: str) -> bool
     return all(option not in parser._option_string_actions for option in options)
 
 
-def args_option_arities(
-    args_type: type[BaseModel],
-    *,
-    prefix: str = "",
-) -> dict[str, int]:
-    """Return possible Args option strings without validating field support."""
-    result: dict[str, int] = {}
+def _iter_fields(args_type: type[BaseModel], prefix: str = "") -> Iterator[tuple[str, Any, Any]]:
     for name, field in args_type.model_fields.items():
         dotted = f"{prefix}{name}"
-        flag = "--" + dotted.replace("_", "-")
         inner = _unwrap_optional(field.annotation)
         if _is_model_type(inner):
-            result.update(args_option_arities(inner, prefix=f"{dotted}."))
-        elif inner is bool:
+            yield from _iter_fields(inner, f"{dotted}.")
+        else:
+            yield dotted, field, inner
+
+
+def args_option_arities(args_type: type[BaseModel]) -> dict[str, int]:
+    """Return possible Args option strings without validating field support."""
+    result: dict[str, int] = {}
+    for dotted, _field, inner in _iter_fields(args_type):
+        flag = "--" + dotted.replace("_", "-")
+        if inner is bool:
             result[flag] = 0
             result["--no-" + dotted.replace("_", "-")] = 0
         else:
@@ -140,19 +152,13 @@ def _register_scalar(
 def register_args(
     parser: argparse.ArgumentParser,
     args_type: type[BaseModel],
-    *,
-    prefix: str = "",
 ) -> None:
     """Register one argparse option per supported Args field."""
-    for name, field in args_type.model_fields.items():
-        dotted = f"{prefix}{name}"
+    for dotted, field, inner in _iter_fields(args_type):
         flag = "--" + dotted.replace("_", "-")
-        inner = _unwrap_optional(field.annotation)
         origin = get_origin(inner)
 
-        if _is_model_type(inner):
-            register_args(parser, inner, prefix=f"{dotted}.")
-        elif inner in _BARE_UNSUPPORTED_TYPES:
+        if inner in _BARE_UNSUPPORTED_TYPES:
             _reject(dotted, field.annotation)
         elif inner is bool:
             negative_flag = "--no-" + dotted.replace("_", "-")
@@ -191,23 +197,19 @@ def register_args(
 def collect_cli_args_namespace(
     namespace: argparse.Namespace,
     args_type: type[BaseModel],
-    *,
-    prefix: str = "",
 ) -> dict[str, Any]:
     """Collect CLI-provided fields into nested settings init kwargs."""
     raw_namespace = vars(namespace)
     result: dict[str, Any] = {}
-    for name, field in args_type.model_fields.items():
-        dotted = f"{prefix}{name}"
-        inner = _unwrap_optional(field.annotation)
-        if _is_model_type(inner):
-            nested = collect_cli_args_namespace(namespace, inner, prefix=f"{dotted}.")
-            if nested:
-                result[name] = nested
-        else:
-            dest = _dest(dotted)
-            if dest in raw_namespace:
-                result[name] = raw_namespace[dest]
+    for dotted, _field, _inner in _iter_fields(args_type):
+        dest = _dest(dotted)
+        if dest not in raw_namespace:
+            continue
+        target = result
+        path = dotted.split(".")
+        for name in path[:-1]:
+            target = target.setdefault(name, {})
+        target[path[-1]] = raw_namespace[dest]
     return result
 
 

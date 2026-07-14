@@ -15,10 +15,10 @@ from varve.cli.plan import (
     wrap_stage_name,
 )
 from varve.engine.runner import run
+from varve.engine.state import SourceReviewState
 from varve.status import (
     CellCoordinate,
     PipelineStatus,
-    StageReviewStatus,
     StageStatus,
     StageStatusGroup,
 )
@@ -70,8 +70,7 @@ def _cell(
     status: str = "needs-run",
     logical_needs: tuple[str, ...] = (),
     cell: tuple[CellCoordinate, ...] = (),
-    batch_completed: int | None = None,
-    batch_total: int | None = None,
+    batch_progress: tuple[int, int] | None = None,
 ) -> StageStatus:
     return StageStatus(
         name=name,
@@ -82,10 +81,8 @@ def _cell(
         status=status,  # type: ignore[arg-type]
         reason=status,
         summary_reason=status,
-        execution_status="needs-run" if status != "hit" else "hit",  # type: ignore[arg-type]
         execution_reason=status,
-        source_relationship="not-applicable",
-        source_decision="none",
+        source_review=SourceReviewState("not-applicable"),
         duration=None,
         committed_at=None,
         decision_key=None,
@@ -93,8 +90,7 @@ def _cell(
         key_inputs=None,
         source_changes={},
         unavailable_reason=None,
-        batch_completed=batch_completed,
-        batch_total=batch_total,
+        batch_progress=batch_progress,
     )
 
 
@@ -167,7 +163,6 @@ def _topology_status() -> PipelineStatus:
     )
     return PipelineStatus(
         pipeline="TopologyPipeline",
-        module="demo",
         branch="main",
         output_root=Path("out"),
         stages=cells,
@@ -228,8 +223,6 @@ def test_plan_renderer_covers_matrix_progress_and_long_names() -> None:
 def test_format_group_progress_matrix_and_batch() -> None:
     matrix_group = StageStatusGroup(
         base_name="official",
-        axes=("item",),
-        logical_needs=("extract",),
         cells=(
             _cell(
                 "official@item=0",
@@ -244,58 +237,49 @@ def test_format_group_progress_matrix_and_batch() -> None:
                 cell=(CellCoordinate("item", "1"),),
             ),
         ),
-        review=StageReviewStatus("not-applicable", "none", {}),
+        review=SourceReviewState("not-applicable"),
     )
     assert format_group_progress(matrix_group).plain == "1/2 cells"
 
     batch_group = StageStatusGroup(
         base_name="work",
-        axes=(),
-        logical_needs=(),
         cells=(
             _cell(
                 "work",
                 "work",
                 status="resume",
-                batch_completed=3,
-                batch_total=12,
+                batch_progress=(3, 12),
             ),
         ),
-        review=StageReviewStatus("not-applicable", "none", {}),
+        review=SourceReviewState("not-applicable"),
     )
     assert format_group_progress(batch_group).plain == "3/12 batches"
 
     failed_batch_group = StageStatusGroup(
         base_name="work",
-        axes=(),
-        logical_needs=(),
         cells=(
             _cell(
                 "work",
                 "work",
                 status="failed",
-                batch_completed=3,
-                batch_total=12,
+                batch_progress=(3, 12),
             ),
         ),
-        review=StageReviewStatus("not-applicable", "none", {}),
+        review=SourceReviewState("not-applicable"),
     )
     assert format_group_progress(failed_batch_group).plain == "3/12 batches · ✕ failed"
 
     review_batch_group = StageStatusGroup(
         base_name="work",
-        axes=(),
-        logical_needs=(),
         cells=(
             _cell(
                 "work",
                 "work",
                 status="needs-review",
-                batch_completed=3,
-                batch_total=12,
+                batch_progress=(3, 12),
             ),
         ),
-        review=StageReviewStatus("changed", "none", {}),
+        review=SourceReviewState("changed"),
     )
     assert format_group_progress(review_batch_group).plain == ("3/12 batches · ! needs-review")
 

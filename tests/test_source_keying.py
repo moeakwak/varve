@@ -398,12 +398,12 @@ def test_source_stat_cache_requires_same_physical_path(tmp_path: Path) -> None:
         size=stat.st_size,
         mtime_ns=stat.st_mtime_ns,
     )
-    observed = source_module._source_entry(
-        "pipeline/source.py",
-        source_path,
-        stale,
+    entries, _paths = source_module._declared_entries(
+        {source_path: "pipeline"},
+        {stale.path: stale},
         force_rehash=False,
     )
+    observed = entries["pipeline/source.py"]
     assert observed.cache_path == str(source_path.resolve())
     assert observed.digest != stale.digest
 
@@ -419,19 +419,19 @@ def test_residual_ast_retries_when_file_changes_during_read(
     pipeline = _load_pipeline(module_path, "racing_source_demo")
     stage_spec = pipeline.stages()["one"]
     baseline = SourceFingerprintSession().observe(pipeline, stage_spec)
-    original_read = source_module._read_module_ast
+    original_read = Path.read_bytes
     reads = 0
 
-    def racing_read(path: Path):
+    def racing_read(path: Path) -> bytes:
         nonlocal reads
-        tree, after = original_read(path)
-        if path == module_path and reads == 0:
-            module_path.write_text(changed, encoding="utf-8")
-            after = module_path.stat()
-        reads += 1
-        return tree, after
+        source = original_read(path)
+        if path == module_path:
+            reads += 1
+            if reads == 1:
+                module_path.write_text(changed, encoding="utf-8")
+        return source
 
-    monkeypatch.setattr(source_module, "_read_module_ast", racing_read)
+    monkeypatch.setattr(Path, "read_bytes", racing_read)
     observed = SourceFingerprintSession().observe(pipeline, stage_spec)
 
     assert reads == 2

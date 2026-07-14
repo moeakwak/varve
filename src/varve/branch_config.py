@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 from pydantic import BaseModel, ValidationError, create_model
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,34 +24,29 @@ from varve.store.store import Store
 ConfigT = TypeVar("ConfigT", bound=BaseModel)
 
 
-@dataclass(frozen=True)
-class ResolvedBranch:
+class ResolvedBranch(NamedTuple):
     config: Any
     branch: str
-    is_temporary: bool
     output_base: Path | None
-    temporary_config: dict[str, Any] | None = None
     axes: dict[str, tuple[str, ...]] | None = None
-    temporary_axes: dict[str, tuple[str, ...]] | None = None
+    temporary_config: dict[str, Any] | None = None
+
+    @property
+    def is_temporary(self) -> bool:
+        return self.temporary_config is not None
+
+    @property
+    def temporary_axes(self) -> dict[str, tuple[str, ...]] | None:
+        return self.axes if self.is_temporary else None
 
 
+@cache
 def _settings_type(config_type: type[BaseModel]) -> type[BaseSettings]:
     class VarveSettings(BaseSettings):
         model_config = SettingsConfigDict(
             env_nested_delimiter="__",
             env_file=".env",
         )
-
-        @classmethod
-        def settings_customise_sources(
-            cls,
-            settings_cls,
-            init_settings,
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
-        ):
-            return (init_settings, env_settings, dotenv_settings, file_secret_settings)
 
     fields: dict[str, Any] = {
         name: (field.annotation, field) for name, field in config_type.model_fields.items()
@@ -60,8 +55,7 @@ def _settings_type(config_type: type[BaseModel]) -> type[BaseSettings]:
 
 
 def config_from_init(config_type: type[ConfigT], init_kwargs: dict[str, Any]) -> ConfigT:
-    settings_type = _settings_type(config_type)
-    settings = settings_type(**init_kwargs)
+    settings = _settings_type(config_type)(**init_kwargs)
     return config_type.model_validate(settings.model_dump())
 
 
@@ -75,8 +69,8 @@ def _main_config(
     pipeline: type[Pipeline],
     raw_main: dict[str, Any],
     *,
-    cli_out: Path | None,
-    allow_bare_output_root: bool,
+    cli_out: Path | None = None,
+    allow_bare_output_root: bool = False,
 ) -> Any:
     try:
         return config_from_init(pipeline.Config, raw_main)
@@ -88,15 +82,6 @@ def _main_config(
 
 def _manifest_axes(manifest) -> dict[str, tuple[str, ...]]:
     return {name: tuple(values) for name, values in (manifest.temporary_axes or {}).items()}
-
-
-def _temporary_from_manifest(
-    main_base: Path, branch: str
-) -> tuple[dict[str, Any], dict[str, tuple[str, ...]]]:
-    manifest = Store(main_base / ".tmp" / branch).read_manifest()
-    if manifest is None or manifest.temporary_config is None:
-        raise ValueError(f"Unknown varve branch {branch!r}")
-    return manifest.temporary_config, _manifest_axes(manifest)
 
 
 def _validate_temporary_store(
@@ -131,9 +116,6 @@ def resolve_branch(
     main_axes = normalize_axes(
         pipeline, main_definition.axes if main_definition is not None else None
     )
-    axes = main_axes
-    is_temporary = False
-    temporary_config = None
 
     if override_json is not None:
         if branch in branches and branch != "main":
@@ -145,44 +127,35 @@ def resolve_branch(
         )
         branch = override_branch_name(temporary_config, main_axes) if branch == "main" else branch
         validate_branch_name(branch)
-        _validate_temporary_store(main_base, branch, temporary_config, axes)
-        output_base = main_base
-        is_temporary = True
-    elif branch in branches:
+        _validate_temporary_store(main_base, branch, temporary_config, main_axes)
+        return ResolvedBranch(config, branch, main_base, main_axes, temporary_config)
+    if branch in branches:
         definition = branches[branch]
         axes = normalize_axes(pipeline, definition.axes)
         config = config_from_init(pipeline.Config, definition.config)
-        is_temporary = definition.is_temporary
-        if is_temporary:
-            temporary_config = _snapshot(config)
-            main_base = output_base or pipeline.default_output_root(config)
-            _validate_temporary_store(main_base, branch, temporary_config, axes)
-    elif branch == "main":
-        config = _main_config(
-            pipeline,
-            raw_main,
-            cli_out=cli_out,
-            allow_bare_output_root=allow_bare_output_root,
-        )
-    else:
-        main_base = output_base or pipeline.default_output_root(
+        if not definition.is_temporary:
+            return ResolvedBranch(config, branch, output_base, axes)
+        temporary_config = _snapshot(config)
+        main_base = output_base or pipeline.default_output_root(config)
+        _validate_temporary_store(main_base, branch, temporary_config, axes)
+        return ResolvedBranch(config, branch, output_base, axes, temporary_config)
+    if branch == "main":
+        return ResolvedBranch(
             _main_config(
                 pipeline,
                 raw_main,
-                cli_out=None,
-                allow_bare_output_root=False,
-            )
+                cli_out=cli_out,
+                allow_bare_output_root=allow_bare_output_root,
+            ),
+            branch,
+            output_base,
+            main_axes,
         )
-        temporary_config, axes = _temporary_from_manifest(main_base, branch)
-        config = pipeline.Config.model_validate(temporary_config)
-        output_base = main_base
-        is_temporary = True
-    return ResolvedBranch(
-        config=config,
-        branch=branch,
-        is_temporary=is_temporary,
-        output_base=output_base,
-        temporary_config=temporary_config,
-        axes=axes,
-        temporary_axes=axes if is_temporary else None,
-    )
+    main_base = output_base or pipeline.default_output_root(_main_config(pipeline, raw_main))
+    manifest = Store(main_base / ".tmp" / branch).read_manifest()
+    if manifest is None or manifest.temporary_config is None:
+        raise ValueError(f"Unknown varve branch {branch!r}")
+    temporary_config = manifest.temporary_config
+    axes = _manifest_axes(manifest)
+    config = pipeline.Config.model_validate(temporary_config)
+    return ResolvedBranch(config, branch, main_base, axes, temporary_config)

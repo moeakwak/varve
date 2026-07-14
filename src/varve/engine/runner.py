@@ -8,10 +8,10 @@ import logging
 import time
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from varve.context import Ctx
 from varve.decorators import ProducesItem, ProducesSpec
@@ -20,7 +20,6 @@ from varve.engine.review import (
     ReviewAction,
     ReviewCandidate,
     SourceReviewResult,
-    apply_review_writes,
     plan_source_review,
 )
 from varve.engine.run_display import (
@@ -69,7 +68,7 @@ from varve.store.lock import OutputLock
 from varve.store.store import Store
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StageProbe:
     stage: str
     decision: Decision
@@ -90,8 +89,8 @@ class _KeyingSession:
 
     fingerprints: FingerprintSession = field(default_factory=FingerprintSession)
     sources: SourceFingerprintSession = field(default_factory=SourceFingerprintSession)
-    records: dict[tuple[Path, str], SuccessRecord | object] = field(default_factory=dict)
-    reviews: dict[tuple[Path, str], ReviewRecord | object] = field(default_factory=dict)
+    records: dict[tuple[Path, str], SuccessRecord | None] = field(default_factory=dict)
+    reviews: dict[tuple[Path, str], ReviewRecord | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.fingerprints.force_rehash:
@@ -110,14 +109,15 @@ class _KeyingSession:
         self.records.clear()
         self.reviews.clear()
 
+    @staticmethod
+    def _read_cached(cache: dict, key: tuple[Path, str], load: Callable[[], Any]):
+        if key not in cache:
+            cache[key] = load()
+        return cache[key]
+
     def read_success(self, store: Store, stage: str) -> SuccessRecord | None:
         key = (store.root, stage)
-        cached = self.records.get(key, _RECORD_UNOBSERVED)
-        if cached is _RECORD_UNOBSERVED:
-            record = store.read_success(stage)
-            self.records[key] = _RECORD_MISSING if record is None else record
-            return record
-        return None if cached is _RECORD_MISSING else cached  # type: ignore[return-value]
+        return self._read_cached(self.records, key, lambda: store.read_success(stage))
 
     def write_success(self, store: Store, record: SuccessRecord) -> None:
         store.write_success(record)
@@ -131,12 +131,7 @@ class _KeyingSession:
             stage_spec if isinstance(stage_spec, str) else stage_spec.base_name or stage_spec.name
         )
         key = (store.root, stage)
-        cached = self.reviews.get(key, _RECORD_UNOBSERVED)
-        if cached is _RECORD_UNOBSERVED:
-            record = store.read_review(stage)
-            self.reviews[key] = _RECORD_MISSING if record is None else record
-            return record
-        return None if cached is _RECORD_MISSING else cached  # type: ignore[return-value]
+        return self._read_cached(self.reviews, key, lambda: store.read_review(stage))
 
     def source_observation(
         self,
@@ -158,8 +153,7 @@ class _KeyingSession:
         )
 
 
-@dataclass(frozen=True)
-class _Runtime:
+class _Runtime(NamedTuple):
     pipeline: type[Pipeline]
     graph: PipelineGraph
     config: Any
@@ -190,8 +184,8 @@ class _Runtime:
         )
 
 
-_RECORD_UNOBSERVED = object()
-_RECORD_MISSING = object()
+_SOURCE_CHANGED = SourceReviewState("changed")
+_SOURCE_INVALIDATED = SourceReviewState("changed", "invalidate")
 
 
 class ReviewRequiredError(Exception):
@@ -283,8 +277,15 @@ def _managed_output(
     return absolute, _relative_to_out(absolute, ctx.out, description=description)
 
 
+def _fresh_artifact(runtime: _Runtime, path: str):
+    return artifact_fingerprint(
+        runtime.out / path,
+        runtime.out,
+        force_rehash=True,
+    )
+
+
 def _refresh_fingerprint_cache(
-    *,
     runtime: _Runtime,
     previous: SuccessRecord | None,
     components: KeyComponents,
@@ -303,14 +304,10 @@ def _refresh_fingerprint_cache(
         return
     if previous.key_components.inputs == components.inputs:
         return
-    refreshed = previous.model_copy(
-        update={
-            "key_components": previous.key_components.model_copy(
-                update={"inputs": components.inputs}
-            )
-        }
+    components = previous.key_components.model_copy(update={"inputs": components.inputs})
+    runtime.keying.write_success(
+        runtime.store, previous.model_copy(update={"key_components": components})
     )
-    runtime.keying.write_success(runtime.store, refreshed)
 
 
 def _produced_paths(
@@ -333,6 +330,25 @@ def _produced_paths(
             )
         )
     return result
+
+
+def _batch_result(
+    runtime: _Runtime,
+    outputs_by_index: dict[int, list[str]],
+) -> tuple[list[OutputHandle], str]:
+    indexed = [
+        (index, ordinal, path)
+        for index, paths in sorted(outputs_by_index.items())
+        for ordinal, path in enumerate(paths)
+    ]
+    outputs = [
+        OutputHandle(index=index, path=path, artifact=_fresh_artifact(runtime, path))
+        for index, _, path in indexed
+    ]
+    return outputs, artifacts_root_fingerprint(
+        [item.artifact for item in outputs],
+        positions=[(index, ordinal) for index, ordinal, _ in indexed],
+    )
 
 
 def _validate_static_produces_location(produces: ProducesSpec, ctx: Ctx[Any, Any]) -> None:
@@ -396,36 +412,13 @@ def _review_state(
     return SourceReviewState("changed", review.decision)
 
 
-def _partial_review_fingerprint(
-    runtime: _Runtime,
-    stage_name: str,
-    current_key: str,
-) -> str | None:
-    attempt = runtime.store.read_attempt(stage_name)
-    if attempt is not None and attempt.input_key == current_key:
-        return attempt.review_source_fingerprint
-    failure = runtime.store.read_failure(stage_name)
-    if failure is not None and failure.input_key == current_key:
-        return failure.review_source_fingerprint
-    return None
-
-
-def _source_review(
+def _previous_review(
     runtime: _Runtime,
     stage_spec,
-    previous: SuccessRecord | None,
     current: SourceObservation,
-    *,
-    current_key: str | None = None,
-    partial: dict[int, BatchRecord] | None = None,
+    previous: SuccessRecord | None,
 ) -> SourceReviewState:
-    baseline = (
-        _partial_review_fingerprint(runtime, stage_spec.name, current_key)
-        if partial and current_key is not None
-        else None
-    )
-    if baseline is None and previous is not None:
-        baseline = previous.executed_source.review.fingerprint
+    baseline = None if previous is None else previous.executed_source.review.fingerprint
     return _review_state(runtime, stage_spec, current, baseline)
 
 
@@ -511,10 +504,7 @@ def _merge_config_access(
     prev_access = previous.key_components.config_access
     if prev_access is None:
         return None
-    if (
-        previous.executed_source.rerun.fingerprint != source.rerun.fingerprint
-        or previous.executed_source.review.fingerprint != source.review.fingerprint
-    ):
+    if not previous.executed_source.matches(source):
         return recorded
     return sorted(set(prev_access) | set(recorded))
 
@@ -529,41 +519,43 @@ def _decision_for_key(
     components: KeyComponents,
     previous: SuccessRecord | None,
     artifacts_match: bool,
-) -> tuple[Decision, dict[int, BatchRecord] | None, FailureRecord | None]:
+) -> tuple[Decision, dict[int, BatchRecord] | None, AttemptMarker | None, FailureRecord | None]:
     attempt = runtime.store.read_attempt(stage_spec.name)
     failure = runtime.store.read_failure(stage_spec.name)
     partial = None
-    options: dict[str, Any]
+    produces_exist = True
     if stage_spec.kind == "batch":
         partial = _validated_partial(
             runtime.store.read_partial(stage_spec.name, current_key),
             runtime.out,
             runtime.keying.fingerprints,
         )
-        options = {"partial": partial, "output_exists": lambda path: (runtime.out / path).exists()}
     else:
         produces = previous.produces if previous is not None else []
         assert produces is not None
-        options = {"produces_exist": all((runtime.out / item.path).exists() for item in produces)}
-    return (
-        decide(
-            kind=stage_spec.kind,
-            current_key=current_key,
-            current_components=components,
-            success=previous,
-            attempt=attempt,
-            artifacts_match=artifacts_match,
-            failure=failure,
-            **options,
+        produces_exist = all((runtime.out / item.path).exists() for item in produces)
+    decision = decide(
+        kind=stage_spec.kind,
+        current_key=current_key,
+        current_components=components,
+        success=previous,
+        attempt=attempt,
+        produces_exist=produces_exist,
+        partial=partial,
+        output_exists=(
+            (lambda path: (runtime.out / path).exists()) if stage_spec.kind == "batch" else None
         ),
-        partial,
-        failure,
+        artifacts_match=artifacts_match,
+        failure=failure,
     )
+    return decision, partial, attempt, failure
 
 
 def _empty_source_observation() -> SourceObservation:
-    empty = SourceFingerprint(fingerprint="error", files=[])
-    return SourceObservation(rerun=empty, review=empty)
+    return SourceObservation(
+        rerun=SourceFingerprint(fingerprint="error", files=[]),
+        review=SourceFingerprint(fingerprint="error", files=[]),
+    )
 
 
 def _unavailable_probe(
@@ -598,30 +590,32 @@ def _resolve_source_review(
     decision_key: str,
     decision: Decision,
     partial: dict[int, BatchRecord] | None,
+    attempt: AttemptMarker | None,
+    failure: FailureRecord | None,
     artifacts_match: bool,
 ) -> SourceReviewState:
     """Apply current-key partial first, then success baseline for reusable hits only."""
 
     if partial:
-        baseline = _partial_review_fingerprint(runtime, stage_spec.name, decision_key)
-        if baseline is not None:
-            return _review_state(runtime, stage_spec, source_observation, baseline)
+        for provenance in (attempt, failure):
+            if provenance is not None and provenance.input_key == decision_key:
+                return _review_state(
+                    runtime, stage_spec, source_observation, provenance.review_source_fingerprint
+                )
 
     if (
         previous is not None
         and previous.executed_source.review.fingerprint == source_observation.review.fingerprint
     ):
         return SourceReviewState("current")
-    otherwise_reusable = (
-        previous is not None
+    baseline = (
+        previous.executed_source.review.fingerprint
+        if previous is not None
         and previous.input_key == decision_key
         and artifacts_match
         and decision.status in {"hit", "failed", "resume"}
+        else None
     )
-    baseline = None
-    if otherwise_reusable:
-        assert previous is not None
-        baseline = previous.executed_source.review.fingerprint
     return _review_state(runtime, stage_spec, source_observation, baseline)
 
 
@@ -640,11 +634,7 @@ def _stage_decision(
         provisional_review = source_review or SourceReviewState("not-applicable")
         config_access = (
             previous.key_components.config_access
-            if previous is not None
-            and not (
-                provisional_review.relationship == "changed"
-                and provisional_review.decision == "invalidate"
-            )
+            if previous is not None and provisional_review != _SOURCE_INVALIDATED
             else None
         )
     ctx = runtime.context(stage_spec)
@@ -663,7 +653,7 @@ def _stage_decision(
     if previous is not None and _success_outputs_exist(runtime, previous):
         artifact_root = _current_artifacts(runtime, previous)
         artifacts_match = artifact_root == previous.artifact_fingerprint
-    decision, partial, failure = _decision_for_key(
+    decision, partial, attempt, failure = _decision_for_key(
         runtime,
         stage_spec,
         decision_key,
@@ -677,7 +667,6 @@ def _stage_decision(
         and config_access is not None
         and partial is None
     ):
-        attempt = runtime.store.read_attempt(stage_spec.name)
         provenance = attempt or failure
         if provenance is not None and provenance.input_key != decision_key:
             full_config_probe = _stage_decision(
@@ -700,16 +689,11 @@ def _stage_decision(
         decision_key=decision_key,
         decision=decision,
         partial=partial,
+        attempt=attempt,
+        failure=failure,
         artifacts_match=artifacts_match,
     )
-    if (
-        config_access is not None
-        and previous is not None
-        and source_review is None
-        and review.relationship == "changed"
-        and review.decision == "invalidate"
-        and previous.key_components.config_access is not None
-    ):
+    if config_access is not None and source_review is None and review == _SOURCE_INVALIDATED:
         # Invalidated review should not reuse the previous projected access set.
         return _stage_decision(
             runtime,
@@ -731,34 +715,6 @@ def _stage_decision(
         _partial=partial,
         _artifacts_match=artifacts_match,
     )
-
-
-def _probe_stage(
-    runtime: _Runtime,
-    stage_name: str,
-    *,
-    known_upstream_fingerprints: dict[str, str],
-    source_observation: SourceObservation,
-) -> StageProbe:
-    stage_spec = runtime.graph.stages[stage_name]
-    probe = _stage_decision(
-        runtime,
-        stage_spec,
-        known_upstream_fingerprints=known_upstream_fingerprints,
-        source_observation=source_observation,
-    )
-    attempt = runtime.store.read_attempt(stage_name)
-    if (
-        probe.previous is None
-        and attempt is not None
-        and runtime.store.read_failure(stage_name) is None
-        and stage_spec.kind == "single"
-    ):
-        try:
-            _produced_paths(stage_spec.produces, runtime.context(stage_spec))
-        except FileNotFoundError:
-            pass
-    return probe
 
 
 def probe_pipeline(
@@ -806,6 +762,7 @@ def probe_pipeline(
                 )
             )
             continue
+        previous = keying_session.read_success(store, stage_name)
         if schema_migration:
             assert manifest is not None
             probes.append(
@@ -822,7 +779,6 @@ def probe_pipeline(
             None,
         )
         if missing_upstream is not None:
-            previous = keying_session.read_success(store, stage_name)
             probes.append(
                 _unavailable_probe(
                     stage_name,
@@ -830,18 +786,28 @@ def probe_pipeline(
                     f"upstream {missing_upstream} has no success record",
                     source_observation,
                     previous=previous,
-                    review=_source_review(runtime, stage_spec, previous, source_observation),
+                    review=_previous_review(runtime, stage_spec, source_observation, previous),
                 )
             )
             continue
-        previous = keying_session.read_success(store, stage_name)
         try:
-            probe = _probe_stage(
+            probe = _stage_decision(
                 runtime,
-                stage_name,
+                stage_spec,
                 known_upstream_fingerprints=known_upstream_fingerprints,
                 source_observation=source_observation,
             )
+            attempt = store.read_attempt(stage_name)
+            if (
+                probe.previous is None
+                and attempt is not None
+                and store.read_failure(stage_name) is None
+                and stage_spec.kind == "single"
+            ):
+                try:
+                    _produced_paths(stage_spec.produces, runtime.context(stage_spec))
+                except FileNotFoundError:
+                    pass
         except Exception as error:  # noqa: BLE001 - status must retain evaluation errors.
             probe = _unavailable_probe(
                 stage_name,
@@ -849,20 +815,13 @@ def probe_pipeline(
                 str(error),
                 source_observation,
                 previous=previous,
-                review=_source_review(runtime, stage_spec, previous, source_observation),
+                review=_previous_review(runtime, stage_spec, source_observation, previous),
                 failure=store.read_failure(stage_name),
             )
         probes.append(probe)
         if probe.previous is not None and _success_outputs_exist(runtime, probe.previous):
             known_upstream_fingerprints[stage_name] = _current_artifacts(runtime, probe.previous)
     return tuple(probes)
-
-
-async def _execute_stage(instance, stage_spec, ctx: Ctx) -> None:
-    coordinates = {axis.name: value for axis, value in stage_spec.cell}
-    result = stage_spec.func(instance, ctx, **coordinates)
-    if inspect.isawaitable(result):
-        await result
 
 
 async def _execute_batch(instance, stage_spec, ctx: Ctx):
@@ -877,29 +836,164 @@ async def _execute_batch(instance, stage_spec, ctx: Ctx):
             yield ctx._current_batch_index, [Path(yielded)]
 
 
-def _display(
-    graph: PipelineGraph,
-    selected: set[str],
-    store: Store,
-    mode: RunDisplayMode,
-    reporter: RunReporter | None = None,
-) -> tuple[Any, RunReporter]:
-    if reporter is None:
-        plan = build_run_display_plan(graph, selected, store, mode=mode)
-        reporter = RunReporter(plan, logging.getLogger("varve"))
-    return reporter.plan, reporter
+async def _materialize_stage(
+    runtime: _Runtime,
+    instance: Pipeline,
+    stage_spec,
+    ctx: Ctx,
+    decision: Decision,
+    partial: dict[int, BatchRecord] | None,
+    current_key: str,
+) -> tuple[list[ProducedPath] | None, list[OutputHandle] | None, str]:
+    if stage_spec.kind == "single":
+        try:
+            coordinates = {axis.name: value for axis, value in stage_spec.cell}
+            result = stage_spec.func(instance, ctx, **coordinates)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as error:
+            _record_stage_failure(runtime, stage_spec.name, error)
+            raise
+        produces = _produced_paths(stage_spec.produces, ctx)
+        return produces, None, artifacts_root_fingerprint([item.artifact for item in produces])
+
+    store, out = runtime.store, runtime.out
+    outputs_by_index = {
+        index: list(batch.yielded)
+        for index, batch in ((partial if decision.resume_skip else None) or {}).items()
+        if all((out / path).exists() for path in batch.yielded)
+    }
+    partial_enabled = True
+    saw_yield = False
+    batch_iterator = _execute_batch(instance, stage_spec, ctx).__aiter__()
+    while True:
+        try:
+            yielded_index, index_paths = await anext(batch_iterator)
+        except StopAsyncIteration:
+            break
+        except Exception as error:
+            _record_stage_failure(runtime, stage_spec.name, error)
+            raise
+        saw_yield = True
+        if not ctx._used_resume and partial_enabled:
+            warnings.warn(
+                f"batch stage {stage_spec.name!r} yielded without iterating ctx.resume; "
+                "its outputs are not resumable. Wrap your iterable in ctx.resume(...) "
+                "to enable per-batch checkpoint resume.",
+                stacklevel=3,
+            )
+            store.clear_partial(stage_spec.name, current_key)
+            outputs_by_index.clear()
+            partial_enabled = False
+        index = yielded_index if yielded_index is not None else len(outputs_by_index)
+        yielded = []
+        for path in index_paths:
+            _, relative = _managed_output(
+                path,
+                ctx,
+                "Yielded varve output",
+                matrix_description="Yielded matrix stage output",
+                cwd_hint=True,
+            )
+            yielded.append(relative)
+        if partial_enabled:
+            store.write_batch(
+                stage_spec.name,
+                current_key,
+                BatchRecord(
+                    index=index,
+                    yielded=yielded,
+                    artifacts=[_fresh_artifact(runtime, item) for item in yielded],
+                    committed_at=_now(),
+                    total=ctx._resume_total,
+                ),
+            )
+        outputs_by_index[index] = yielded
+    if not ctx._used_resume:
+        store.clear_partial(stage_spec.name, current_key)
+        if not saw_yield:
+            outputs_by_index.clear()
+    outputs, artifact_root = _batch_result(runtime, outputs_by_index)
+    return None, outputs, artifact_root
+
+
+def _execution_probe(
+    runtime: _Runtime,
+    stage_spec,
+    source_observation: SourceObservation,
+    review: SourceReviewState,
+    *,
+    force: bool,
+) -> tuple[StageProbe, tuple[str, str, dict[int, BatchRecord]] | None]:
+    """Resolve the execution key basis, review action, and checkpoint adoption."""
+
+    probe = _stage_decision(
+        runtime,
+        stage_spec,
+        source_observation=source_observation,
+        source_review=review,
+    )
+    components, current_key = probe.components, probe.decision_key
+    assert components is not None and current_key is not None
+    decision, partial, failure = probe.decision, probe._partial, probe.failure
+    partial_adoption = None
+
+    if (
+        review.relationship == "changed"
+        and components.config_access is not None
+        and (decision.status != "hit" or force)
+    ):
+        # Reused changes may probe with the old access set, but execution must
+        # conservatively start from the whole Config and record a fresh set.
+        projected_key, projected_partial = current_key, partial
+        probe = _stage_decision(
+            runtime,
+            stage_spec,
+            source_observation=source_observation,
+            source_review=review,
+            config_access=None,
+        )
+        components, current_key = probe.components, probe.decision_key
+        assert components is not None and current_key is not None
+        decision, full_key_partial, failure = probe.decision, probe._partial, probe.failure
+        if stage_spec.kind == "batch":
+            if review.decision == "reuse" and projected_key != current_key and projected_partial:
+                partial = dict(projected_partial)
+                partial.update(full_key_partial or {})
+                partial_adoption = (projected_key, current_key, partial)
+                decision = decide(
+                    kind="batch",
+                    current_key=current_key,
+                    current_components=components,
+                    success=probe.previous,
+                    partial=partial,
+                    attempt=runtime.store.read_attempt(stage_spec.name),
+                    output_exists=lambda path: (runtime.out / path).exists(),
+                    artifacts_match=probe._artifacts_match,
+                    failure=failure,
+                )
+            else:
+                partial = full_key_partial
+
+    if force:
+        decision = Decision("needs-run", "forced")
+    elif review == _SOURCE_INVALIDATED:
+        decision = Decision("needs-run", "source-changed")
+    elif decision.status == "failed":
+        decision = (
+            Decision("resume", "resume-after-failure", decision.resume_skip, decision.resume_total)
+            if decision.resume_skip
+            else Decision("needs-run", "retry-failed")
+        )
+    return replace(probe, decision=decision, _partial=partial), partial_adoption
 
 
 async def _drive(
     runtime: _Runtime,
     *,
-    upto: str | None,
-    downstream: str | None,
-    only: str | None,
+    selected: set[str],
     force: bool,
-    display_mode: RunDisplayMode,
-    reporter: RunReporter | None = None,
-    slices: tuple[str, ...] = (),
+    reporter: RunReporter,
 ) -> list[StageOutcome]:
     graph, store, out, keying_session = (
         runtime.graph,
@@ -907,14 +1001,7 @@ async def _drive(
         runtime.out,
         runtime.keying,
     )
-    selected = selected_stages(
-        graph,
-        upto=upto,
-        downstream=downstream,
-        only=only,
-        slices=slices,
-    )
-    display_plan, reporter = _display(graph, selected, store, display_mode, reporter)
+    display_plan = reporter.plan
     preflight_names = graph.closure(selected)
     preflight = probe_pipeline(
         runtime.pipeline,
@@ -927,20 +1014,13 @@ async def _drive(
     )
     preflight_by_stage = {probe.stage: probe for probe in preflight}
     external = preflight_names.difference(selected)
-    pending_bases: list[str] = []
-    seen_pending: set[str] = set()
-    for probe in preflight:
-        if not (
-            probe.source_review.relationship == "changed" and probe.source_review.decision == "none"
-        ):
-            continue
-        if force and probe.stage not in external:
-            continue
-        base = graph.stages[probe.stage].base_name or probe.stage
-        if base in seen_pending:
-            continue
-        seen_pending.add(base)
-        pending_bases.append(base)
+    pending_bases = list(
+        dict.fromkeys(
+            graph.stages[probe.stage].base_name or probe.stage
+            for probe in preflight
+            if probe.source_review == _SOURCE_CHANGED and (not force or probe.stage in external)
+        )
+    )
     if pending_bases:
         raise ReviewRequiredError(pending_bases)
     errors = [probe for probe in preflight if probe.decision.status == "error"]
@@ -960,7 +1040,7 @@ async def _drive(
         raise ValueError(f"Upstream stage is not current: {details}")
     execution_source_reviews = {
         probe.stage: (
-            SourceReviewState("changed", "invalidate")
+            _SOURCE_INVALIDATED
             if force and probe.source_review.relationship == "changed"
             else probe.source_review
         )
@@ -980,16 +1060,11 @@ async def _drive(
             )
             for stage_name in group.stages
         }
-        batch_completed = None
-        batch_total = None
-        if (
-            not first_spec.cell
-            and first_spec.kind == "batch"
-            and first_probe.decision.resume_skip
-            and first_probe.decision.resume_total is not None
-        ):
-            batch_completed = len(first_probe.decision.resume_skip)
-            batch_total = first_probe.decision.resume_total
+        batch_progress = (
+            first_probe.decision.progress
+            if not first_spec.cell and first_spec.kind == "batch"
+            else None
+        )
         order_markers.append(
             format_run_order_marker(
                 base_name=group.base_name,
@@ -997,108 +1072,36 @@ async def _drive(
                 is_matrix=bool(first_spec.cell),
                 forced=force,
                 status_by_stage=status_by_stage,
-                batch_completed=batch_completed,
-                batch_total=batch_total,
+                batch_progress=batch_progress,
             )
         )
     reporter.log_plan(markers=tuple(order_markers))
 
-    for stage_name in graph.topo_order():
+    for preflight_probe in preflight:
+        stage_name = preflight_probe.stage
         if stage_name not in selected:
             continue
         stage_spec = graph.stages[stage_name]
         reporter.start(stage_name)
-        source_observation = preflight_by_stage[stage_name].source_observation
+        source_observation = preflight_probe.source_observation
         review = execution_source_reviews[stage_name]
-        probe = _stage_decision(
+        probe, partial_adoption = _execution_probe(
             runtime,
             stage_spec,
-            source_observation=source_observation,
-            source_review=review,
+            source_observation,
+            review,
+            force=force,
         )
         previous = probe.previous
-        previous_access = probe.components.config_access if probe.components is not None else None
         components = probe.components
         current_key = probe.decision_key
         assert components is not None and current_key is not None
-        partial_adoption: tuple[str, str, dict[int, BatchRecord]] | None = None
-        decision, partial, failure = probe.decision, probe._partial, probe.failure
-
-        probe_key = current_key
-        probe_partial = partial
-        if (
-            review.relationship == "changed"
-            and previous_access is not None
-            and (decision.status != "hit" or force)
-        ):
-            # A reused source change may continue using the old access set
-            # while probing a reusable materialization. Once this run will
-            # actually execute, use the whole Config as the conservative input
-            # basis and let the execution record a new access set.
-            probe = _stage_decision(
-                runtime,
-                stage_spec,
-                source_observation=source_observation,
-                source_review=review,
-                config_access=None,
-            )
-            components, current_key = probe.components, probe.decision_key
-            assert components is not None and current_key is not None
-            decision, full_key_partial, failure = probe.decision, probe._partial, probe.failure
-            if stage_spec.kind == "batch":
-                if (
-                    review.relationship == "changed"
-                    and review.decision == "reuse"
-                    and probe_key != current_key
-                    and probe_partial
-                ):
-                    partial = dict(probe_partial)
-                    partial.update(full_key_partial or {})
-                    partial_adoption = (probe_key, current_key, partial)
-                else:
-                    partial = full_key_partial
-                if partial is not full_key_partial:
-                    decision = decide(
-                        kind="batch",
-                        current_key=current_key,
-                        current_components=components,
-                        success=previous,
-                        partial=partial,
-                        attempt=store.read_attempt(stage_name),
-                        output_exists=lambda path: (out / path).exists(),
-                        artifacts_match=probe._artifacts_match,
-                        failure=failure,
-                    )
-
-        # `failed` is the read-only state of the last attempt. Once a run has
-        # been requested, retry it using any validated batch checkpoints.
-        if decision.status == "failed":
-            decision = (
-                Decision(
-                    "resume",
-                    "resume-after-failure",
-                    decision.resume_skip,
-                    decision.resume_total,
-                )
-                if decision.resume_skip
-                else Decision("needs-run", "retry-failed")
-            )
-
-        if review.relationship == "changed" and review.decision == "invalidate":
-            decision = Decision("needs-run", "source-changed")
-        if force:
-            decision = Decision("needs-run", "forced")
+        decision, partial = probe.decision, probe._partial
         if decision.status == "hit":
-            _refresh_fingerprint_cache(
-                runtime=runtime,
-                previous=previous,
-                components=components,
-            )
+            _refresh_fingerprint_cache(runtime, previous, components)
             reporter.lifecycle(stage_name, decision.status, decision.reason)
             reporter.input_key(stage_name, current_key)
-            outcome = display_plan.outcome(stage_name, decision.status, decision.reason, None)
-            outcomes.append(outcome)
-            reporter.record(outcome)
+            outcomes.append(reporter.outcome(stage_name, decision.status, decision.reason, None))
             continue
         access = ConfigAccess()
         ctx = runtime.context(
@@ -1113,7 +1116,7 @@ async def _drive(
                 store.write_batch(stage_name, new_key, batch)
             store.clear_partial(stage_name, old_key)
         if stage_spec.kind == "batch":
-            if force or (review.relationship == "changed" and review.decision == "invalidate"):
+            if force or review == _SOURCE_INVALIDATED:
                 store.clear_partial(stage_name)
             elif not decision.resume_skip:
                 store.clear_partial(stage_name, current_key)
@@ -1130,118 +1133,15 @@ async def _drive(
                 touched_existing=previous is not None,
             ),
         )
-        if stage_spec.kind == "single":
-            try:
-                await _execute_stage(instance, stage_spec, ctx)
-            except Exception as error:
-                _record_stage_failure(runtime, stage_name, error)
-                raise
-            produces = _produced_paths(stage_spec.produces, ctx)
-            outputs = None
-            artifact_root = artifacts_root_fingerprint([item.artifact for item in produces])
-        else:
-            produces = None
-            partial_for_outputs = partial if decision.resume_skip else None
-            outputs_by_index = {
-                index: list(batch.yielded)
-                for index, batch in (partial_for_outputs or {}).items()
-                if all((out / path).exists() for path in batch.yielded)
-            }
-            partial_enabled = True
-            saw_yield = False
-            batch_iterator = _execute_batch(instance, stage_spec, ctx).__aiter__()
-            while True:
-                try:
-                    yielded_index, index_paths = await anext(batch_iterator)
-                except StopAsyncIteration:
-                    break
-                except Exception as error:
-                    _record_stage_failure(runtime, stage_name, error)
-                    raise
-                saw_yield = True
-                if not ctx._used_resume and partial_enabled:
-                    warnings.warn(
-                        f"batch stage {stage_name!r} yielded without iterating ctx.resume; "
-                        "its outputs are not resumable. Wrap your iterable in ctx.resume(...) "
-                        "to enable per-batch checkpoint resume.",
-                        stacklevel=2,
-                    )
-                    store.clear_partial(stage_name, current_key)
-                    outputs_by_index.clear()
-                    partial_enabled = False
-                index = yielded_index if yielded_index is not None else len(outputs_by_index)
-                yielded = []
-                for path in index_paths:
-                    _, relative = _managed_output(
-                        path,
-                        ctx,
-                        "Yielded varve output",
-                        matrix_description="Yielded matrix stage output",
-                        cwd_hint=True,
-                    )
-                    yielded.append(relative)
-                if partial_enabled:
-                    store.write_batch(
-                        stage_name,
-                        current_key,
-                        BatchRecord(
-                            index=index,
-                            yielded=yielded,
-                            artifacts=[
-                                artifact_fingerprint(
-                                    out / item,
-                                    out,
-                                    session=keying_session.fingerprints,
-                                    force_rehash=True,
-                                )
-                                for item in yielded
-                            ],
-                            committed_at=_now(),
-                            total=ctx._resume_total,
-                        ),
-                    )
-                outputs_by_index[index] = yielded
-            if not ctx._used_resume:
-                store.clear_partial(stage_name, current_key)
-                if not saw_yield:
-                    outputs_by_index.clear()
-            outputs = [
-                OutputHandle(
-                    index=index,
-                    path=path,
-                    artifact=artifact_fingerprint(
-                        out / path,
-                        out,
-                        session=keying_session.fingerprints,
-                        force_rehash=True,
-                    ),
-                )
-                for index, paths in sorted(outputs_by_index.items())
-                for path in paths
-            ]
-            artifact_root = artifacts_root_fingerprint(
-                [item.artifact for item in outputs],
-                positions=[
-                    (index, ordinal)
-                    for index, paths in sorted(outputs_by_index.items())
-                    for ordinal, _ in enumerate(paths)
-                ],
-            )
-        elapsed = time.monotonic() - started
-        resumed_without_access_baseline = (
-            stage_spec.kind == "batch"
-            and bool(decision.resume_skip)
-            and (
-                previous is None
-                or previous.executed_source.rerun.fingerprint
-                != source_observation.rerun.fingerprint
-                or previous.executed_source.review.fingerprint
-                != source_observation.review.fingerprint
-            )
+        produces, outputs, artifact_root = await _materialize_stage(
+            runtime, instance, stage_spec, ctx, decision, partial, current_key
         )
+        elapsed = time.monotonic() - started
         committed_access = (
             None
-            if resumed_without_access_baseline
+            if stage_spec.kind == "batch"
+            and decision.resume_skip
+            and (previous is None or not previous.executed_source.matches(source_observation))
             else _merge_config_access(previous, source_observation, access.resolve())
         )
         commit_components = components.model_copy(
@@ -1272,9 +1172,7 @@ async def _drive(
         store.clear_partial(stage_name)
         keying_session.refresh_fingerprints()
         reporter.lifecycle(stage_name, "done", f"{elapsed:.2f}s")
-        outcome = display_plan.outcome(stage_name, decision.status, decision.reason, elapsed)
-        outcomes.append(outcome)
-        reporter.record(outcome)
+        outcomes.append(reporter.outcome(stage_name, decision.status, decision.reason, elapsed))
     return outcomes
 
 
@@ -1335,13 +1233,9 @@ def run(
             return asyncio.run(
                 _drive(
                     runtime,
-                    upto=upto,
-                    downstream=downstream,
-                    only=only,
+                    selected=selected,
                     force=force,
-                    display_mode=display_mode,
                     reporter=reporter,
-                    slices=slices,
                 )
             )
         except Exception as error:
@@ -1399,7 +1293,17 @@ def record_source_review(
             candidates,
             decision,
         )
-        apply_review_writes(store, writes, _now())
+        decided_at = _now()
+        for base_stage, observation in writes:
+            store.write_review(
+                base_stage,
+                ReviewRecord(
+                    review_fingerprint=observation.fingerprint,
+                    review_observation=observation,
+                    decision=decision,
+                    decided_at=decided_at,
+                ),
+            )
         return result
 
 
@@ -1440,14 +1344,12 @@ def evaluate_state(
         _keying_session=keying,
         _stage_names=selected,
     )
-    by_stage = {probe.stage: probe for probe in probes}
-    display_plan, reporter = _display(graph, selected, store, "expand")
+    display_plan = build_run_display_plan(graph, selected, store, mode="expand")
+    reporter = RunReporter(display_plan, logging.getLogger("varve"))
     outcomes = []
     reporter.log_plan()
-    for stage_name in graph.topo_order():
-        if stage_name not in selected:
-            continue
-        probe = by_stage[stage_name]
+    for probe in probes:
+        stage_name = probe.stage
         reporter.start(stage_name)
         if _record_callback is not None:
             _record_callback(stage_name, probe.previous)
@@ -1455,9 +1357,7 @@ def evaluate_state(
         if probe.decision_key is not None:
             reporter.lifecycle(stage_name, probe.decision.status, probe.decision.reason)
             reporter.input_key(stage_name, probe.decision_key)
-        outcome = display_plan.outcome(
-            stage_name, probe.decision.status, probe.decision.reason, None
+        outcomes.append(
+            reporter.outcome(stage_name, probe.decision.status, probe.decision.reason, None)
         )
-        outcomes.append(outcome)
-        reporter.record(outcome)
     return outcomes

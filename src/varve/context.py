@@ -20,18 +20,6 @@ def _len_or_none(iterable: Iterable[Any]) -> int | None:
         return None
 
 
-def _make_tqdm_progress(
-    *,
-    desc: str,
-    total: int | None,
-    initial: int,
-    unit: str,
-):
-    from tqdm.auto import tqdm
-
-    return tqdm(total=total, initial=initial, desc=desc, unit=unit)
-
-
 class Ctx(Generic[ConfigT, ArgsT]):
     """Runtime context passed to stage methods.
 
@@ -135,18 +123,21 @@ class Ctx(Generic[ConfigT, ArgsT]):
         self._resume_total = inferred_total
         progress_handle = None
         if progress:
-            if desc is not None:
-                label = desc
-            elif self._stage_display:
-                label = " / ".join(self._stage_display)
-            else:
-                label = self._stage_name or "batch"
+            label = (
+                desc
+                if desc is not None
+                else " / ".join(self._stage_display)
+                if self._stage_display
+                else self._stage_name or "batch"
+            )
             initial = (
                 sum(1 for index in self._resume_skip if index < inferred_total)
                 if inferred_total is not None
                 else 0
             )
-            progress_handle = _make_tqdm_progress(
+            from tqdm.auto import tqdm
+
+            progress_handle = tqdm(
                 desc=label,
                 total=inferred_total,
                 initial=initial,

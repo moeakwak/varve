@@ -65,6 +65,12 @@ class SourceObservation(VarveModel):
     rerun: SourceFingerprint
     review: SourceFingerprint
 
+    def matches(self, other: SourceObservation) -> bool:
+        return (
+            self.rerun.fingerprint == other.rerun.fingerprint
+            and self.review.fingerprint == other.review.fingerprint
+        )
+
 
 class KeyComponents(VarveModel):
     config: dict[str, Any]

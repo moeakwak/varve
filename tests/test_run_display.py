@@ -18,7 +18,6 @@ from varve.engine.run_display import (
     StageOutcome,
     build_run_display_plan,
     format_run_order_marker,
-    outcome_rows,
 )
 from varve.engine.runner import run
 from varve.engine.state import (
@@ -150,12 +149,12 @@ def test_compact_reporter_finishes_non_contiguous_group_by_count(caplog) -> None
 
     reporter.start(stages[0])
     for stage_name in stages[:-1]:
-        reporter.record(plan.outcome(stage_name, "hit", "hit", None))
+        reporter.outcome(stage_name, "hit", "hit", None)
     assert not any("ran 0" in record.getMessage() for record in caplog.records)
 
     # Completion depends on the selected-cell count, not adjacency in the
     # caller's event stream.
-    reporter.record(plan.outcome(stages[-1], "needs-run", "source-changed", 0.25))
+    reporter.outcome(stages[-1], "needs-run", "source-changed", 0.25)
     messages = [record.getMessage() for record in caplog.records]
     assert "[work] start · 8 cells" in messages
     assert "[work] done · 8 cells · 7 hit, 1 needs-run · ran 1 · 0.25s" in messages
@@ -173,14 +172,16 @@ def test_compact_reporter_surfaces_new_slow_cell_by_concrete_name(caplog) -> Non
     caplog.set_level(logging.INFO, logger="varve")
     stage_name = graph.base_cells["work"][0]
 
-    reporter.record(plan.outcome(stage_name, "needs-run", "no-cache", AUTO_EXPAND_SLOW_SECONDS))
+    reporter.outcome(stage_name, "needs-run", "no-cache", AUTO_EXPAND_SLOW_SECONDS)
 
     assert f"[{stage_name}] slow · {AUTO_EXPAND_SLOW_SECONDS:.2f}s" in [
         record.getMessage() for record in caplog.records
     ]
 
 
-def test_compact_runner_aggregates_live_hits_runs_and_outcomes(tmp_path: Path, caplog) -> None:
+def test_compact_runner_aggregates_live_hits_runs_and_outcomes(
+    tmp_path: Path, caplog, capsys
+) -> None:
     caplog.set_level(logging.INFO, logger="varve")
     first = run(LargeMatrix, Config(), cli_out=tmp_path)
     first_messages = [record.getMessage() for record in caplog.records]
@@ -193,17 +194,22 @@ def test_compact_runner_aggregates_live_hits_runs_and_outcomes(tmp_path: Path, c
     assert "[work] start · 8 cells" in first_messages
     assert any("8 needs-run · ran 8" in message for message in first_messages)
     assert not any("[work@item=" in message for message in first_messages)
-    first_rows = outcome_rows(first)
-    assert [(row.stage, row.cells, row.ran) for row in first_rows] == [("work", 8, 8)]
+    assert len(first) == 8
+    assert {outcome.display_base for outcome in first} == {"work"}
+    assert sum(outcome.elapsed is not None for outcome in first) == 8
 
     caplog.clear()
     second = run(LargeMatrix, Config(), cli_out=tmp_path)
     second_messages = [record.getMessage() for record in caplog.records]
     assert any("8 hit · ran 0" in message for message in second_messages)
-    second_row = outcome_rows(second)[0]
-    assert second_row.status == "8 hit"
-    assert second_row.status_counts == (("hit", 8),)
-    assert second_row.elapsed is None
+    assert len(second) == 8
+    assert {outcome.status for outcome in second} == {"hit"}
+    assert all(outcome.elapsed is None for outcome in second)
+
+    render_run_outcomes(make_console(), second)
+    output = capsys.readouterr().out
+    row = " ".join(next(line for line in output.splitlines() if "work" in line).split())
+    assert row == "work 8 hit - 8 0 -"
 
 
 def test_compact_cli_outcome_table_has_one_group_row(tmp_path: Path, capsys) -> None:
@@ -340,8 +346,7 @@ def test_run_order_marker_always_folds_matrix_and_force() -> None:
             is_matrix=False,
             forced=False,
             status_by_stage={"build": "failed"},
-            batch_completed=3,
-            batch_total=12,
+            batch_progress=(3, 12),
         )
         == "build 3/12 · ✕ failed"
     )
@@ -360,15 +365,15 @@ def test_run_order_highlighter_uses_pending_and_arrow_styles() -> None:
     assert console.get_style("varve.run_order_arrow").dim is True
 
 
-def test_non_matrix_outcome_rows_remain_one_row_per_stage() -> None:
+def test_non_matrix_outcomes_render_one_row_per_stage(capsys) -> None:
     outcomes = [
         StageOutcome("prepare", "hit", "hit", None),
         StageOutcome("finish", "needs-run", "no-cache", 0.5),
     ]
 
-    rows = outcome_rows(outcomes)
+    render_run_outcomes(make_console(), outcomes)
+    output = capsys.readouterr().out
 
-    assert [(row.stage, row.status, row.grouped) for row in rows] == [
-        ("prepare", "hit", False),
-        ("finish", "needs-run", False),
-    ]
+    assert "CELLS" not in output
+    assert "prepare" in output and "hit" in output
+    assert "finish" in output and "needs-run" in output

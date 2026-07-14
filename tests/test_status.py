@@ -16,6 +16,7 @@ from varve.cli.review import render_source_review
 from varve.cli.status import reason_text, render_status
 from varve.command import resolved_command_context
 from varve.engine.runner import record_source_review, run
+from varve.engine.state import SourceReviewState
 from varve.status import (
     CellCoordinate,
     collect_pipeline_status,
@@ -108,7 +109,6 @@ def collect_status(
     resolved = ResolvedBranch(
         config=config,
         branch=branch,
-        is_temporary=False,
         output_base=out.parent,
     )
     context = resolved_command_context(pipeline, resolved, pipeline.Args())
@@ -129,9 +129,8 @@ def test_collect_status_reads_previous_record(tmp_path: Path) -> None:
     ).stages[0]
 
     assert stage_status.status == "hit"
-    assert stage_status.execution_status == "hit"
-    assert stage_status.source_relationship == "current"
     assert stage_status.decision_key is not None
+    assert stage_status.source_review.relationship == "current"
     assert stage_status.stored_key is not None
     assert stage_status.duration == 1.25
     assert stage_status.source_changes == {}
@@ -152,6 +151,7 @@ def test_collect_status_keeps_previous_duration_when_upstream_record_is_missing(
     ).stages[0]
 
     assert downstream.status == "needs-run"
+    assert downstream.decision_key is None
     assert downstream.stored_key is not None
     assert downstream.duration is not None
     assert downstream.source_changes == {}
@@ -179,7 +179,6 @@ def test_collect_status_marks_inputs_unavailable_after_missing_upstream(
 
     assert [stage.name for stage in status.stages] == ["prepare", "finish"]
     downstream = status.stages[1]
-    assert downstream.decision_key is None
     assert downstream.key_inputs is None
     assert downstream.unavailable_reason == "upstream prepare has no success record"
 
@@ -227,7 +226,7 @@ def render_to_text(
     buffer = StringIO()
     console = Console(file=buffer, width=width, color_system=None)
     view = "summary" if stage is None and depth == 0 else "detail"
-    render_status(console, status, view=view, dependency_depth=depth)
+    render_status(console, status, view=view)
     return buffer.getvalue()
 
 
@@ -293,7 +292,6 @@ def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
             cell=coordinate("a"),
             logical_needs=("prepare",),
             status="hit",
-            execution_status="hit",
             reason="hit",
             summary_reason="hit",
             duration=1.0,
@@ -305,7 +303,6 @@ def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
             cell=coordinate("b"),
             logical_needs=("prepare",),
             status="needs-run",
-            execution_status="needs-run",
             reason="inputs-changed",
             summary_reason="inputs-changed",
             duration=2.0,
@@ -317,7 +314,6 @@ def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
             cell=coordinate("c"),
             logical_needs=("prepare",),
             status="failed",
-            execution_status="failed",
             reason="stage-failed",
             summary_reason="stage-failed",
             duration=None,
@@ -329,7 +325,7 @@ def test_matrix_group_aggregates_mixed_statuses_and_recorded_durations(
     assert group.status == "failed"
     assert group.status_counts == (("hit", 1), ("needs-run", 1), ("failed", 1))
     assert group.duration == 3.0
-    assert group.recorded_duration_count == 2
+    assert sum(cell.duration is not None for cell in group.cells) == 2
 
     output = render_to_text(status, stage=None, depth=0, width=160)
     assert "1 hit · 1 needs-run · 1 failed" in output
@@ -411,8 +407,7 @@ def test_required_review_renders_as_effective_needs_review(pipeline_status) -> N
         status="needs-review",
         reason="source-changed",
         summary_reason="source-changed",
-        source_relationship="changed",
-        source_decision="none",
+        source_review=SourceReviewState("changed"),
         source_changes={"review/pipeline.py": "changed"},
     )
     status = replace(pipeline_status, stages=(stage,))
@@ -476,7 +471,7 @@ def test_partial_matrix_status_keeps_canonical_selector_and_full_probe_subset(
 
     assert status.selector is not None
     assert status.selector.canonical == "score@model=y"
-    assert status.selector.matched_count == 2
+    assert len(status.selector.concrete_stages) == 2
     assert [stage.name for stage in status.stages] == [
         "score@bench=a,model=y",
         "score@bench=b,model=y",
@@ -512,7 +507,6 @@ def test_matrix_effective_status_prioritizes_needs_review(pipeline_status) -> No
         base_name="score",
         cell=(CellCoordinate(axis="model", value_id="x"),),
         status="hit",
-        execution_status="hit",
     )
     required = replace(
         original,
@@ -522,10 +516,8 @@ def test_matrix_effective_status_prioritizes_needs_review(pipeline_status) -> No
         status="needs-review",
         reason="source-changed",
         summary_reason="source-changed",
-        execution_status="error",
         execution_reason="cannot evaluate input",
-        source_relationship="changed",
-        source_decision="none",
+        source_review=SourceReviewState("changed"),
     )
     status = replace(pipeline_status, stages=(hit, required))
 
@@ -626,8 +618,7 @@ def test_changed_source_detail_preserves_review_decision_and_files(
         status=effective,
         reason="source-changed" if effective == "needs-run" else "hit",
         summary_reason="source-changed" if effective == "needs-run" else "hit",
-        source_relationship="changed",
-        source_decision=decision,
+        source_review=SourceReviewState("changed", decision),
         source_changes={"review/pipeline.py": "changed"},
     )
     status = replace(pipeline_status, stages=(stage,))

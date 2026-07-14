@@ -23,27 +23,15 @@ def wrap_stage_name(name: str, *, limit: int = STAGE_NAME_LIMIT) -> tuple[str, .
 
     if len(name) <= limit:
         return (name,)
-    split_at = _preferred_split(name, limit)
+    # Prefer the last separator that keeps the first line within the limit.
+    split_at = max(name.rfind("_", 0, limit), name.rfind("-", 0, limit)) + 1 or None
     if split_at is None:
         return (name[:limit], _middle_truncate(name[limit:], limit))
     first = name[:split_at]
     second = name[split_at:]
-    if len(first) > limit:
-        first = first[:limit]
     if len(second) <= limit:
         return (first, second)
     return (first, _middle_truncate(second, limit))
-
-
-def _preferred_split(name: str, limit: int) -> int | None:
-    # Prefer the last separator that keeps the first line within the limit.
-    best: int | None = None
-    for index, char in enumerate(name):
-        if char in {"_", "-"} and 0 < index + 1 <= limit:
-            best = index + 1
-        if index + 1 >= limit and best is not None:
-            break
-    return best
 
 
 def _middle_truncate(value: str, limit: int) -> str:
@@ -51,9 +39,8 @@ def _middle_truncate(value: str, limit: int) -> str:
         return value
     if limit <= 1:
         return "…"
-    keep = limit - 1
-    head = (keep + 1) // 2
-    tail = keep - head
+    head = limit // 2
+    tail = limit - head - 1
     return f"{value[:head]}…{value[-tail:] if tail else ''}"
 
 
@@ -61,46 +48,35 @@ def format_group_progress(group: StageStatusGroup) -> Text:
     """Render status/progress text for one logical Stage node."""
 
     if group.is_matrix:
-        if group.hit_cells == group.cell_count and group.cell_count > 0:
+        total = len(group.cells)
+        hit = sum(cell.status == "hit" for cell in group.cells)
+        if hit == total and total > 0:
             return Text("✓", style=STATUS_STYLES["hit"])
-        progress = Text(
-            f"{group.hit_cells}/{group.cell_count} cells",
-            style=STATUS_STYLES["needs-run"],
-        )
-        if group.status in {"needs-review", "failed", "error"}:
-            progress.append(" · ", style="dim")
-            progress.append_text(_aggregate_status_label(group.status))
-        return progress
+        return _progress(f"{hit}/{total} cells", group.status)
     if group.status == "hit":
         return Text("✓", style=STATUS_STYLES["hit"])
-    if group.batch_completed is not None and group.batch_total is not None:
-        progress = Text(
-            f"{group.batch_completed}/{group.batch_total} batches",
-            style=STATUS_STYLES["needs-run"],
-        )
-        if group.status in {"needs-review", "failed", "error"}:
-            progress.append(" · ", style="dim")
-            progress.append_text(_aggregate_status_label(group.status))
-        return progress
-    if group.status == "needs-review":
-        return Text("! needs-review", style=STATUS_STYLES[group.status])
-    if group.status == "failed":
-        return Text("✕ failed", style=STATUS_STYLES[group.status])
-    if group.status == "error":
-        return Text("! error", style=STATUS_STYLES[group.status])
+    cell = group.cells[0]
+    if cell.batch_progress is not None:
+        completed, total = cell.batch_progress
+        return _progress(f"{completed}/{total} batches", group.status)
+    if group.status in {"needs-review", "failed", "error"}:
+        return _aggregate_status_label(group.status)
     if group.status == "resume":
         return Text("resume", style=STATUS_STYLES[group.status])
     return Text("pending", style=STATUS_STYLES["needs-run"])
 
 
 def _aggregate_status_label(status: str) -> Text:
-    if status == "needs-review":
-        return Text("! needs-review", style=STATUS_STYLES[status])
-    if status == "failed":
-        return Text("✕ failed", style=STATUS_STYLES[status])
-    if status == "error":
-        return Text("! error", style=STATUS_STYLES[status])
-    return Text(status, style=STATUS_STYLES.get(status, ""))
+    marker = {"needs-review": "! ", "failed": "✕ ", "error": "! "}.get(status, "")
+    return Text(marker + status, style=STATUS_STYLES.get(status, ""))
+
+
+def _progress(label: str, status: str) -> Text:
+    result = Text(label, style=STATUS_STYLES["needs-run"])
+    if status in {"needs-review", "failed", "error"}:
+        result.append(" · ", style="dim")
+        result.append_text(_aggregate_status_label(status))
+    return result
 
 
 def node_label(group: StageStatusGroup) -> Text:
@@ -143,7 +119,7 @@ def build_plan_graph(status: PipelineStatus, *, console: Console) -> ConsoleGrap
     }
     edges: list[tuple[Hashable, Hashable, dict[str, Any]]] = []
     for group in groups:
-        for need in group.logical_needs:
+        for need in group.cells[0].logical_needs:
             if need in selected_bases:
                 edges.append((need, group.base_name, edge_attrs))
     return ConsoleGraph(

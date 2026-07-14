@@ -38,7 +38,6 @@ def _entry(
     module: str | None = None,
     pipeline_name: str | None = "Demo",
     branch: str = "main",
-    temporary: bool = False,
 ) -> PipelineEntry:
     return PipelineEntry(
         output_root=output_root,
@@ -46,7 +45,6 @@ def _entry(
         pipeline_name=pipeline_name,
         branch=branch,
         module=Demo.__module__ if module is None else module,
-        temporary=temporary,
     )
 
 
@@ -60,7 +58,7 @@ def test_load_state_wraps_shared_pipeline_status(tmp_path: Path) -> None:
     assert state.status == "hit"
     assert state.complete is True
     assert [stage.name for stage in state.stages] == ["sample", "summary"]
-    assert all(stage.execution_status == "hit" for stage in state.stages)
+    assert all(stage.status == "hit" for stage in state.stages)
 
 
 def test_load_state_passes_shared_command_session(
@@ -74,7 +72,6 @@ def test_load_state_passes_shared_command_session(
         seen.append(session)
         return PipelineStatus(
             pipeline="Demo",
-            module=Demo.__module__,
             branch="main",
             output_root=context.output_root,
             stages=(),
@@ -159,9 +156,8 @@ def test_structure_resolution_deduplicates_branches_but_rejects_classes(
         _entry(tmp_path / "main", module=Demo.__module__),
         _entry(tmp_path / "alt", module=Demo.__module__, branch="alt"),
     ]
-    pipeline, matched = resolve_structure_pipeline(entries, Demo.__module__)
+    pipeline = resolve_structure_pipeline(entries, Demo.__module__)
     assert pipeline is Demo
-    assert len(matched) == 2
 
     entries.append(
         _entry(

@@ -14,7 +14,7 @@ from varve.dashboard.models import PipelineEntry, PipelineState, StateError
 from varve.dashboard.render import render_overview
 from varve.engine.review import SourceReviewResult
 from varve.engine.runner import run
-from varve.engine.state import EffectiveStatus, ExecutionStatus
+from varve.engine.state import EffectiveStatus, SourceReviewState
 from varve.status import PipelineStatus, StageStatus
 
 
@@ -85,7 +85,6 @@ def _stage_status(
     name: str = "sample",
     reason: str | None = None,
 ) -> StageStatus:
-    execution: ExecutionStatus = "hit" if status == "needs-review" else status
     relationship = "changed" if status == "needs-review" else "current"
     return StageStatus(
         name=name,
@@ -96,10 +95,8 @@ def _stage_status(
         status=status,
         reason=reason or ("source-changed" if status == "needs-review" else status),
         summary_reason=reason or ("source-changed" if status == "needs-review" else status),
-        execution_status=execution,
         execution_reason="hit" if status == "needs-review" else (reason or status),
-        source_relationship=relationship,
-        source_decision="none",
+        source_review=SourceReviewState(relationship),
         duration=1.25,
         committed_at=None,
         decision_key=None,
@@ -120,13 +117,12 @@ def _state(
     if status == "error":
         return PipelineState(
             entry=entry,
-            error=StateError(phase="import", message=reason or "broken"),
+            error=StateError("import", reason or "broken"),
         )
     return PipelineState(
         entry=entry,
         pipeline_status=PipelineStatus(
             pipeline=entry.pipeline_name or "Demo",
-            module=entry.module or "missing",
             branch=entry.branch,
             output_root=entry.output_root,
             stages=(_stage_status(status, reason=reason),),
@@ -607,10 +603,7 @@ def test_overview_filters_before_exact_evaluation_and_status_after(
     monkeypatch.setattr(commands, "load_state", fake_load)
     assert (
         commands.overview_command(
-            tmp_path,
-            prefix="pkg.",
-            branch="main",
-            include_temp=False,
+            commands.DiscoveryScope(tmp_path, "pkg.", "main", False),
             rehash=False,
             statuses=("needs-review",),
         )
@@ -631,10 +624,7 @@ def test_overview_empty_discovery_is_failure_but_empty_status_is_success(
     monkeypatch.setattr(commands, "discover_scope", lambda *args, **kwargs: [])
     assert (
         commands.overview_command(
-            tmp_path,
-            prefix="pkg",
-            branch="main",
-            include_temp=False,
+            commands.DiscoveryScope(tmp_path, "pkg", "main", False),
             rehash=False,
             statuses=(),
         )
@@ -653,10 +643,7 @@ def test_overview_empty_discovery_is_failure_but_empty_status_is_success(
     monkeypatch.setattr(commands, "load_state", lambda entry, session: _state(entry, "hit"))
     assert (
         commands.overview_command(
-            tmp_path,
-            prefix=None,
-            branch=None,
-            include_temp=False,
+            commands.DiscoveryScope(tmp_path, None, None, False),
             rehash=False,
             statuses=("failed",),
         )
@@ -691,9 +678,7 @@ def test_overview_error_row_does_not_hide_later_pipeline(tmp_path: Path) -> None
         branch="main",
         module="pkg.broken",
     )
-    second = first.model_copy(
-        update={"output_root": tmp_path / "good", "pipeline_id": "good", "module": "pkg.good"}
-    )
+    second = first._replace(output_root=tmp_path / "good", pipeline_id="good", module="pkg.good")
     buffer = StringIO()
     render_overview(
         [_state(first, "error", reason="cannot import"), _state(second, "hit")],
@@ -785,10 +770,7 @@ def test_bulk_review_continues_after_entry_failure_and_uses_default_args(
 
     assert (
         commands.bulk_review_command(
-            tmp_path,
-            prefix=None,
-            branch=None,
-            include_temp=False,
+            commands.DiscoveryScope(tmp_path, None, None, False),
             decision="reuse",
         )
         == 1
@@ -844,10 +826,7 @@ def test_bulk_run_skips_hit_and_review_runs_eligible_then_rechecks(
 
     assert (
         commands.bulk_run_command(
-            tmp_path,
-            prefix=None,
-            branch=None,
-            include_temp=False,
+            commands.DiscoveryScope(tmp_path, None, None, False),
             rehash=False,
         )
         == 2
@@ -872,8 +851,8 @@ def test_bulk_run_mixed_failure_returns_one_and_preserves_all_groups(
         branch="main",
         module="pkg.review",
     )
-    failed = review.model_copy(
-        update={"output_root": tmp_path / "failed", "pipeline_id": "failed", "module": "pkg.failed"}
+    failed = review._replace(
+        output_root=tmp_path / "failed", pipeline_id="failed", module="pkg.failed"
     )
     monkeypatch.setattr(commands, "discover_scope", lambda *args, **kwargs: [review, failed])
     monkeypatch.setattr(
@@ -889,10 +868,7 @@ def test_bulk_run_mixed_failure_returns_one_and_preserves_all_groups(
 
     assert (
         commands.bulk_run_command(
-            tmp_path,
-            prefix=None,
-            branch=None,
-            include_temp=False,
+            commands.DiscoveryScope(tmp_path, None, None, False),
             rehash=False,
         )
         == 1

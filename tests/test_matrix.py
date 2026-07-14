@@ -112,6 +112,7 @@ def test_stage_selector_resolves_ordinary_base_partial_and_concrete_stages() -> 
     assert concrete.is_concrete
     assert concrete.canonical == "score@bench=a,model=large"
     assert concrete.coordinates == (("bench", "a"), ("model", "large"))
+    assert graph.names_for("score@model=large") == partial.concrete_stages
 
 
 def test_repeatable_stage_selectors_validate_then_form_a_topology_order_union() -> None:
@@ -444,8 +445,7 @@ def test_structured_status_groups_cells_without_skipping_exact_probes(tmp_path: 
     assert len(status.stages) == len(graph.stages) == 7
     assert [group.base_name for group in status.groups] == ["source", "score", "finish"]
     score = status.groups[1]
-    assert score.axes == ("bench", "model")
-    assert score.logical_needs == ("source",)
+    assert score.cells[0].logical_needs == ("source",)
     assert [(item.axis, item.value_id) for item in score.cells[0].cell] == [
         ("bench", "a"),
         ("model", "small"),
@@ -671,14 +671,14 @@ def test_matrix_scoped_runs_probe_exact_external_closure_in_graph_order(
 ) -> None:
     run(MatrixPipeline, Config(), cli_out=tmp_path)
     probed: list[str] = []
-    original = runner_module._probe_stage
+    original = runner_module.probe_pipeline
 
     def counted(*call_args, **call_kwargs):
         result = original(*call_args, **call_kwargs)
-        probed.append(result.stage)
+        probed.extend(probe.stage for probe in result)
         return result
 
-    monkeypatch.setattr(runner_module, "_probe_stage", counted)
+    monkeypatch.setattr(runner_module, "probe_pipeline", counted)
 
     run(
         MatrixPipeline,

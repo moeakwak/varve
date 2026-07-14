@@ -48,9 +48,7 @@ class ConfigAccess:
     def resolve(self) -> list[str] | None:
         """Return the sorted recorded fields, or ``None`` when all fields matter."""
 
-        if self._all:
-            return None
-        return sorted(self._fields)
+        return None if self._all else sorted(self._fields)
 
 
 class RecordingConfig:

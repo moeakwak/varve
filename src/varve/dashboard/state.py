@@ -5,11 +5,11 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-from varve.branch_config import ResolvedBranch, resolve_branch
+from varve.branch_config import resolve_branch
 from varve.command import ResolvedCommandContext, resolved_command_context
 from varve.dashboard.models import ErrorPhase, PipelineEntry, PipelineState, StateError
 from varve.engine.runner import _KeyingSession
-from varve.matrix import PipelineGraph, build_graph
+from varve.matrix import build_graph
 from varve.pipeline import Pipeline
 from varve.status import collect_pipeline_status
 
@@ -71,7 +71,7 @@ def resolve_module_entry(
 def resolve_structure_pipeline(
     entries: list[PipelineEntry],
     module: str,
-) -> tuple[type[Pipeline], tuple[PipelineEntry, ...]]:
+) -> type[Pipeline]:
     """Resolve one branch-independent MODULE, deduplicating identical classes."""
 
     candidates = [entry for entry in entries if entry.module == module]
@@ -83,8 +83,7 @@ def resolve_structure_pipeline(
     class_names = {entry.pipeline_name for entry in candidates if entry.pipeline_name is not None}
     if len(class_names) != 1 or any(entry.manifest_error for entry in candidates):
         raise ValueError(_ambiguity(module, "all branches", candidates))
-    representative = candidates[0]
-    return import_entry_pipeline(representative), tuple(candidates)
+    return import_entry_pipeline(candidates[0])
 
 
 def import_entry_pipeline(entry: PipelineEntry) -> type[Pipeline]:
@@ -108,21 +107,6 @@ def resolve_entry_context(
 ) -> ResolvedCommandContext:
     """Restore a discovered store's exact output identity as a shared context."""
 
-    resolved, graph = resolve_entry_target(entry, pipeline)
-    return resolved_command_context(
-        pipeline,
-        resolved,
-        args,
-        graph=graph,
-    )
-
-
-def resolve_entry_target(
-    entry: PipelineEntry,
-    pipeline: type[Pipeline],
-) -> tuple[ResolvedBranch, PipelineGraph]:
-    """Resolve only the branch, exact output identity, and graph."""
-
     resolved = resolve_branch(
         pipeline,
         branch=entry.branch,
@@ -133,17 +117,18 @@ def resolve_entry_target(
             else entry.output_root.parent
         ),
     )
-    output_root = pipeline.output_root(
-        resolved.config,
-        cli_out=resolved.output_base,
-        branch=resolved.branch,
-        is_temporary=resolved.is_temporary,
+    context = resolved_command_context(
+        pipeline,
+        resolved,
+        args,
+        graph=build_graph(pipeline, resolved.axes),
     )
-    if output_root.resolve() != entry.output_root.resolve():
+    if context.output_root.resolve() != entry.output_root.resolve():
         raise ValueError(
-            f"Resolved output root {output_root} does not match manifest anchor {entry.output_root}"
+            f"Resolved output root {context.output_root} does not match manifest anchor "
+            f"{entry.output_root}"
         )
-    return resolved, build_graph(pipeline, resolved.axes)
+    return context
 
 
 def _ambiguity(module: str, branch: str, candidates: list[PipelineEntry]) -> str:
@@ -156,4 +141,4 @@ def _ambiguity(module: str, branch: str, candidates: list[PipelineEntry]) -> str
 
 
 def _error(entry: PipelineEntry, phase: ErrorPhase, message: str) -> PipelineState:
-    return PipelineState(entry=entry, error=StateError(phase=phase, message=message))
+    return PipelineState(entry=entry, error=StateError(phase, message))

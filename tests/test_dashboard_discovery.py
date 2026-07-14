@@ -184,12 +184,11 @@ def test_discovery_sorts_by_exact_module_branch_class_and_output(tmp_path: Path)
 def test_filter_entries_shares_prefix_branch_and_temporary_scope(tmp_path: Path) -> None:
     entries = [
         PipelineEntry(
-            output_root=tmp_path / name,
+            output_root=tmp_path / ".tmp" / name if temporary else tmp_path / name,
             pipeline_id=name,
             pipeline_name="Demo",
             branch=branch,
             module=module,
-            temporary=temporary,
         )
         for name, module, branch, temporary in (
             ("main", "pkg.match", "main", False),

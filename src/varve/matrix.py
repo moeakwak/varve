@@ -135,23 +135,22 @@ class PipelineGraph:
             hint = f"; did you mean {suggestions[0]!r}?" if suggestions else ""
             raise ValueError(f"Unknown varve stage: {base_stage!r}{hint}")
 
-        declared_axes = tuple(template.matrix)
+        declared_axes = template.matrix
         if separator and not declared_axes:
             raise ValueError(f"Ordinary stage {base_stage!r} does not accept coordinates")
         if separator and not raw_coordinates:
             raise ValueError(f"Invalid stage selector {text!r}: coordinates are empty")
 
         supplied: dict[str, str] = {}
-        if separator:
-            for coordinate in raw_coordinates.split(","):
-                axis_name, equals, value_id = coordinate.partition("=")
-                if not equals or not axis_name or not value_id or "=" in value_id:
-                    raise ValueError(
-                        f"Invalid stage selector {text!r}: expected AXIS=VALUE coordinates"
-                    )
-                if axis_name in supplied:
-                    raise ValueError(f"Duplicate axis {axis_name!r} in stage selector {text!r}")
-                supplied[axis_name] = value_id
+        for coordinate in raw_coordinates.split(",") if separator else ():
+            axis_name, equals, value_id = coordinate.partition("=")
+            if not equals or not axis_name or not value_id or "=" in value_id:
+                raise ValueError(
+                    f"Invalid stage selector {text!r}: expected AXIS=VALUE coordinates"
+                )
+            if axis_name in supplied:
+                raise ValueError(f"Duplicate axis {axis_name!r} in stage selector {text!r}")
+            supplied[axis_name] = value_id
 
         axes_by_name = {axis.name: axis for axis in declared_axes}
         unknown_axes = [name for name in supplied if name not in axes_by_name]
@@ -176,9 +175,9 @@ class PipelineGraph:
         coordinates = tuple(
             (axis.name, supplied[axis.name]) for axis in declared_axes if axis.name in supplied
         )
-        canonical = base_stage
-        if coordinates:
-            canonical += "@" + ",".join(f"{name}={value}" for name, value in coordinates)
+        canonical = base_stage + (
+            "@" + ",".join(f"{name}={value}" for name, value in coordinates) if coordinates else ""
+        )
         matches = []
         for stage_name in self.base_cells[base_stage]:
             spec = self.stages[stage_name]
@@ -274,22 +273,17 @@ def cell_output_path(output_root: Path, spec: StageSpec) -> Path:
     return path
 
 
-def pipeline_axes(pipeline: type[Any]) -> dict[str, Axis]:
-    by_name: dict[str, Axis] = {}
-    for spec in pipeline.stages().values():
-        for axis in spec.matrix:
-            if by_name.get(axis.name, axis) is not axis:
-                raise ValueError(
-                    f"Duplicate matrix axis name {axis.name!r} refers to different Axis objects"
-                )
-            by_name[axis.name] = axis
-    return by_name
-
-
 def normalize_axes(
     pipeline: type[Any], raw_axes: Mapping[str, Sequence[str]] | None
 ) -> dict[str, tuple[str, ...]]:
-    declared = pipeline_axes(pipeline)
+    declared: dict[str, Axis] = {}
+    for spec in pipeline.stages().values():
+        for axis in spec.matrix:
+            if declared.get(axis.name, axis) is not axis:
+                raise ValueError(
+                    f"Duplicate matrix axis name {axis.name!r} refers to different Axis objects"
+                )
+            declared[axis.name] = axis
     raw_axes = raw_axes or {}
     unknown = sorted(set(raw_axes) - set(declared))
     if unknown:
@@ -314,7 +308,8 @@ def build_graph(
 ) -> PipelineGraph:
     active = normalize_axes(pipeline, axes)
     templates = pipeline.stages()
-    for template in templates.values():
+    expanded: dict[str, list[StageSpec]] = {}
+    for base_name, template in templates.items():
         parameters = list(inspect.signature(template.func).parameters.values())[2:]
         coordinate_names = {axis.name for axis in template.matrix}
         actual_names = {parameter.name for parameter in parameters}
@@ -325,32 +320,30 @@ def build_graph(
                 f"Stage {template.name!r} coordinate parameters must be keyword-only and exactly "
                 f"match its matrix axes {sorted(coordinate_names)!r}"
             )
-    expanded: dict[str, list[StageSpec]] = {}
-    for base_name, template in templates.items():
         values = [
             tuple(axis.value_for_id(value_id) for value_id in active[axis.name])
             for axis in template.matrix
         ]
-        cells = product(*values) if values else [()]
         expanded[base_name] = []
-        for coordinate_values in cells:
+        for coordinate_values in product(*values):
             cell = tuple(zip(template.matrix, coordinate_values, strict=True))
             coordinates = ",".join(f"{axis.name}={axis.id_of(value)}" for axis, value in cell)
             name = f"{template.name}@{coordinates}" if cell else template.name
             expanded[base_name].append(template.expanded(name=name, cell=cell))
 
+    coordinates = {stage.name: dict(stage.cell) for group in expanded.values() for stage in group}
     concrete: dict[str, StageSpec] = {}
     base_cells: dict[str, tuple[str, ...]] = {}
     for base_name, cells in expanded.items():
         resolved_cells: list[str] = []
         for cell in cells:
-            cell_values = dict(cell.cell)
+            cell_values = coordinates[cell.name]
             actual_needs: list[str] = []
             need_cells: dict[str, tuple[str, ...]] = {}
             for logical_need in cell.logical_needs:
                 matches = []
                 for upstream in expanded[logical_need]:
-                    upstream_values = dict(upstream.cell)
+                    upstream_values = coordinates[upstream.name]
                     shared = set(cell_values) & set(upstream_values)
                     if all(cell_values[axis] == upstream_values[axis] for axis in shared):
                         matches.append(upstream.name)

@@ -178,13 +178,10 @@ class Store:
         for path in sorted(batches_root.glob("*.json")):
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError) as error:
-                raise CorruptStore(f"Cannot read varve store file {path}: {error}") from error
-            if "artifacts" not in raw:
-                continue
-            try:
+                if "artifacts" not in raw:
+                    continue
                 batch = BatchRecord.model_validate(raw)
-            except ValidationError as error:
+            except (json.JSONDecodeError, OSError, ValidationError) as error:
                 raise CorruptStore(f"Cannot read varve store file {path}: {error}") from error
             batches[batch.index] = batch
         return batches

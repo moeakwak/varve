@@ -5,13 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, NamedTuple, TypeAlias
 
 JSON: TypeAlias = Mapping[str, "JSON"] | list["JSON"] | str | int | float | bool | None
 
 
-@dataclass(frozen=True)
-class DependencyContext:
+class DependencyContext(NamedTuple):
     """Stable context available while resolving durable dependencies.
 
     Runtime ``Args`` are deliberately absent: a value that selects durable

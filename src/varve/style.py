@@ -9,6 +9,7 @@ dashboard imports so it can sit at the leaf of the import graph.
 from __future__ import annotations
 
 import re
+from contextlib import nullcontext
 
 from rich.console import Console
 from rich.highlighter import RegexHighlighter
@@ -108,6 +109,10 @@ def make_console(*, stderr: bool = False) -> Console:
     """Build a Console sharing the varve theme with auto-highlight disabled."""
 
     return Console(stderr=stderr, theme=_THEME, highlight=False)
+
+
+def loading(console: Console, message: str):
+    return console.status(message, spinner="dots") if console.is_terminal else nullcontext(None)
 
 
 def status_text(status: str) -> Text:

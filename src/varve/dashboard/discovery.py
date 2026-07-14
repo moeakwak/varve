@@ -32,7 +32,8 @@ def discover_pipelines(root: Path, *, include_temporary: bool = False) -> list[P
         if split is None:
             continue
         directories.clear()
-        if _is_temporary_output_root(output_root) and not include_temporary:
+        temporary = output_root.parent.name == ".tmp" and output_root.parent.parent.name == "out"
+        if temporary and not include_temporary:
             continue
         pipeline_id, branch = split
         manifest, manifest_error = _read_manifest(manifest_path)
@@ -44,7 +45,6 @@ def discover_pipelines(root: Path, *, include_temporary: bool = False) -> list[P
                 branch=branch,
                 module=manifest.module if manifest is not None else None,
                 manifest_error=manifest_error,
-                temporary=_is_temporary_output_root(output_root),
             )
         )
     return sort_entries(entries)
@@ -77,10 +77,7 @@ def filter_entries(
         [
             entry
             for entry in entries
-            if (
-                include_temporary
-                or not (entry.temporary or entry.output_root.parent.name == ".tmp")
-            )
+            if (include_temporary or entry.output_root.parent.name != ".tmp")
             and (branch is None or entry.branch == branch)
             and (prefix is None or (entry.module or "").startswith(prefix))
         ]
@@ -100,10 +97,6 @@ def _branch_output_id(root: Path, output_root: Path) -> tuple[str, str] | None:
         relative = Path(pipeline_root.name)
     pipeline_id = ".".join(relative.parts) if relative.parts else pipeline_root.name
     return pipeline_id, output_root.name
-
-
-def _is_temporary_output_root(output_root: Path) -> bool:
-    return output_root.parent.name == ".tmp" and output_root.parent.parent.name == "out"
 
 
 def _read_manifest(manifest_path: Path) -> tuple[Manifest | None, str | None]:

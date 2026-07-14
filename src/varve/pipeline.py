@@ -59,7 +59,7 @@ class Pipeline:
             )
             raise ValueError(f"Unknown varve stage dependencies: {details}")
 
-        return dict(collected)
+        return collected
 
     @classmethod
     def topo_order(cls) -> list[str]:

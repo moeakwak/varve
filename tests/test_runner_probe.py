@@ -32,6 +32,16 @@ class ProbePipeline(Pipeline):
         (ctx.out / "sample.txt").write_text(ctx.config.profile, encoding="utf-8")
 
 
+def test_error_source_observations_are_isolated() -> None:
+    first = runner_module._empty_source_observation()
+    second = runner_module._empty_source_observation()
+
+    first.rerun.fingerprint = "poisoned"
+
+    assert first.review.fingerprint == "error"
+    assert second.rerun.fingerprint == "error"
+
+
 def downstream_helper(value: str) -> str:
     return value.upper()
 
@@ -294,14 +304,14 @@ def test_external_validation_probes_only_the_external_ancestor_closure(
     )
 
     probed: list[str] = []
-    original = runner_module._probe_stage
+    original = runner_module.probe_pipeline
 
     def counted(*call_args, **call_kwargs):
         result = original(*call_args, **call_kwargs)
-        probed.append(result.stage)
+        probed.extend(probe.stage for probe in result)
         return result
 
-    monkeypatch.setattr(runner_module, "_probe_stage", counted)
+    monkeypatch.setattr(runner_module, "probe_pipeline", counted)
 
     outcomes = run(
         ScopedExternalValidationPipeline,

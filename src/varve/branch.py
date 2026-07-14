@@ -7,9 +7,8 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import yaml
 
@@ -26,8 +25,7 @@ def validate_branch_name(name: str) -> str:
     return name
 
 
-@dataclass(frozen=True)
-class BranchDefinition:
+class BranchDefinition(NamedTuple):
     config: dict[str, Any]
     axes: dict[str, list[str]]
     is_temporary: bool

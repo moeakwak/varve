@@ -46,6 +46,11 @@ class StageSpec:
         return replace(self, needs=needs, need_cells=need_cells)
 
 
+def _attach_stage_spec(func: Callable[..., Any], spec: StageSpec) -> Callable[..., Any]:
+    setattr(func, "__varve_stage__", spec)
+    return func
+
+
 def _normalize_needs(
     needs: NeedItem | list[NeedItem] | tuple[NeedItem, ...] | None,
 ) -> tuple[str, ...]:
@@ -54,11 +59,6 @@ def _normalize_needs(
     if isinstance(needs, str) or callable(needs):
         needs = (needs,)
     return tuple(need if isinstance(need, str) else need.__name__ for need in needs)
-
-
-def _attach_stage_spec(func: Callable[..., Any], spec: StageSpec) -> Callable[..., Any]:
-    setattr(func, "__varve_stage__", spec)
-    return func
 
 
 def _stage_decorator(
