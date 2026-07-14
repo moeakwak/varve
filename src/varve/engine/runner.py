@@ -28,9 +28,11 @@ from varve.engine.run_display import (
     RunReporter,
     StageOutcome,
     build_run_display_plan,
+    format_run_order_marker,
 )
 from varve.engine.state import (
     Decision,
+    EffectiveStatus,
     SourceReviewState,
     decide,
     effective_reason,
@@ -967,7 +969,39 @@ async def _drive(
     }
     instance = runtime.pipeline()
     outcomes: list[StageOutcome] = []
-    reporter.log_plan()
+    order_markers = []
+    for group in display_plan.groups:
+        first_spec = graph.stages[group.stages[0]]
+        first_probe = preflight_by_stage[group.stages[0]]
+        status_by_stage: dict[str, EffectiveStatus] = {
+            stage_name: effective_status(
+                preflight_by_stage[stage_name].decision.status,
+                execution_source_reviews[stage_name],
+            )
+            for stage_name in group.stages
+        }
+        batch_completed = None
+        batch_total = None
+        if (
+            not first_spec.cell
+            and first_spec.kind == "batch"
+            and first_probe.decision.resume_skip
+            and first_probe.decision.resume_total is not None
+        ):
+            batch_completed = len(first_probe.decision.resume_skip)
+            batch_total = first_probe.decision.resume_total
+        order_markers.append(
+            format_run_order_marker(
+                base_name=group.base_name,
+                stages=group.stages,
+                is_matrix=bool(first_spec.cell),
+                forced=force,
+                status_by_stage=status_by_stage,
+                batch_completed=batch_completed,
+                batch_total=batch_total,
+            )
+        )
+    reporter.log_plan(markers=tuple(order_markers))
 
     for stage_name in graph.topo_order():
         if stage_name not in selected:

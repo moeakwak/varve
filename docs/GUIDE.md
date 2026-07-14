@@ -292,7 +292,7 @@ Execution, status, plan, and clean selectors use `STAGE` or `STAGE@AXIS=VALUE[,A
 
 `run --only score@bench=a` selects the matching active score Cells without automatically running their upstreams; external upstreams must already be current. `--upto`, `--downstream`, and `--only` are mutually exclusive and apply their respective closure after the shared resolver returns concrete seeds. `clean --downstream` applies descendant closure, while status applies no implicit upstream or downstream expansion. Repeated Review base targets form a topology-ordered stable union. `--slice axis=id` remains a separate temporary-run constraint across selected stages and their aligned upstream closure.
 
-Run display uses one policy for the plan, lifecycle log, and outcome table. In automatic mode, large matrix groups fold to a single summary line, while small groups and groups with known slow cells stay expanded. `run --expand` always shows concrete cells and `run --compact` always folds matrix groups; failures and slow cells keep their concrete identities, and `-v` keeps concrete lifecycle and key diagnostics. The exact fold thresholds live in [Matrix graph expansion](ARCHITECTURE.md#matrix-graph-expansion).
+`run` opens with a short base-Stage `Run order:` summary that always folds Matrix Cells and never prints concrete Cell names. Lifecycle logs and the outcome table still share one display policy: in automatic mode, large matrix groups fold to a single summary line, while small groups and groups with known slow cells stay expanded. `run --expand` and `run --compact` control only those later views; failures and slow cells keep their concrete identities, and `-v` keeps concrete lifecycle and key diagnostics. The exact fold thresholds live in [Matrix graph expansion](ARCHITECTURE.md#matrix-graph-expansion).
 
 Matrix batch progress defaults to canonical coordinate values in axis declaration order instead of the full concrete stage name. An explicit `ctx.resume(desc=...)` remains authoritative.
 
@@ -374,11 +374,11 @@ Without `--stage`, these commands process every logical Stage with a current Rev
 ### plan and ls
 
 ```text
-plan [--branch NAME] [--only STAGE_SELECTOR | --upto STAGE_SELECTOR | --downstream STAGE_SELECTOR] [--out PATH]
+plan [--branch NAME] [--only STAGE_SELECTOR | --upto STAGE_SELECTOR | --downstream STAGE_SELECTOR] [--rehash] [--out PATH]
 ls
 ```
 
-`plan` resolves the selected branch and prints concrete topological order without evaluating keys or executing stages. `ls` shows branch-independent stage templates with `STAGE`, `KIND`, `NEEDS`, and `MATRIX` and does not probe the store.
+`plan` is a read-only, status-aware topology view. It resolves the selected branch, Config, Pipeline Args, active axes, and StageSelector, then exact-probes the selected concrete stages with the same collector as `status`. The renderer draws a logical base-Stage DAG with netext: completed Stages show `✓`, Matrix Stages show `X/Y cells`, and ordinary batch Stages with a known validated partial show `X/Y batches`. Matrix Cells stay folded; probe-only external upstreams outside the selection do not appear in the graph. `plan` never initializes a store, executes a Stage body, or writes success, attempt, failure, partial, or ReviewRecord state. `ls` shows branch-independent stage templates with `STAGE`, `KIND`, `NEEDS`, and `MATRIX` and does not probe the store.
 
 ### clean
 
@@ -388,7 +388,7 @@ clean [--branch NAME] [--downstream STAGE_SELECTOR] [--out PATH] [--yes]
 
 Without `--downstream`, clean removes the complete selected output root after confirmation. With a selector, it deletes recorded artifacts and store state for the concrete seeds and their descendants. Clean does not infer ownership from filenames; it relies on manifest anchors and recorded paths.
 
-All commands accept the global `-v` or `--verbose` flag before the command. Generated Args flags are available on `run`, `status`, `reuse`, `invalidate`, and `clean`.
+All commands accept the global `-v` or `--verbose` flag before the command. Generated Args flags are available on `run`, `status`, `plan`, `reuse`, `invalidate`, and `clean`.
 
 ## Top-level CLI
 
@@ -406,7 +406,7 @@ varve clean MODULE
 
 `varve ls` exact-evaluates each selected entry through the shared status collector and one command observation session. `--prefix`, `--branch`, and `--include-temp` filter discovery before import and evaluation; repeatable `--status` filters effective rows afterward. A discovery scope with no entries returns 1, while a successful evaluation whose status filter matches no rows returns 0. The overview displays complete MODULE selectors with `BRANCH` and effective `STATUS`; wide terminals add duration and last run, while narrow terminals use stacked rows instead of truncating MODULE. Manifest, import, resolve, and evaluate errors occupy rows without stopping later entries.
 
-`varve ls MODULE` is branch-independent and shares the generated `ls` renderer. `status MODULE`, `run MODULE`, `reuse MODULE`, `invalidate MODULE`, `plan MODULE`, and `clean MODULE` restore the existing manifest output identity and call the same single-pipeline services as generated commands. They do not accept `--out`, `--override`, or `--slice`. Top-level status supports one execution selector; top-level `reuse` and `invalidate` support repeatable base Stage targets. Run, status, clean, reuse, and invalidate register the selected pipeline's Args after resolving MODULE; plan and structure listing do not instantiate Args.
+`varve ls MODULE` is branch-independent and shares the generated `ls` renderer. `status MODULE`, `run MODULE`, `reuse MODULE`, `invalidate MODULE`, `plan MODULE`, and `clean MODULE` restore the existing manifest output identity and call the same single-pipeline services as generated commands. They do not accept `--out`, `--override`, or `--slice`. Top-level status supports one execution selector; top-level `reuse` and `invalidate` support repeatable base Stage targets. Run, status, plan, clean, reuse, and invalidate register the selected pipeline's Args after resolving MODULE; structure listing does not instantiate Args.
 
 `run --all`, `reuse --all`, and `invalidate --all` accept `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run additionally accepts `--rehash`. Bulk commands use each pipeline's default Args and reject pipeline-specific flags; bulk Review does not accept Stage selection. Each store has its own lock and commit, failures do not stop later entries, and the command returns 1 if any entry failed. Bulk run exact-evaluates each entry, skips hits and complete pipelines blocked only by `needs-review`, runs `needs-run`, `resume`, or `failed` entries, refreshes observations after each attempt, and exact-evaluates final state. It returns 0 when all entries are complete, 2 when `needs-review` is the only incomplete reason, and 1 for failed, error, needs-run, resume, or mixed incomplete results.
 

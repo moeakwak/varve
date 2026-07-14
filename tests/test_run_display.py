@@ -17,6 +17,7 @@ from varve.engine.run_display import (
     RunReporter,
     StageOutcome,
     build_run_display_plan,
+    format_run_order_marker,
     outcome_rows,
 )
 from varve.engine.runner import run
@@ -38,7 +39,7 @@ from varve.models import (
     SuccessRecord,
 )
 from varve.store.store import Store
-from varve.style import make_console
+from varve.style import VarveStatusHighlighter, make_console
 
 
 class Config(BaseModel):
@@ -184,7 +185,11 @@ def test_compact_runner_aggregates_live_hits_runs_and_outcomes(tmp_path: Path, c
     first = run(LargeMatrix, Config(), cli_out=tmp_path)
     first_messages = [record.getMessage() for record in caplog.records]
 
-    assert "plan: work (8 cells)" in first_messages
+    assert any(message.startswith("Run order: work ") for message in first_messages)
+    assert not any("plan:" in message for message in first_messages)
+    assert not any(
+        "work@item=" in message for message in first_messages if message.startswith("Run order:")
+    )
     assert "[work] start · 8 cells" in first_messages
     assert any("8 needs-run · ran 8" in message for message in first_messages)
     assert not any("[work@item=" in message for message in first_messages)
@@ -258,6 +263,10 @@ def test_expand_runner_keeps_concrete_matrix_lifecycle(tmp_path: Path, caplog) -
     run(LargeMatrix, Config(), cli_out=tmp_path, display_mode="expand")
 
     messages = [record.getMessage() for record in caplog.records]
+    assert any(message.startswith("Run order: work ") for message in messages)
+    assert not any(
+        "work@item=" in message for message in messages if message.startswith("Run order:")
+    )
     assert any("[work@item=0] run" in message for message in messages)
     assert any("[work@item=7] done" in message for message in messages)
     assert not any("[work] start" in message for message in messages)
@@ -291,6 +300,64 @@ def test_compact_failure_always_logs_concrete_cell(tmp_path: Path, caplog) -> No
     assert any(
         "[work@item=3] error · planned failure" in record.getMessage() for record in caplog.records
     )
+
+
+def test_run_order_marker_always_folds_matrix_and_force() -> None:
+    assert (
+        format_run_order_marker(
+            base_name="work",
+            stages=("work@item=0", "work@item=1"),
+            is_matrix=True,
+            forced=False,
+            status_by_stage={"work@item=0": "hit", "work@item=1": "needs-run"},
+        )
+        == "work 1/2"
+    )
+    assert (
+        format_run_order_marker(
+            base_name="work",
+            stages=("work@item=0", "work@item=1"),
+            is_matrix=True,
+            forced=True,
+            status_by_stage={"work@item=0": "hit", "work@item=1": "hit"},
+        )
+        == "work run"
+    )
+    assert (
+        format_run_order_marker(
+            base_name="prepare",
+            stages=("prepare",),
+            is_matrix=False,
+            forced=False,
+            status_by_stage={"prepare": "hit"},
+        )
+        == "prepare ✓"
+    )
+    assert (
+        format_run_order_marker(
+            base_name="build",
+            stages=("build",),
+            is_matrix=False,
+            forced=False,
+            status_by_stage={"build": "failed"},
+            batch_completed=3,
+            batch_total=12,
+        )
+        == "build 3/12 · ✕ failed"
+    )
+
+
+def test_run_order_highlighter_uses_pending_and_arrow_styles() -> None:
+    text = VarveStatusHighlighter()(Text("Run order: prepare run → work 1/2 → finish ✓"))
+    spans = {(text.plain[span.start : span.end], span.style) for span in text.spans}
+
+    assert ("run", "varve.run_order_pending") in spans
+    assert ("→", "varve.run_order_arrow") in spans
+    console = make_console()
+    pending_color = console.get_style("varve.run_order_pending").color
+    assert pending_color is not None
+    assert pending_color.name == "yellow"
+    assert console.get_style("varve.run_order_arrow").dim is True
 
 
 def test_non_matrix_outcome_rows_remain_one_row_per_stage() -> None:

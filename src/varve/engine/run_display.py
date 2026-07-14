@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal
 
-from varve.engine.state import EXECUTION_STATUS_SEVERITY, ExecutionStatus
+from varve.engine.state import EXECUTION_STATUS_SEVERITY, EffectiveStatus, ExecutionStatus
 from varve.matrix import PipelineGraph
 from varve.store.store import Store
 
@@ -45,14 +45,15 @@ class RunDisplayPlan:
     by_stage: Mapping[str, RunDisplayGroup]
 
     def plan_entries(self) -> tuple[str, ...]:
+        """Legacy lifecycle/outcome helper; always folds Matrix groups."""
+
         return tuple(
-            entry
+            f"{group.base_name} ({len(group.stages)} cells)"
+            if len(group.stages) > 1 or group.compact
+            else group.stages[0]
+            if group.stages
+            else group.base_name
             for group in self.groups
-            for entry in (
-                (f"{group.base_name} ({len(group.stages)} cells)",)
-                if group.compact
-                else group.stages
-            )
         )
 
     def outcome(
@@ -126,6 +127,49 @@ def _status_distribution(outcomes: list[StageOutcome]) -> str:
     return ", ".join(f"{count} {status}" for status, count in _status_counts(outcomes))
 
 
+def format_run_order_marker(
+    *,
+    base_name: str,
+    stages: tuple[str, ...],
+    is_matrix: bool,
+    forced: bool,
+    status_by_stage: Mapping[str, EffectiveStatus],
+    batch_completed: int | None = None,
+    batch_total: int | None = None,
+) -> str:
+    """Build one base-stage token for the run-order summary line."""
+
+    if forced:
+        return f"{base_name} run"
+    if is_matrix:
+        hit = sum(status_by_stage.get(stage) == "hit" for stage in stages)
+        total = len(stages)
+        if hit == total and total > 0:
+            return f"{base_name} ✓"
+        return f"{base_name} {hit}/{total}"
+    status = status_by_stage.get(stages[0], "needs-run")
+    if status == "hit":
+        return f"{base_name} ✓"
+    if batch_completed is not None and batch_total is not None:
+        progress = f"{base_name} {batch_completed}/{batch_total}"
+        if status == "needs-review":
+            return f"{progress} · ! needs-review"
+        if status == "failed":
+            return f"{progress} · ✕ failed"
+        if status == "error":
+            return f"{progress} · ! error"
+        return progress
+    if status == "needs-review":
+        return f"{base_name} ! needs-review"
+    if status == "failed":
+        return f"{base_name} ✕ failed"
+    if status == "error":
+        return f"{base_name} ! error"
+    if status == "resume":
+        return f"{base_name} resume"
+    return f"{base_name} run"
+
+
 class RunReporter:
     """Emit bounded live logs while retaining concrete debug diagnostics."""
 
@@ -136,8 +180,13 @@ class RunReporter:
         self._completed: dict[str, list[StageOutcome]] = {}
         self.active_stage: str | None = None
 
-    def log_plan(self) -> None:
-        self.logger.info("plan: %s", " -> ".join(self.plan.plan_entries()))
+    def log_plan(
+        self,
+        *,
+        markers: tuple[str, ...] | None = None,
+    ) -> None:
+        entries = markers if markers is not None else self.plan.plan_entries()
+        self.logger.info("Run order: %s", " → ".join(entries))
 
     def start(self, stage: str) -> None:
         self.active_stage = stage

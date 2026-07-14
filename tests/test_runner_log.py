@@ -29,7 +29,8 @@ def test_runner_emits_stage_level_logs(tmp_path: Path, caplog) -> None:
     caplog.set_level(logging.INFO, logger="varve")
     run(LogPipeline, Config(), cli_out=tmp_path)
     messages = [record.getMessage() for record in caplog.records]
-    assert "plan: sample" in messages
+    assert any(message.startswith("Run order: sample ") for message in messages)
+    assert not any(message.startswith("plan:") for message in messages)
     assert any("[sample] run · no-cache" in message for message in messages)
     assert any("[sample] done" in message for message in messages)
     assert not any("sha256:" in message for message in messages)

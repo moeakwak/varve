@@ -12,6 +12,15 @@ wheels = [
 ]
 
 [[package]]
+name = "cachetools"
+version = "7.1.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f4/8b/0d3945a13955303b81272f759a0331e54c5c793da455e6f5706b89d2639c/cachetools-7.1.4.tar.gz", hash = "sha256:437f55a4e0c1b01a4f3077cc470e6991d47430970e36fbcb77e2be0df4fc1cd6", size = 40085, upload-time = "2026-05-21T22:40:43.376Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8c/7b/1fc1c09cc0756cf25861a3be10565915953876da48bb228fb9a672b20a42/cachetools-7.1.4-py3-none-any.whl", hash = "sha256:323dc4127934744db5b54eb4924482d7edafbf9554e820d1531c2e08c0e4ef54", size = 16761, upload-time = "2026-05-21T22:40:41.845Z" },
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -60,6 +69,26 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
+]
+
+[[package]]
+name = "netext"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cachetools" },
+    { name = "rich" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b1/7b/d34a88ba97472fa1ddbe8a1904777008690ed5fa43474855c59e79f0c948/netext-0.5.0.tar.gz", hash = "sha256:621bfd5153d3f3f17c8caee7bada7dbd6d05b209e4afb59498e1292a924d61bd", size = 301911, upload-time = "2026-06-02T08:07:52.256Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f7/7e/af1fe0ec385d73a32cbec971d2b3c17ed3a4344e7d4bc513cb906c3cafab/netext-0.5.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:aacf4d8e821560bd9cfb4d15541423d6489cb9c398d68d40dbdb25af3975f879", size = 601140, upload-time = "2026-06-02T08:07:42.435Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/bd/1ba5a9c200c09c9c38303c0d1a590cbef2e6e83e14940205a19975172dd6/netext-0.5.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:190c4c4375a537f4aeece8a0ef98c5a602248c0ad5d96359587270a7c7a59a4a", size = 584317, upload-time = "2026-06-02T08:07:44.069Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/5e/e657252d4845165fe3027c8efecca96dcd77bbe21aca2f7cb58c487ed2ad/netext-0.5.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:298dc2511c3901178000636f1c99e6299b97fae536936c208bcb4eef4514cda7", size = 627386, upload-time = "2026-06-02T08:07:45.475Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/87/5ba293a3588c2e5ad4afa77f724055ec16324ab2bcd3156d32a1888c7f95/netext-0.5.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3e44a04401bc0911d5cadcfec4d15ae494327b4ac9208c99c49ff9255c68ce64", size = 634614, upload-time = "2026-06-02T08:07:46.831Z" },
+    { url = "https://files.pythonhosted.org/packages/64/d2/8a648584e0cbee6e78187f370d956d7ac5e5bf6419a41bfc2617454cfb7b/netext-0.5.0-cp310-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:e12e75cc47238a566f83fed8b39a3d06afe3b2e52040d0109ef8c750a32f621a", size = 803263, upload-time = "2026-06-02T08:07:48.306Z" },
+    { url = "https://files.pythonhosted.org/packages/20/21/eded3ce214e11cd18b6bc618cebfd1b06f589f05fbbacf7d4df23b12eed5/netext-0.5.0-cp310-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:5922b1d909ab8162ec6f6c4ed564eff2f8906fa7c21541a0d12e69ecda55ded0", size = 844830, upload-time = "2026-06-02T08:07:49.642Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/0d/1dee9354716a3bfc73b9694410ad02007e6b80b419da0cb6f1ea1ba97af5/netext-0.5.0-cp310-abi3-win_amd64.whl", hash = "sha256:d3a7bb0e50b75c1e06de8398ef0f210d1f4ab181da325d7baed1f78c9680b769", size = 478893, upload-time = "2026-06-02T08:07:50.913Z" },
 ]
 
 [[package]]
@@ -482,6 +511,7 @@ name = "varve"
 version = "0.4.0"
 source = { editable = "." }
 dependencies = [
+    { name = "netext" },
     { name = "pydantic" },
     { name = "pydantic-settings", extra = ["yaml"] },
     { name = "rich" },
@@ -497,6 +527,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "netext", specifier = ">=0.5,<0.6" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydantic-settings", extras = ["yaml"], specifier = ">=2.0.0" },
     { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.0" },

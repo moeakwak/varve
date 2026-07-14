@@ -112,7 +112,7 @@ Every `Pipeline` gets seven commands:
 | --- | --- |
 | `run` | Evaluate cache decisions and execute the selected stages. |
 | `status` | Explain each Stage's input key, materialization, artifact, source relationship, and Review state. |
-| `plan` | Print the selected concrete topology without executing it. |
+| `plan` | Exact-probe the selected stages and draw their logical Stage topology. |
 | `ls` | Show branch-independent stage templates and matrix axes. |
 | `clean` | Safely remove a whole output root or a recorded downstream closure. |
 | `reuse` | Keep existing materializations reusable after Review-source changes. |

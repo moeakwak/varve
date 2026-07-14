@@ -107,11 +107,13 @@ class UnsupportedConfigPipeline(Pipeline):
         (ctx.out / "sample.txt").write_text("sample", encoding="utf-8")
 
 
-def test_cli_ls_and_plan(capsys) -> None:
+def test_cli_ls_and_plan(tmp_path: Path, capsys) -> None:
     assert CliPipeline.cli(["ls"]) == 0
     assert "sample" in capsys.readouterr().out
-    assert CliPipeline.cli(["plan"]) == 0
-    assert "sample" in capsys.readouterr().out
+    assert CliPipeline.cli(["plan", "--out", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert "Plan · main" in output
+    assert "sample" in output
 
 
 def test_cli_run_status_clean(tmp_path: Path, capsys) -> None:
@@ -160,16 +162,21 @@ def test_cli_reads_yaml_config(tmp_path: Path, capsys, monkeypatch: pytest.Monke
     assert "no-cache" in capsys.readouterr().out
 
 
-def test_cli_plan_target_filters_graph(capsys) -> None:
-    assert CliPipeline.cli(["plan", "--upto", "sample"]) == 0
-    assert capsys.readouterr().out.strip() == "sample"
+def test_cli_plan_target_filters_graph(tmp_path: Path, capsys) -> None:
+    assert CliPipeline.cli(["plan", "--out", str(tmp_path), "--upto", "sample"]) == 0
+    output = capsys.readouterr().out
+    assert "Plan · main" in output
+    assert "sample" in output
 
 
-def test_cli_ls_and_plan_do_not_require_supported_config(capsys) -> None:
+def test_cli_ls_does_not_require_supported_config(capsys) -> None:
     assert UnsupportedConfigPipeline.cli(["ls"]) == 0
     assert "sample" in capsys.readouterr().out
-    assert UnsupportedConfigPipeline.cli(["plan"]) == 0
-    assert capsys.readouterr().out.strip() == "sample"
+
+
+def test_cli_plan_requires_supported_args(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="argmap does not support args field"):
+        UnsupportedConfigPipeline.cli(["plan", "--out", str(tmp_path)])
 
 
 @pytest.mark.parametrize("known_command", ["run", "status", "clean"])

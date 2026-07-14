@@ -458,10 +458,13 @@ def test_dynamic_value_matching_existing_module_and_typo_target_execute_nothing(
     assert "Unknown module: typo.module" in error
 
 
-def test_top_level_plan_does_not_construct_required_pipeline_args(
+def test_top_level_plan_registers_pipeline_args_like_status(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import varve.cli.commands as cli_commands
+
     output_base = tmp_path / "required" / "out"
     run(
         RequiredArgsDemo,
@@ -471,8 +474,40 @@ def test_top_level_plan_does_not_construct_required_pipeline_args(
     )
     capsys.readouterr()
 
-    assert RequiredArgsDemo.cli(["plan", "--out", str(output_base), "--only", "sample"]) == 0
-    generated = capsys.readouterr().out.strip()
+    collected = []
+    rendered = []
+    original_collect = cli_commands.collect_pipeline_status
+    original_render = cli_commands.render_plan
+
+    def collect_spy(context, *, selector=None, rehash=False, session=None):
+        collected.append((context.args, selector, rehash))
+        return original_collect(context, selector=selector, rehash=rehash, session=session)
+
+    def render_spy(console, status, *, target_module=None):
+        rendered.append((status, target_module))
+        return original_render(console, status, target_module=target_module)
+
+    monkeypatch.setattr(cli_commands, "collect_pipeline_status", collect_spy)
+    monkeypatch.setattr(cli_commands, "render_plan", render_spy)
+
+    assert (
+        RequiredArgsDemo.cli(
+            [
+                "plan",
+                "--out",
+                str(output_base),
+                "--only",
+                "sample",
+                "--rehash",
+                "--workers",
+                "2",
+            ]
+        )
+        == 0
+    )
+    generated = capsys.readouterr().out
+    assert "Plan · main" in generated
+    assert "sample" in generated
     assert (
         main(
             [
@@ -482,12 +517,24 @@ def test_top_level_plan_does_not_construct_required_pipeline_args(
                 str(tmp_path),
                 "--only",
                 "sample",
+                "--rehash",
+                "--workers",
+                "2",
             ]
         )
         == 0
     )
-    top_level = capsys.readouterr().out.strip()
-    assert generated == top_level == "sample"
+    top_level = capsys.readouterr().out
+    assert "Plan · main" in top_level
+    assert "sample" in top_level
+    assert [args for args, _selector, _rehash in collected] == [
+        RequiredArgs(workers=2),
+        RequiredArgs(workers=2),
+    ]
+    assert [rehash for _args, _selector, rehash in collected] == [True, True]
+    assert len(rendered) == 2
+    assert rendered[0][1] is None
+    assert rendered[1][1] == RequiredArgsDemo.__module__
 
 
 def test_partial_matrix_summary_heading_matches_generated_and_top_level_status(

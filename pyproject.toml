@@ -21,6 +21,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "netext>=0.5,<0.6",
     "pydantic>=2.0.0",
     "pydantic-settings[yaml]>=2.0.0",
     "rich>=13.0.0",

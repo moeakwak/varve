@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from varve.cli.clean import clean
+from varve.cli.plan import render_plan
 from varve.cli.review import render_source_review
 from varve.cli.run import render_run_outcomes
 from varve.cli.status import render_status, status_view
@@ -15,20 +16,49 @@ from varve.command import ResolvedCommandContext
 from varve.engine.review import ReviewAction, SourceReviewResult
 from varve.engine.run_display import StageOutcome
 from varve.engine.runner import ReviewRequiredError, record_source_review, run
-from varve.matrix import PipelineGraph
+from varve.matrix import ResolvedStageSelector
 from varve.status import collect_pipeline_status
 from varve.style import make_console
 
 
-def render_plan(
-    graph: PipelineGraph,
+def _plan_selector(
+    context: ResolvedCommandContext,
+    namespace: Any,
+) -> ResolvedStageSelector | None:
+    upto = getattr(namespace, "upto", None)
+    downstream = getattr(namespace, "downstream", None)
+    only = getattr(namespace, "only", None)
+    if upto is None and downstream is None and only is None:
+        return None
+    selected = context.graph.selected(upto=upto, downstream=downstream, only=only)
+    seed_text = only or upto or downstream
+    assert seed_text is not None
+    seed = context.graph.resolve_selector(seed_text)
+    return ResolvedStageSelector(
+        text=seed.text,
+        canonical=seed.canonical,
+        base_stage=seed.base_stage,
+        coordinates=seed.coordinates,
+        concrete_stages=tuple(stage for stage in context.graph.topo_order() if stage in selected),
+    )
+
+
+def execute_plan(
+    context: ResolvedCommandContext,
     *,
-    upto: str | None,
-    downstream: str | None,
-    only: str | None,
+    selector: str | ResolvedStageSelector | None = None,
+    rehash: bool = False,
+    target_module: str | None = None,
 ) -> int:
-    selected = graph.selected(upto=upto, downstream=downstream, only=only)
-    print(" -> ".join(name for name in graph.topo_order() if name in selected))
+    console = make_console()
+    loading = (
+        console.status("Evaluating pipeline plan…", spinner="dots")
+        if console.is_terminal
+        else nullcontext()
+    )
+    with loading:
+        status = collect_pipeline_status(context, selector=selector, rehash=rehash)
+    render_plan(console, status, target_module=target_module)
     return 0
 
 
@@ -83,6 +113,13 @@ def dispatch_command(
 ) -> int:
     """Execute a parsed single-pipeline command from either CLI frontend."""
 
+    if namespace.command == "plan":
+        return execute_plan(
+            context,
+            selector=_plan_selector(context, namespace),
+            rehash=namespace.rehash,
+            target_module=target_module,
+        )
     if namespace.command == "status":
         console = make_console()
         loading = (

@@ -80,6 +80,8 @@ class StageStatus:
     source_changes: dict[str, SourceChange]
     unavailable_reason: str | None
     failure: str | None = None
+    batch_completed: int | None = None
+    batch_total: int | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,26 @@ class StageStatusGroup:
         if len(reasons) == 1:
             return reasons[0]
         return f"{reasons[0]} · +{len(reasons) - 1} more"
+
+    @property
+    def hit_cells(self) -> int:
+        return sum(cell.status == "hit" for cell in self.cells)
+
+    @property
+    def cell_count(self) -> int:
+        return len(self.cells)
+
+    @property
+    def batch_completed(self) -> int | None:
+        if self.is_matrix or len(self.cells) != 1:
+            return None
+        return self.cells[0].batch_completed
+
+    @property
+    def batch_total(self) -> int | None:
+        if self.is_matrix or len(self.cells) != 1:
+            return None
+        return self.cells[0].batch_total
 
 
 @dataclass(frozen=True)
@@ -258,6 +280,16 @@ def collect_pipeline_status(
         execution_reason = probe.decision.display_reason
         status = effective_status(probe.decision.status, probe.source_review)
         reason = effective_reason(execution_reason, probe.source_review)
+        batch_completed = None
+        batch_total = None
+        if (
+            not spec.cell
+            and spec.kind == "batch"
+            and probe.decision.resume_skip
+            and probe.decision.resume_total is not None
+        ):
+            batch_completed = len(probe.decision.resume_skip)
+            batch_total = probe.decision.resume_total
         stages.append(
             StageStatus(
                 name=probe.stage,
@@ -287,6 +319,8 @@ def collect_pipeline_status(
                     if probe.failure is None
                     else f"{probe.failure.exception_type}: {probe.failure.message}"
                 ),
+                batch_completed=batch_completed,
+                batch_total=batch_total,
             )
         )
     return PipelineStatus(

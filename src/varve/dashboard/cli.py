@@ -13,7 +13,6 @@ from varve.dashboard.commands import (
     bulk_review_command,
     bulk_run_command,
     overview_command,
-    plan_command,
     render_structure_command,
 )
 from varve.dashboard.discovery import discover_pipelines
@@ -22,7 +21,7 @@ from varve.dashboard.state import import_entry_pipeline, resolve_entry_context, 
 from varve.log import configure_cli_logging
 from varve.pipeline import Pipeline
 
-_DYNAMIC_COMMANDS = {"run", "status", "clean", "reuse", "invalidate"}
+_DYNAMIC_COMMANDS = {"run", "status", "plan", "clean", "reuse", "invalidate"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -125,14 +124,6 @@ def main(argv: list[str] | None = None) -> int:
                 branch=namespace.branch or "main",
             )
             pipeline = import_entry_pipeline(entry)
-        if namespace.command == "plan":
-            return plan_command(
-                entry,
-                pipeline,
-                upto=namespace.upto,
-                downstream=namespace.downstream,
-                only=namespace.only,
-            )
         pipeline_args = argmap.model_from_namespace(namespace, pipeline.Args)
         context = resolve_entry_context(entry, pipeline, pipeline_args)
         if namespace.command == "run":
@@ -193,10 +184,14 @@ def _parser(
         dynamic.usage = f"varve {name} {target}"
         _add_dynamic_options(dynamic, name, positional=True, help_text=argmap.STAGE_SELECTOR_HELP)
 
-    plan_parser = command("plan", "print selected stage order for one pipeline store")
-    plan_parser.add_argument("module", nargs="?", metavar="MODULE")
-    _add_single_target_options(plan_parser)
-    argmap.add_stage_selection(plan_parser, argmap.STAGE_SELECTOR_HELP)
+    plan_parser = command("plan", "show selected logical stage topology for one pipeline store")
+    plan_parser.usage = "varve plan MODULE [OPTIONS]"
+    _add_dynamic_options(
+        plan_parser,
+        "plan",
+        positional=True,
+        help_text=argmap.STAGE_SELECTOR_HELP,
+    )
 
     clean_parser = command("clean", "clean one pipeline store")
     clean_parser.usage = "varve clean MODULE [OPTIONS]"
@@ -247,6 +242,9 @@ def _add_dynamic_options(
     elif command == "status":
         parser.add_argument("--stage", metavar="STAGE_SELECTOR", help=help_text)
         parser.add_argument("--expand", action="store_true")
+        parser.add_argument("--rehash", action="store_true")
+    elif command == "plan":
+        argmap.add_stage_selection(parser, help_text)
         parser.add_argument("--rehash", action="store_true")
     elif command in {"reuse", "invalidate"}:
         parser.add_argument(

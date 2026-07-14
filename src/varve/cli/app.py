@@ -12,10 +12,7 @@ from pydantic import BaseModel
 from varve.branch_config import resolve_branch
 from varve.cli import argmap
 from varve.cli.clean import default_confirm
-from varve.cli.commands import (
-    dispatch_command,
-    render_plan,
-)
+from varve.cli.commands import dispatch_command
 from varve.cli.structure import render_structure
 from varve.command import resolved_command_context
 from varve.log import configure_cli_logging
@@ -164,15 +161,21 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         review_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
         review_parsers[command] = review_parser
 
-    plan_parser = subparsers.add_parser("plan", help="print selected stage order")
-    argmap.add_stage_selection(plan_parser, selector_help, verb="Print")
+    plan_parser = subparsers.add_parser(
+        "plan", help="show selected logical stage topology with exact status"
+    )
+    argmap.add_stage_selection(plan_parser, selector_help, verb="Show")
     plan_parser.add_argument("--branch", default="main", metavar="NAME")
-    plan_parser.add_argument("--out", type=Path, metavar="PATH")
+    plan_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
+    plan_parser.add_argument(
+        "--rehash", action="store_true", help="Ignore persisted stat shortcuts while keying."
+    )
 
     subparsers.add_parser("ls", help="list branch-independent pipeline structure")
     config_parsers = {
         "run": run_parser,
         "status": status_parser,
+        "plan": plan_parser,
         "clean": clean_parser,
         **review_parsers,
     }
@@ -195,16 +198,6 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     if namespace.command == "ls":
         render_structure(make_console(), pipeline)
         return 0
-    if namespace.command == "plan":
-        resolved = resolve_branch(
-            pipeline, branch=namespace.branch, override_json=None, cli_out=namespace.out
-        )
-        return render_plan(
-            build_graph(pipeline, resolved.axes),
-            upto=namespace.upto,
-            downstream=namespace.downstream,
-            only=namespace.only,
-        )
 
     resolved = resolve_branch(
         pipeline,

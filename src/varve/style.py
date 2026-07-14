@@ -71,7 +71,13 @@ _THEME = Theme(
     {f"varve.{_theme_key(status)}": style for status, style in STATUS_STYLES.items()}
     | {f"varve.dependency.{kind}": style for kind, style in DEPENDENCY_STYLES.items()}
     | {f"varve.review.{name}": style for name, style in REVIEW_STYLES.items()}
-    | {"varve.stage": "bold", "varve.bulk_run": "bold cyan"}
+    | {
+        "varve.stage": "bold",
+        "varve.bulk_run": "bold cyan",
+        "varve.run_order": "bold",
+        "varve.run_order_pending": STATUS_STYLES["needs-run"],
+        "varve.run_order_arrow": "dim",
+    }
 )
 
 
@@ -83,7 +89,12 @@ class VarveStatusHighlighter(RegexHighlighter):
         # Accent the whole `▸ run <module> --branch <branch>` header.
         rf"(?P<bulk_run>{re.escape(BULK_RUN_MARKER)} run .+)",
         r"(?P<stage>\[[^\]]+\])",
+        r"(?P<hit>✓)",
+        r"(?P<needs_run>\b\d+/\d+\b)",
+        r"(?P<run_order>Run order:)",
         *(rf"(?P<{_theme_key(status)}>\b{re.escape(status)}\b)" for status in STATUS_STYLES),
+        r"(?P<run_order_pending>\brun(?=\s*(?:→|$)))",
+        r"(?P<run_order_arrow>→)",
     ]
 
 

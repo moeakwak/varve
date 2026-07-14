@@ -9,7 +9,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from varve.cli.commands import execute_review, render_plan
+from varve.cli.commands import execute_review
 from varve.cli.commands import execute_run as _run_context
 from varve.cli.review import (
     BulkReviewEntry,
@@ -24,7 +24,6 @@ from varve.dashboard.state import (
     import_entry_pipeline,
     load_state,
     resolve_entry_context,
-    resolve_entry_target,
     resolve_structure_pipeline,
 )
 from varve.engine.review import ReviewAction
@@ -32,7 +31,6 @@ from varve.engine.runner import _KeyingSession
 from varve.engine.state import EffectiveStatus
 from varve.keying.fingerprint import FingerprintSession
 from varve.log import configure_cli_logging
-from varve.pipeline import Pipeline
 from varve.style import BULK_RUN_MARKER, make_console
 
 
@@ -61,18 +59,6 @@ def render_structure_command(
     pipeline, _ = resolve_structure_pipeline(entries, module)
     render_structure(console or make_console(), pipeline)
     return 0
-
-
-def plan_command(
-    entry: PipelineEntry,
-    pipeline: type[Pipeline],
-    *,
-    upto: str | None,
-    downstream: str | None,
-    only: str | None,
-) -> int:
-    _, graph = resolve_entry_target(entry, pipeline)
-    return render_plan(graph, upto=upto, downstream=downstream, only=only)
 
 
 def overview_command(
