@@ -17,7 +17,7 @@ from varve.cli.review import (
     render_bulk_source_review,
 )
 from varve.dashboard.discovery import discover_pipelines, filter_entries
-from varve.dashboard.models import PipelineEntry, PipelineState
+from varve.dashboard.models import PipelineEntry, PipelineState, module_selector
 from varve.dashboard.render import render_bulk_run, render_no_status_matches, render_overview
 from varve.dashboard.state import (
     import_entry_pipeline,
@@ -92,7 +92,7 @@ def bulk_review_command(
     results: list[BulkReviewEntry] = []
     failures: list[BulkReviewFailure] = []
     for entry in entries:
-        module = entry.module or entry.pipeline_id
+        module = module_selector(entry.module) if entry.module is not None else entry.pipeline_id
         try:
             pipeline = import_entry_pipeline(entry)
             context = resolve_entry_context(entry, pipeline, pipeline.Args())
@@ -134,7 +134,7 @@ def bulk_run_command(
         if not logging_configured:
             configure_cli_logging()
             logging_configured = True
-        module = entry.module or entry.pipeline_id
+        module = module_selector(entry.module) if entry.module is not None else entry.pipeline_id
         logger.info("%s run %s --branch %s", BULK_RUN_MARKER, module, entry.branch)
         try:
             pipeline = import_entry_pipeline(entry)

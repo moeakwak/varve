@@ -17,7 +17,7 @@ from varve.dashboard.commands import (
     overview_command,
 )
 from varve.dashboard.discovery import discover_pipelines
-from varve.dashboard.models import PipelineEntry
+from varve.dashboard.models import PipelineEntry, module_selector
 from varve.dashboard.state import (
     import_entry_pipeline,
     resolve_entry_context,
@@ -126,7 +126,9 @@ def main(argv: list[str] | None = None) -> int:
             review_targets=(
                 tuple(namespace.stage) if namespace.command in {"reuse", "invalidate"} else ()
             ),
-            target_module=entry.module,
+            target_module=(
+                module_selector(entry.module) if entry.module is not None else entry.pipeline_id
+            ),
         )
     except Exception as error:  # noqa: BLE001 - CLI reports backend diagnostics as exit 1.
         print(str(error), file=sys.stderr)

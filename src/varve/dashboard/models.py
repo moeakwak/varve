@@ -26,6 +26,11 @@ class PipelineEntry(NamedTuple):
     manifest_error: str | None = None
 
 
+def module_selector(module: str) -> str:
+    """Return the user-facing selector for a persisted import module."""
+    return module.removesuffix(".__main__")
+
+
 class PipelineState(NamedTuple):
     """Discovery metadata around the canonical shared pipeline status."""
 

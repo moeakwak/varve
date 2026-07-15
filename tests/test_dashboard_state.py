@@ -135,6 +135,28 @@ def test_resolve_module_entry_defaults_to_exact_main_and_lists_modules(tmp_path:
         resolve_module_entry(entries, "pkg.missing")
 
 
+def test_resolve_module_entry_accepts_package_selector_for_main_module(tmp_path: Path) -> None:
+    entries = [
+        _entry(tmp_path / "main", module="pkg.demo.__main__"),
+        _entry(tmp_path / "other", module="pkg.other.__main__"),
+    ]
+
+    assert resolve_module_entry(entries, "pkg.demo").output_root == tmp_path / "main"
+    assert resolve_module_entry(entries, "pkg.demo.__main__").output_root == tmp_path / "main"
+    with pytest.raises(ValueError, match=r"Available modules: pkg.demo, pkg.other"):
+        resolve_module_entry(entries, "pkg.missing")
+
+
+def test_resolve_module_entry_prefers_an_exact_module_over_main_alias(tmp_path: Path) -> None:
+    entries = [
+        _entry(tmp_path / "exact", module="pkg.demo"),
+        _entry(tmp_path / "main", module="pkg.demo.__main__"),
+    ]
+
+    assert resolve_module_entry(entries, "pkg.demo").output_root == tmp_path / "exact"
+    assert resolve_module_entry(entries, "pkg.demo.__main__").output_root == tmp_path / "main"
+
+
 def test_resolve_module_entry_reports_every_ambiguous_candidate(tmp_path: Path) -> None:
     entries = [
         _entry(tmp_path / "first", module="pkg.demo"),
@@ -169,3 +191,13 @@ def test_structure_resolution_deduplicates_branches_but_rejects_classes(
     )
     with pytest.raises(ValueError, match="Ambiguous module"):
         resolve_structure_pipeline(entries, Demo.__module__)
+
+
+def test_structure_resolution_accepts_package_selector_for_main_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _entry(tmp_path / "main", module=f"{Demo.__module__}.__main__")
+    monkeypatch.setattr("varve.dashboard.state.import_entry_pipeline", lambda candidate: Demo)
+
+    assert resolve_structure_pipeline([entry], Demo.__module__) is Demo

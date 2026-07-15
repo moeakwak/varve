@@ -184,6 +184,27 @@ def test_bare_varve_is_exact_overview_and_uses_manifest_module(
     assert "STAGES" not in output
 
 
+def test_overview_hides_main_module_suffix(tmp_path: Path) -> None:
+    module = "pkg.demo.__main__"
+    entry = PipelineEntry(
+        output_root=tmp_path,
+        pipeline_id="demo",
+        pipeline_name="Demo",
+        branch="main",
+        module=module,
+    )
+    buffer = StringIO()
+
+    render_overview(
+        [_state(entry, "hit")],
+        console=Console(file=buffer, width=120, force_terminal=False),
+    )
+
+    output = buffer.getvalue()
+    assert "pkg.demo" in output
+    assert "__main__" not in output
+
+
 def test_ls_module_and_status_share_generated_renderers(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

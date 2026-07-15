@@ -7,7 +7,13 @@ from typing import Any
 
 from varve.branch_config import resolve_branch
 from varve.command import ResolvedCommandContext, resolved_command_context
-from varve.dashboard.models import ErrorPhase, PipelineEntry, PipelineState, StateError
+from varve.dashboard.models import (
+    ErrorPhase,
+    PipelineEntry,
+    PipelineState,
+    StateError,
+    module_selector,
+)
 from varve.engine.runner import _KeyingSession
 from varve.matrix import build_graph
 from varve.pipeline import Pipeline
@@ -45,12 +51,12 @@ def resolve_module_entry(
     *,
     branch: str = "main",
 ) -> PipelineEntry:
-    """Resolve one exact manifest MODULE and branch without importing candidates."""
+    """Resolve one user-facing MODULE selector and branch without importing candidates."""
 
-    module_entries = [entry for entry in entries if entry.module == module]
+    module_entries = _matching_module_entries(entries, module)
     candidates = [entry for entry in module_entries if entry.branch == branch]
     if not candidates:
-        available = sorted({entry.module for entry in entries if entry.module is not None})
+        available = _available_modules(entries)
         if module_entries:
             branches = sorted({entry.branch for entry in module_entries})
             raise ValueError(
@@ -72,11 +78,11 @@ def resolve_structure_pipeline(
     entries: list[PipelineEntry],
     module: str,
 ) -> type[Pipeline]:
-    """Resolve one branch-independent MODULE, deduplicating identical classes."""
+    """Resolve one branch-independent MODULE selector, deduplicating identical classes."""
 
-    candidates = [entry for entry in entries if entry.module == module]
+    candidates = _matching_module_entries(entries, module)
     if not candidates:
-        available = sorted({entry.module for entry in entries if entry.module is not None})
+        available = _available_modules(entries)
         raise ValueError(
             f"Unknown module: {module}. Available modules: {', '.join(available) or '(none)'}"
         )
@@ -84,6 +90,24 @@ def resolve_structure_pipeline(
     if len(class_names) != 1 or any(entry.manifest_error for entry in candidates):
         raise ValueError(_ambiguity(module, "all branches", candidates))
     return import_entry_pipeline(candidates[0])
+
+
+def _matching_module_entries(
+    entries: list[PipelineEntry],
+    module: str,
+) -> list[PipelineEntry]:
+    exact = [entry for entry in entries if entry.module == module]
+    if exact:
+        return exact
+    return [
+        entry
+        for entry in entries
+        if entry.module is not None and module_selector(entry.module) == module
+    ]
+
+
+def _available_modules(entries: list[PipelineEntry]) -> list[str]:
+    return sorted({module_selector(entry.module) for entry in entries if entry.module is not None})
 
 
 def import_entry_pipeline(entry: PipelineEntry) -> type[Pipeline]:

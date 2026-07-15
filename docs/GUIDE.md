@@ -392,7 +392,7 @@ All commands accept the global `-v` or `--verbose` flag before the command. Gene
 
 ## Top-level CLI
 
-The installed `varve` command discovers existing branch stores from manifests. MODULE is the exact persisted Python module shown by the first column of `varve ls`. Single commands with dynamic Args require MODULE immediately after the command: `COMMAND MODULE [OPTIONS]`.
+The installed `varve` command discovers existing branch stores from manifests. MODULE is the user-facing selector shown by the first column of `varve ls`. It normally matches the persisted Python module; for a package entry persisted as `package.__main__`, Varve displays and accepts `package` while continuing to accept the exact persisted name. Single commands with dynamic Args require MODULE immediately after the command: `COMMAND MODULE [OPTIONS]`.
 
 ```bash
 varve ls [MODULE]
