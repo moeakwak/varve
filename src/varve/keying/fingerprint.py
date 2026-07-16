@@ -28,7 +28,53 @@ class FingerprintSession:
     """Reuse filesystem observations within one probe or run command."""
 
     _snapshots: dict[str, _FileSnapshot] = field(default_factory=dict)
+    _input_entries: dict[str, tuple[tuple[Path, str], ...]] = field(default_factory=dict)
+    _input_directories: dict[str, FileFingerprint] = field(default_factory=dict)
     force_rehash: bool = False
+
+    def input_entries(self, path: Path) -> tuple[tuple[Path, str], ...]:
+        """Expand one declared input root once per filesystem snapshot."""
+
+        expanded = path.expanduser()
+        input_path = str(expanded.absolute())
+        entries = self._input_entries.get(input_path)
+        if entries is not None:
+            return entries
+
+        assert_no_symlink_path(expanded, description="input dependencies")
+        normalized = expanded.resolve()
+        normalized_path = str(normalized)
+        entries = self._input_entries.get(normalized_path)
+        if entries is None:
+            entries = tuple(
+                _tree_entries(
+                    normalized,
+                    label="Input dependency",
+                    symlink_description="input dependencies",
+                )
+            )
+            self._input_entries[normalized_path] = entries
+        self._input_entries[input_path] = entries
+        return entries
+
+    def input_directory(self, path: Path) -> FileFingerprint:
+        """Observe one input directory once per filesystem snapshot."""
+
+        key = str(path)
+        fingerprint = self._input_directories.get(key)
+        if fingerprint is not None:
+            return fingerprint
+        stat = path.stat()
+        fingerprint = FileFingerprint(
+            path=key,
+            kind="dir",
+            inode=stat.st_ino,
+            size=0,
+            mtime_ns=stat.st_mtime_ns,
+            content_hash=_DIRECTORY_CONTENT_HASH,
+        )
+        self._input_directories[key] = fingerprint
+        return fingerprint
 
     def fingerprint(
         self,
@@ -211,23 +257,11 @@ def files_fingerprints(
         members = {}
         resolved_paths = resolve_paths(ctx)
         for path in [resolved_paths] if isinstance(resolved_paths, Path) else resolved_paths:
-            assert_no_symlink_path(path, description="input dependencies")
-            expanded = path.expanduser().resolve()
-            for member, kind in _tree_entries(
-                expanded, label="Input dependency", symlink_description="input dependencies"
-            ):
+            for member, kind in session.input_entries(path):
                 if kind == "file":
                     fingerprint = session.fingerprint(member, cached_by_path=cached_by_path)
                 else:
-                    stat = member.stat()
-                    fingerprint = FileFingerprint(
-                        path=str(member),
-                        kind="dir",
-                        inode=stat.st_ino,
-                        size=0,
-                        mtime_ns=stat.st_mtime_ns,
-                        content_hash=_DIRECTORY_CONTENT_HASH,
-                    )
+                    fingerprint = session.input_directory(member)
                 members[fingerprint.path] = fingerprint
         results[name] = [members[path] for path in sorted(members)]
     return results

@@ -78,7 +78,7 @@ A concrete stage has an execution status of `hit`, `needs-run`, `resume`, `faile
 
 Exact state evaluation shares filesystem fingerprints, normalized Python-file observations, and parsed success records within one command. The snapshot stays in memory and never survives into another command.
 
-Each regular file hash can reuse persisted metadata when path, inode, size, mtime_ns, algorithm, and cache schema match. Directory trees are still walked completely. Files written by the current stage are rehashed at commit.
+Each regular file hash can reuse persisted metadata when path, inode, size, mtime_ns, algorithm, and cache schema match. Dependency resolvers still run for every concrete stage, but each unique returned input root is normalized, symlink-validated, and expanded at most once per filesystem snapshot; a directory tree is walked completely on its first observation. Files written by the current stage are rehashed at commit.
 
 Generated status, top-level single status, and top-level `ls` use the same exact collector and command-scoped `_KeyingSession`. Runs use an independent snapshot for external-upstream validation, refresh filesystem observations after each successful stage, and update the cached success record after commit. Bulk review passes one session through every review probe and refreshes it after each entry. Bulk run clears source, filesystem, and record observations after every attempted entry, including failures, before exact final evaluation can observe source files changed during execution.
 

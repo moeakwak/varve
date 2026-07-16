@@ -80,6 +80,62 @@ def test_files_fingerprints_are_order_independent(tmp_path: Path) -> None:
     ]
 
 
+def test_fingerprint_session_reuses_input_expansion_but_calls_resolver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "inputs"
+    root.mkdir()
+    (root / "value.txt").write_text("value", encoding="utf-8")
+    resolver_calls = 0
+    expansion_calls = 0
+    original_tree_entries = fingerprint_module._tree_entries
+
+    def resolve(_ctx):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return root
+
+    def counted_tree_entries(*args, **kwargs):
+        nonlocal expansion_calls
+        expansion_calls += 1
+        yield from original_tree_entries(*args, **kwargs)
+
+    monkeypatch.setattr(fingerprint_module, "_tree_entries", counted_tree_entries)
+    session = FingerprintSession()
+
+    first = files_fingerprints(object(), {"input": resolve}, session=session)
+    second = files_fingerprints(object(), {"input": resolve}, session=session)
+
+    assert first == second
+    assert resolver_calls == 2
+    assert expansion_calls == 1
+
+
+def test_new_fingerprint_session_observes_input_tree_changes(tmp_path: Path) -> None:
+    root = tmp_path / "inputs"
+    root.mkdir()
+    (root / "first.txt").write_text("first", encoding="utf-8")
+
+    def resolver(_ctx):
+        return root
+
+    session = FingerprintSession()
+
+    first = files_fingerprints(object(), {"input": resolver}, session=session)
+    (root / "second.txt").write_text("second", encoding="utf-8")
+    shared_snapshot = files_fingerprints(object(), {"input": resolver}, session=session)
+    refreshed = files_fingerprints(
+        object(),
+        {"input": resolver},
+        session=FingerprintSession(),
+    )
+
+    assert len(first["input"]) == 2
+    assert shared_snapshot == first
+    assert len(refreshed["input"]) == 3
+
+
 def test_fingerprint_session_shares_path_snapshot_and_keeps_files_distinct(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -496,6 +496,31 @@ def test_probe_reads_each_success_record_once(
     assert reads == {stage: 1 for stage in MatrixProbePipeline.graph().topo_order()}
 
 
+def test_probe_reuses_each_current_artifact_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run(DownstreamPipeline, Config(), cli_out=tmp_path)
+    observed: list[str] = []
+    original = runner_module._current_artifacts
+
+    def counted(runtime, record):
+        observed.append(record.stage)
+        return original(runtime, record)
+
+    monkeypatch.setattr(runner_module, "_current_artifacts", counted)
+
+    probes = probe_pipeline(
+        DownstreamPipeline,
+        Config(),
+        args=DownstreamPipeline.Args(),
+        out=tmp_path / "main",
+    )
+
+    assert len(probes) == 2
+    assert observed == ["upstream", "downstream"]
+
+
 def test_forced_source_change_reuses_single_preflight_observations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

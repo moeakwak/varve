@@ -81,6 +81,7 @@ class StageProbe:
     unavailable_reason: str | None = None
     _partial: dict[int, BatchRecord] | None = field(default=None, repr=False)
     _artifacts_match: bool = field(default=True, repr=False)
+    _artifact_fingerprint: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -650,6 +651,7 @@ def _stage_decision(
     )
     decision_key = input_key(components)
     artifacts_match = True
+    artifact_root = None
     if previous is not None and _success_outputs_exist(runtime, previous):
         artifact_root = _current_artifacts(runtime, previous)
         artifacts_match = artifact_root == previous.artifact_fingerprint
@@ -714,6 +716,7 @@ def _stage_decision(
         failure=failure,
         _partial=partial,
         _artifacts_match=artifacts_match,
+        _artifact_fingerprint=artifact_root,
     )
 
 
@@ -820,7 +823,9 @@ def probe_pipeline(
             )
         probes.append(probe)
         if probe.previous is not None and _success_outputs_exist(runtime, probe.previous):
-            known_upstream_fingerprints[stage_name] = _current_artifacts(runtime, probe.previous)
+            known_upstream_fingerprints[stage_name] = (
+                probe._artifact_fingerprint or _current_artifacts(runtime, probe.previous)
+            )
     return tuple(probes)
 
 
