@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from varve.dashboard.models import PipelineState, module_selector
+from varve.dashboard.models import PipelineState
 from varve.style import format_elapsed, make_console, status_text
 
 
@@ -119,11 +119,10 @@ def render_bulk_run(
 
 
 def _module(state: PipelineState) -> str:
-    return (
-        module_selector(state.entry.module)
-        if state.entry.module is not None
-        else f"<manifest error: {state.entry.pipeline_id}>"
-    )
+    entry = state.entry
+    if entry.module is None and entry.name is None:
+        return f"<manifest error: {entry.pipeline_id}>"
+    return entry.selector
 
 
 def _format_datetime(value: datetime | None) -> str:

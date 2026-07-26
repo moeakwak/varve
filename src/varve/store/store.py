@@ -71,6 +71,7 @@ class Store:
         pipeline: str,
         *,
         module: str | None = None,
+        name: str | None = None,
         temporary_config: dict[str, Any] | None = None,
         temporary_axes: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
@@ -90,6 +91,7 @@ class Store:
                 Manifest(
                     pipeline=pipeline,
                     module=module,
+                    name=name,
                     temporary_config=temporary_config,
                     temporary_axes=normalized_axes,
                 ),
@@ -116,17 +118,20 @@ class Store:
                     update={
                         "schema_version": SCHEMA_VERSION,
                         "module": module if module is not None else manifest.module,
+                        "name": name if name is not None else manifest.name,
                     }
                 ),
             )
             for directory in ("reviews", "failures", "attempts", "partial"):
                 shutil.rmtree(self.root / directory, ignore_errors=True)
             return
-        if module is not None and manifest.module != module:
-            _atomic_write_json(
-                manifest_path,
-                manifest.model_copy(update={"module": module}),
-            )
+        identity = {
+            field: value
+            for field, value in (("module", module), ("name", name))
+            if value is not None and getattr(manifest, field) != value
+        }
+        if identity:
+            _atomic_write_json(manifest_path, manifest.model_copy(update=identity))
 
     def _stage_path(self, directory: str, stage: str) -> Path:
         return self.root / directory / f"{stage}.json"

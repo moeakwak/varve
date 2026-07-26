@@ -263,7 +263,7 @@ def test_evaluate_state_does_not_initialize_store(tmp_path: Path) -> None:
     assert not (_out(tmp_path) / ".varve").exists()
 
 
-def test_run_writes_importable_main_module_to_manifest(
+def test_run_writes_importable_main_module_and_selector_to_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -291,6 +291,7 @@ def test_run_writes_importable_main_module_to_manifest(
     assert manifest is not None
     assert manifest.pipeline == "MainPipeline"
     assert manifest.module == "pkg.demo.__main__"
+    assert manifest.name == "pkg.demo"
 
 
 def test_run_persists_stage_elapsed(

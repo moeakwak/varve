@@ -44,6 +44,7 @@ def discover_pipelines(root: Path, *, include_temporary: bool = False) -> list[P
                 pipeline_name=manifest.pipeline if manifest is not None else None,
                 branch=branch,
                 module=manifest.module if manifest is not None else None,
+                name=manifest.name if manifest is not None else None,
                 manifest_error=manifest_error,
             )
         )
@@ -56,7 +57,7 @@ def sort_entries(entries: list[PipelineEntry]) -> list[PipelineEntry]:
     return sorted(
         entries,
         key=lambda entry: (
-            entry.module or "",
+            entry.selector,
             entry.branch,
             entry.pipeline_name or "",
             str(entry.output_root),
@@ -79,7 +80,7 @@ def filter_entries(
             for entry in entries
             if (include_temporary or entry.output_root.parent.name != ".tmp")
             and (branch is None or entry.branch == branch)
-            and (prefix is None or (entry.module or "").startswith(prefix))
+            and (prefix is None or entry.selector.startswith(prefix))
         ]
     )
 

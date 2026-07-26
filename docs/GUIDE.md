@@ -392,7 +392,17 @@ All commands accept the global `-v` or `--verbose` flag before the command. Gene
 
 ## Top-level CLI
 
-The installed `varve` command discovers existing branch stores from manifests. MODULE is the user-facing selector shown by the first column of `varve ls`. It normally matches the persisted Python module; for a package entry persisted as `package.__main__`, Varve displays and accepts `package` while continuing to accept the exact persisted name. Single commands with dynamic Args require MODULE immediately after the command: `COMMAND MODULE [OPTIONS]`.
+The installed `varve` command discovers existing branch stores from manifests. MODULE is the user-facing selector shown by the first column of `varve ls`.
+
+A selector defaults to the package that owns the store's output directory: `out/` sits next to the module that defines the pipeline, so a pipeline defined in `studies/label_renderability/run.py` or in `studies/label_renderability/__main__.py` both select `studies.label_renderability`. That is also the name `python -m` accepts whenever the package has a `__main__.py`, so the CLI and module execution agree. Declare `varve_name` when the derived package is wrong or when two pipelines would share one selector:
+
+```python
+class LabelRenderability(Pipeline):
+    varve_name = "studies.label_renderability"
+    Config = Config
+```
+
+`varve_name` must be a dotted path of Python identifiers. It is recorded in the store manifest during a run, so `varve ls` reports it without importing anything. Besides the full selector, Varve accepts any unambiguous dotted suffix of it (`label_renderability`) and the exact persisted module (`studies.label_renderability.run`); an ambiguous target fails with every candidate listed. Single commands with dynamic Args require MODULE immediately after the command: `COMMAND MODULE [OPTIONS]`.
 
 ```bash
 varve ls [MODULE]

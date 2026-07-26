@@ -1218,6 +1218,7 @@ def run(
         store.ensure_initialized(
             pipeline.__name__,
             module=pipeline.import_module_name(),
+            name=pipeline.selector(),
             temporary_config=temporary_config,
             temporary_axes=temporary_axes,
         )

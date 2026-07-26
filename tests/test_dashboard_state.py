@@ -36,6 +36,7 @@ def _entry(
     output_root: Path,
     *,
     module: str | None = None,
+    name: str | None = None,
     pipeline_name: str | None = "Demo",
     branch: str = "main",
 ) -> PipelineEntry:
@@ -45,6 +46,7 @@ def _entry(
         pipeline_name=pipeline_name,
         branch=branch,
         module=Demo.__module__ if module is None else module,
+        name=name,
     )
 
 
@@ -125,9 +127,9 @@ def test_load_state_reports_evaluate_phase(
 
 def test_resolve_module_entry_defaults_to_exact_main_and_lists_modules(tmp_path: Path) -> None:
     entries = [
-        _entry(tmp_path / "main", module="pkg.demo"),
-        _entry(tmp_path / "alt", module="pkg.demo", branch="alt"),
-        _entry(tmp_path / "other", module="pkg.other"),
+        _entry(tmp_path / "main", module="pkg.demo.run"),
+        _entry(tmp_path / "alt", module="pkg.demo.run", branch="alt"),
+        _entry(tmp_path / "other", module="pkg.other.run"),
     ]
     assert resolve_module_entry(entries, "pkg.demo").output_root == tmp_path / "main"
     assert resolve_module_entry(entries, "pkg.demo", branch="alt").output_root == tmp_path / "alt"
@@ -147,14 +149,38 @@ def test_resolve_module_entry_accepts_package_selector_for_main_module(tmp_path:
         resolve_module_entry(entries, "pkg.missing")
 
 
-def test_resolve_module_entry_prefers_an_exact_module_over_main_alias(tmp_path: Path) -> None:
+def test_resolve_module_entry_prefers_a_selector_over_a_persisted_module(tmp_path: Path) -> None:
     entries = [
-        _entry(tmp_path / "exact", module="pkg.demo"),
-        _entry(tmp_path / "main", module="pkg.demo.__main__"),
+        _entry(tmp_path / "declared", module="pkg.impl.run", name="pkg.demo"),
+        _entry(tmp_path / "persisted", module="pkg.demo"),
     ]
 
-    assert resolve_module_entry(entries, "pkg.demo").output_root == tmp_path / "exact"
-    assert resolve_module_entry(entries, "pkg.demo.__main__").output_root == tmp_path / "main"
+    assert resolve_module_entry(entries, "pkg.demo").output_root == tmp_path / "declared"
+    assert resolve_module_entry(entries, "pkg").output_root == tmp_path / "persisted"
+    assert resolve_module_entry(entries, "pkg.impl.run").output_root == tmp_path / "declared"
+
+
+def test_resolve_module_entry_accepts_an_unambiguous_selector_suffix(tmp_path: Path) -> None:
+    entries = [
+        _entry(tmp_path / "main", module="studies.exp.dataset_audit.label_renderability.run"),
+        _entry(tmp_path / "other", module="studies.exp.metric_eval.benchmark_misjudgment.run"),
+    ]
+
+    assert resolve_module_entry(entries, "label_renderability").output_root == tmp_path / "main"
+    assert (
+        resolve_module_entry(entries, "dataset_audit.label_renderability").output_root
+        == tmp_path / "main"
+    )
+
+
+def test_resolve_module_entry_rejects_an_ambiguous_selector_suffix(tmp_path: Path) -> None:
+    entries = [
+        _entry(tmp_path / "first", module="studies.exp.dataset_audit.shared.run"),
+        _entry(tmp_path / "second", module="studies.exp.metric_eval.shared.run"),
+    ]
+
+    with pytest.raises(ValueError, match="Ambiguous module"):
+        resolve_module_entry(entries, "shared")
 
 
 def test_resolve_module_entry_reports_every_ambiguous_candidate(tmp_path: Path) -> None:

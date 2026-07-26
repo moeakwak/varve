@@ -12,11 +12,11 @@ from varve.dashboard.models import (
     PipelineEntry,
     PipelineState,
     StateError,
-    module_selector,
 )
 from varve.engine.runner import _KeyingSession
 from varve.matrix import build_graph
 from varve.pipeline import Pipeline
+from varve.selector import matches_selector
 from varve.status import collect_pipeline_status
 
 
@@ -96,18 +96,19 @@ def _matching_module_entries(
     entries: list[PipelineEntry],
     module: str,
 ) -> list[PipelineEntry]:
-    exact = [entry for entry in entries if entry.module == module]
+    """Match a selector exactly, then by persisted module, then by dotted suffix."""
+
+    exact = [entry for entry in entries if entry.selector == module]
     if exact:
         return exact
-    return [
-        entry
-        for entry in entries
-        if entry.module is not None and module_selector(entry.module) == module
-    ]
+    persisted = [entry for entry in entries if entry.module == module]
+    if persisted:
+        return persisted
+    return [entry for entry in entries if matches_selector(entry.selector, module)]
 
 
 def _available_modules(entries: list[PipelineEntry]) -> list[str]:
-    return sorted({module_selector(entry.module) for entry in entries if entry.module is not None})
+    return sorted({entry.selector for entry in entries if entry.module is not None})
 
 
 def import_entry_pipeline(entry: PipelineEntry) -> type[Pipeline]:
@@ -161,7 +162,10 @@ def _ambiguity(module: str, branch: str, candidates: list[PipelineEntry]) -> str
         f"output={entry.output_root}"
         for entry in candidates
     )
-    return f"Ambiguous module {module!r} ({branch}): {details}"
+    return (
+        f"Ambiguous module {module!r} ({branch}): {details}. "
+        "Declare varve_name on a pipeline to give it a distinct selector."
+    )
 
 
 def _error(entry: PipelineEntry, phase: ErrorPhase, message: str) -> PipelineState:

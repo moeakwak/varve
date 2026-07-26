@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from varve.branch import validate_branch_name
 from varve.decorators import StageSpec
 from varve.dependencies import Dependencies
+from varve.selector import selector_from_module, validate_selector
 
 
 class _EmptyArgs(BaseModel):
@@ -31,6 +32,9 @@ class Pipeline:
     Args: ClassVar[type[Any]] = _EmptyArgs
     Config: ClassVar[type[Any]]
     depends: ClassVar[Dependencies] = Dependencies()
+    # Overrides the selector the `varve` command displays and accepts. Declare it
+    # when the derived package name is wrong or collides with another pipeline.
+    varve_name: ClassVar[str | None] = None
 
     @classmethod
     @cache
@@ -80,6 +84,17 @@ class Pipeline:
         spec = getattr(module, "__spec__", None)
         spec_name = getattr(spec, "name", None)
         return spec_name or cls.__module__
+
+    @classmethod
+    def selector(cls) -> str:
+        """Return the user-facing selector the `varve` command displays and accepts."""
+        if cls.varve_name is not None:
+            return validate_selector(cls.varve_name)
+        module = cls.import_module_name()
+        if module == "__main__":
+            main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+            return Path(main_file).stem if main_file is not None else module
+        return selector_from_module(module)
 
     @classmethod
     def _module_file(cls) -> str | None:

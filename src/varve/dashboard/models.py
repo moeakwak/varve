@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from varve.engine.state import EffectiveStatus
+from varve.selector import selector_from_module
 from varve.status import PipelineStatus
 
 ErrorPhase = Literal["manifest", "import", "resolve", "evaluate"]
@@ -23,12 +24,17 @@ class PipelineEntry(NamedTuple):
     pipeline_name: str | None
     branch: str
     module: str | None = None
+    name: str | None = None
     manifest_error: str | None = None
 
-
-def module_selector(module: str) -> str:
-    """Return the user-facing selector for a persisted import module."""
-    return module.removesuffix(".__main__")
+    @property
+    def selector(self) -> str:
+        """Return the persisted selector, deriving one for stores without a name."""
+        if self.name is not None:
+            return self.name
+        if self.module is not None:
+            return selector_from_module(self.module)
+        return self.pipeline_id
 
 
 class PipelineState(NamedTuple):

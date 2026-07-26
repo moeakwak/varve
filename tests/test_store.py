@@ -72,6 +72,22 @@ def test_store_updates_manifest_module(tmp_path: Path) -> None:
     assert manifest.module == "pkg.new"
 
 
+def test_store_persists_and_updates_manifest_name(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.ensure_initialized("Demo", module="pkg.demo.run")
+    assert (manifest := store.read_manifest()) is not None
+    assert manifest.name is None
+
+    store.ensure_initialized("Demo", module="pkg.demo.run", name="pkg.demo")
+    assert (manifest := store.read_manifest()) is not None
+    assert manifest.name == "pkg.demo"
+
+    store.ensure_initialized("Demo", module="pkg.demo.run", name="team.demo")
+    assert (manifest := store.read_manifest()) is not None
+    assert manifest.module == "pkg.demo.run"
+    assert manifest.name == "team.demo"
+
+
 def test_success_round_trip_and_tmp_does_not_pollute(tmp_path: Path) -> None:
     store = Store(tmp_path)
     store.ensure_initialized("Demo")

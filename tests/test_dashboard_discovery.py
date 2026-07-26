@@ -167,17 +167,33 @@ def test_discovery_stops_at_valid_output_root_but_not_invalid_varve_dir(
     ]
 
 
-def test_discovery_sorts_by_exact_module_branch_class_and_output(tmp_path: Path) -> None:
-    Store(tmp_path / "z" / "out" / "main").ensure_initialized("A", module="pkg.z")
-    Store(tmp_path / "a" / "out" / "alt").ensure_initialized("B", module="pkg.a")
-    Store(tmp_path / "b" / "out" / "main").ensure_initialized("B", module="pkg.a")
+def test_discovery_sorts_by_selector_branch_class_and_output(tmp_path: Path) -> None:
+    Store(tmp_path / "z" / "out" / "main").ensure_initialized("A", module="pkg.z.run")
+    Store(tmp_path / "a" / "out" / "alt").ensure_initialized("B", module="pkg.a.run")
+    Store(tmp_path / "b" / "out" / "main").ensure_initialized("B", module="pkg.a.run")
 
     entries = discover_pipelines(tmp_path)
 
-    assert [(entry.module, entry.branch) for entry in entries] == [
+    assert [(entry.selector, entry.branch) for entry in entries] == [
         ("pkg.a", "alt"),
         ("pkg.a", "main"),
         ("pkg.z", "main"),
+    ]
+
+
+def test_discovery_reports_declared_name_over_derived_selector(tmp_path: Path) -> None:
+    Store(tmp_path / "derived" / "out" / "main").ensure_initialized("A", module="pkg.derived.run")
+    Store(tmp_path / "declared" / "out" / "main").ensure_initialized(
+        "B",
+        module="pkg.declared.run",
+        name="team.declared",
+    )
+
+    entries = discover_pipelines(tmp_path)
+
+    assert [(entry.name, entry.selector) for entry in entries] == [
+        (None, "pkg.derived"),
+        ("team.declared", "team.declared"),
     ]
 
 
@@ -191,10 +207,10 @@ def test_filter_entries_shares_prefix_branch_and_temporary_scope(tmp_path: Path)
             module=module,
         )
         for name, module, branch, temporary in (
-            ("main", "pkg.match", "main", False),
-            ("alt", "pkg.match", "alt", False),
-            ("tmp", "pkg.match", "quick", True),
-            ("other", "other.demo", "main", False),
+            ("main", "pkg.match.run", "main", False),
+            ("alt", "pkg.match.run", "alt", False),
+            ("tmp", "pkg.match.run", "quick", True),
+            ("other", "other.demo.run", "main", False),
         )
     ]
 

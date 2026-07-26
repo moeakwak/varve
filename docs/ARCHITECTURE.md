@@ -41,7 +41,7 @@ Everything else is internal unless this document, `GUIDE.md`, or `README.md` say
 
 ## Dependency direction
 
-- Low-level packages: `keying`, `store`, and `engine.state`. They depend only on leaf modules such as `models`, `log`, and `dependencies`.
+- Low-level packages: `keying`, `store`, and `engine.state`. They depend only on leaf modules such as `models`, `log`, `selector`, and `dependencies`.
 - Middle layer: `branch_config`, `command`, `status`, and `engine.runner`.
 - Top layers: `cli` and `dashboard`; both call shared command services and renderers rather than invoking each other through argv.
 - Public-facing modules such as `pipeline`, `decorators`, and `context` may use internals to keep the user API small.
@@ -167,7 +167,7 @@ Managed matrix artifacts are contained under `ctx.cell_out`, which is `<output-r
 
 `Pipeline.cli(argv)` delegates to `varve.cli.app.main` and provides `run`, `status`, `reuse`, `invalidate`, `plan`, `ls`, and `clean`.
 
-`ResolvedCommandContext` carries the pipeline class, resolved branch/config/axes, output base and root, graph, and runtime Args without probing or mutating the store. The generated frontend constructs it from `ResolvedBranch`; the top-level frontend resolves a user-facing MODULE selector and branch back to the exact manifest identity. A persisted `package.__main__` module has the shorter `package` selector, with exact matching taking precedence and the persisted name remaining accepted. Structure listing uses a lighter resolved target because it does not consume Args or probe keys. `plan` shares the same resolved context and exact status collector as `status`, then renders a logical base-Stage DAG through `cli/plan.py` and netext.
+`ResolvedCommandContext` carries the pipeline class, resolved branch/config/axes, output base and root, graph, and runtime Args without probing or mutating the store. The generated frontend constructs it from `ResolvedBranch`; the top-level frontend resolves a user-facing MODULE selector and branch back to the exact manifest identity. Selector and import identity are separate manifest fields: `module` plus `pipeline` is the import target, while `name` is the selector `Pipeline.selector()` derived at run time from `varve_name` or from the package that owns the output directory. Resolution matches an exact selector first, then the exact persisted module, then an unambiguous dotted selector suffix; stores written before `name` existed derive their selector from `module`. Structure listing uses a lighter resolved target because it does not consume Args or probe keys. `plan` shares the same resolved context and exact status collector as `status`, then renders a logical base-Stage DAG through `cli/plan.py` and netext.
 
 `argparse` parses commands and generated `Args` flags. Top-level run/status/plan/clean/reuse/invalidate use two stages: a fixed `COMMAND MODULE [OPTIONS]` target identifies and imports one discovered pipeline, then its Args fields are registered before full parsing. Bulk commands use default Args and reject pipeline-specific flags. `pydantic-settings` builds semantic `Config` values from branch/override values, environment variables, `.env`, and model defaults.
 
@@ -191,7 +191,7 @@ Per-stage clean only deletes recorded artifacts plus success, attempt, failure, 
 
 ## Top-level discovery and commands
 
-The top-level `varve` console script operates only on existing manifest-anchored stores. Discovery is zero-import and stops descending once `_branch_output_id()` confirms a valid branch output root, so materialized artifacts are never treated as further scan roots. Prefix, exact branch, and temporary scope filters run before import. A valid temporary output root remains terminal even when it is filtered out because `--include-temp` was not passed. An invalid `.varve` directory does not stop traversal and therefore cannot hide a deeper valid store.
+The top-level `varve` console script operates only on existing manifest-anchored stores. Discovery is zero-import and stops descending once `_branch_output_id()` confirms a valid branch output root, so materialized artifacts are never treated as further scan roots. Selector prefix, exact branch, and temporary scope filters run before import. A valid temporary output root remains terminal even when it is filtered out because `--include-temp` was not passed. An invalid `.varve` directory does not stop traversal and therefore cannot hide a deeper valid store.
 
 `varve ls` imports filtered manifest modules, resolves branches, and calls `collect_pipeline_status()` once per entry with a shared observation session. The dashboard model only wraps discovery metadata around shared `PipelineStatus`; it has no parallel stage taxonomy. The overview renderer shows the user-facing MODULE selector, BRANCH, and effective STATUS, adds duration and last run when wide enough, and switches to stacked rows rather than truncating MODULE. Status filtering runs after exact evaluation.
 

@@ -17,6 +17,9 @@ class Manifest(VarveModel):
     schema_version: int = SCHEMA_VERSION
     pipeline: str
     module: str | None = None
+    # User-facing selector; older stores without it fall back to a selector
+    # derived from `module`.
+    name: str | None = None
     temporary_config: dict[str, Any] | None = None
     temporary_axes: dict[str, list[str]] | None = None
 

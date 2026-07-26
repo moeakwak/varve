@@ -609,7 +609,7 @@ def test_overview_filters_before_exact_evaluation_and_status_after(
             pipeline_id=name,
             pipeline_name="CliDemo",
             branch="main",
-            module=f"pkg.{name}",
+            module=f"pkg.{name}.run",
         )
         for name in ("hit", "review", "other")
     ]
@@ -619,7 +619,7 @@ def test_overview_filters_before_exact_evaluation_and_status_after(
 
     def fake_load(entry, session):
         checked.append((entry.module, session))
-        return _state(entry, "needs-review" if entry.module == "pkg.review" else "hit")
+        return _state(entry, "needs-review" if entry.module == "pkg.review.run" else "hit")
 
     monkeypatch.setattr(commands, "load_state", fake_load)
     assert (
@@ -630,7 +630,7 @@ def test_overview_filters_before_exact_evaluation_and_status_after(
         )
         == 0
     )
-    assert [item[0] for item in checked] == ["pkg.hit", "pkg.review"]
+    assert [item[0] for item in checked] == ["pkg.hit.run", "pkg.review.run"]
     assert checked[0][1] is checked[1][1]
     output = capsys.readouterr().out
     assert "pkg.review" in output
@@ -658,7 +658,7 @@ def test_overview_empty_discovery_is_failure_but_empty_status_is_success(
         pipeline_id="demo",
         pipeline_name="Demo",
         branch="main",
-        module="pkg.demo",
+        module="pkg.demo.run",
     )
     monkeypatch.setattr(commands, "discover_scope", lambda *args, **kwargs: [entry])
     monkeypatch.setattr(commands, "load_state", lambda entry, session: _state(entry, "hit"))
@@ -674,19 +674,19 @@ def test_overview_empty_discovery_is_failure_but_empty_status_is_success(
 
 
 def test_narrow_overview_keeps_complete_module_on_its_own_line(tmp_path: Path) -> None:
-    module = "studies.exp.metric_eval.benchmark_misjudgment.run"
+    selector = "studies.exp.metric_eval.benchmark_misjudgment"
     entry = PipelineEntry(
         output_root=tmp_path,
         pipeline_id="short",
         pipeline_name="Demo",
         branch="main",
-        module=module,
+        module=f"{selector}.run",
     )
     buffer = StringIO()
     console = Console(file=buffer, width=45, force_terminal=False)
     render_overview([_state(entry, "needs-review")], console=console)
     output = buffer.getvalue()
-    assert module in output
+    assert selector in output
     assert "…" not in output
     assert "needs-review" in output
 
@@ -697,9 +697,11 @@ def test_overview_error_row_does_not_hide_later_pipeline(tmp_path: Path) -> None
         pipeline_id="broken",
         pipeline_name="Broken",
         branch="main",
-        module="pkg.broken",
+        module="pkg.broken.run",
     )
-    second = first._replace(output_root=tmp_path / "good", pipeline_id="good", module="pkg.good")
+    second = first._replace(
+        output_root=tmp_path / "good", pipeline_id="good", module="pkg.good.run"
+    )
     buffer = StringIO()
     render_overview(
         [_state(first, "error", reason="cannot import"), _state(second, "hit")],
@@ -729,7 +731,7 @@ def test_bulk_review_continues_after_entry_failure_and_uses_default_args(
             pipeline_id=name,
             pipeline_name="CliDemo",
             branch="main",
-            module=f"pkg.{name}",
+            module=f"pkg.{name}.run",
         )
         for name in ("good", "other", "bad")
     ]
@@ -814,7 +816,7 @@ def test_bulk_run_skips_hit_and_review_runs_eligible_then_rechecks(
             pipeline_id=name,
             pipeline_name="CliDemo",
             branch="main",
-            module=f"pkg.{name}",
+            module=f"pkg.{name}.run",
         )
         for name in ("hit", "review", "stale")
     ]
@@ -870,10 +872,10 @@ def test_bulk_run_mixed_failure_returns_one_and_preserves_all_groups(
         pipeline_id="review",
         pipeline_name="CliDemo",
         branch="main",
-        module="pkg.review",
+        module="pkg.review.run",
     )
     failed = review._replace(
-        output_root=tmp_path / "failed", pipeline_id="failed", module="pkg.failed"
+        output_root=tmp_path / "failed", pipeline_id="failed", module="pkg.failed.run"
     )
     monkeypatch.setattr(commands, "discover_scope", lambda *args, **kwargs: [review, failed])
     monkeypatch.setattr(
