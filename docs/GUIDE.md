@@ -300,7 +300,7 @@ Matrix batch progress defaults to canonical coordinate values in axis declaratio
 
 ## Branches and output roots
 
-`varve.yaml` lives next to the pipeline module. It is optional when `main` can use Config defaults. Each branch has independent `config`, `axes`, and `is_temporary` facets:
+`varve.yaml` lives next to the pipeline module. It is optional when `main` can use Config defaults. Each branch has independent `config`, `axes`, `is_temporary`, and `manual` facets:
 
 ```yaml
 main:
@@ -310,9 +310,12 @@ main:
     model: [small]
 
 full:
+  manual: true
   config:
     bootstrap: 5000
 ```
+
+`manual` is an optional boolean, defaulting to `false`. A manual branch is excluded from default top-level `varve run`, but included by `varve run --all`, an explicit `varve run MODULE [--branch NAME]`, or the generated pipeline CLI. It is run-selection metadata only: changing it does not alter Config, input keys, source fingerprints, or store records. There is no experiment-wide inheritance or local store override.
 
 The previous flat Config format is rejected; Config fields must live under `config:`. Axis ids must exist in their declared Axis domains.
 
@@ -407,7 +410,7 @@ class LabelRenderability(Pipeline):
 ```bash
 varve ls [MODULE]
 varve status MODULE [--stage STAGE_SELECTOR]
-varve run MODULE | varve run --all
+varve run [MODULE | --all]
 varve reuse MODULE [--stage BASE_STAGE]... | varve reuse --all
 varve invalidate MODULE [--stage BASE_STAGE]... | varve invalidate --all
 varve plan MODULE
@@ -418,7 +421,9 @@ varve clean MODULE
 
 `varve ls MODULE` is branch-independent and shares the generated `ls` renderer. `status MODULE`, `run MODULE`, `reuse MODULE`, `invalidate MODULE`, `plan MODULE`, and `clean MODULE` restore the existing manifest output identity and call the same single-pipeline services as generated commands. They do not accept `--out`, `--override`, or `--slice`. Top-level status supports one execution selector; top-level `reuse` and `invalidate` support repeatable base Stage targets. Run, status, plan, clean, reuse, and invalidate register the selected pipeline's Args after resolving MODULE; structure listing does not instantiate Args.
 
-`run --all`, `reuse --all`, and `invalidate --all` accept `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run additionally accepts `--rehash`. Bulk commands use each pipeline's default Args and reject pipeline-specific flags; bulk Review does not accept Stage selection. Each store has its own lock and commit, failures do not stop later entries, and the command returns 1 if any entry failed. Bulk run exact-evaluates each entry, skips hits and complete pipelines blocked only by `needs-review`, runs `needs-run`, `resume`, or `failed` entries, refreshes observations after each attempt, and exact-evaluates final state. It returns 0 when all entries are complete, 2 when `needs-review` is the only incomplete reason, and 1 for failed, error, needs-run, resume, or mixed incomplete results.
+`run` without MODULE, `run --all`, `reuse --all`, and `invalidate --all` accept `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run additionally accepts `--rehash`. Bulk commands use each pipeline's default Args and reject pipeline-specific flags; bulk Review does not accept Stage selection. Each store has its own lock and commit, failures do not stop later entries, and the command returns 1 if any entry failed. Default bulk run first excludes manual branches by reading `varve.yaml` next to the persisted pipeline module, before importing pipelines or evaluating dependencies. `--all` disables only this manual filter: discovery scope, temporary exclusion, cache hits, and Review gates still apply. An explicit MODULE selects `main` by default, even if manual; `--branch` selects another explicit branch. Only existing stores participate; initialize a YAML-only branch through its generated pipeline CLI first. `reuse` and `invalidate` retain their existing selection rules.
+
+Bulk run reports separate counts for executed branches (including failed attempts), initial cache hits, and manual skips, and lists each skipped branch. Skipped manual branches are neither hits nor failures and retain their actual state for explicit `status`. Success means that the selected non-skipped range completed, including when every discovered branch was skipped. Bulk run exact-evaluates each selected entry, skips hits and complete pipelines blocked only by `needs-review`, runs `needs-run`, `resume`, or `failed` entries, refreshes observations after each attempt, and exact-evaluates final state. It returns 0 when all entries are complete, 2 when `needs-review` is the only incomplete reason, and 1 for failed, error, needs-run, resume, or mixed incomplete results.
 
 ## Clean safety and recovery
 

@@ -16,8 +16,8 @@ from varve.cli.review import (
     BulkReviewFailure,
     render_bulk_source_review,
 )
-from varve.dashboard.discovery import discover_pipelines, filter_entries
-from varve.dashboard.models import PipelineEntry, PipelineState
+from varve.dashboard.discovery import discover_pipelines, filter_entries, is_manual_entry
+from varve.dashboard.models import PipelineEntry, PipelineState, StateError
 from varve.dashboard.render import render_bulk_run, render_no_status_matches, render_overview
 from varve.dashboard.state import (
     import_entry_pipeline,
@@ -114,6 +114,7 @@ def bulk_run_command(
     scope: DiscoveryScope,
     *,
     rehash: bool,
+    include_manual: bool = False,
     console: Console | None = None,
 ) -> int:
     console = console or make_console()
@@ -123,11 +124,24 @@ def bulk_run_command(
         return 1
     session = _KeyingSession(fingerprints=FingerprintSession(force_rehash=rehash))
     final_states: list[PipelineState] = []
+    manual_skipped: list[PipelineEntry] = []
+    executed = 0
+    hits = 0
     logger = logging.getLogger("varve")
     logging_configured = False
     for index, entry in enumerate(entries, start=1):
+        if not include_manual:
+            try:
+                if is_manual_entry(entry):
+                    manual_skipped.append(entry)
+                    continue
+            except Exception as error:  # noqa: BLE001 - policy errors must not run the entry.
+                final_states.append(PipelineState(entry, error=StateError("resolve", str(error))))
+                continue
         with _loading(console, f"Evaluating pipeline state {index}/{len(entries)}…"):
             state = load_state(entry, session)
+        if state.status == "hit":
+            hits += 1
         if state.status in {"hit", "needs-review", "error"}:
             final_states.append(state)
             continue
@@ -135,6 +149,7 @@ def bulk_run_command(
             configure_cli_logging()
             logging_configured = True
         module = entry.selector
+        executed += 1
         logger.info("%s run %s --branch %s", BULK_RUN_MARKER, module, entry.branch)
         try:
             pipeline = import_entry_pipeline(entry)
@@ -147,7 +162,13 @@ def bulk_run_command(
         final_states.append(load_state(entry, session))
         session.refresh_observations()
 
-    render_bulk_run(final_states, console=console)
+    render_bulk_run(
+        final_states,
+        console=console,
+        executed=executed,
+        hits=hits,
+        manual_skipped=manual_skipped,
+    )
     incomplete = [state for state in final_states if not state.complete]
     if not incomplete:
         return 0

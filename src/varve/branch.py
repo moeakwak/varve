@@ -29,6 +29,7 @@ class BranchDefinition(NamedTuple):
     config: dict[str, Any]
     axes: dict[str, list[str]]
     is_temporary: bool
+    manual: bool = False
 
 
 def load_branches(yaml_path: Path | None) -> dict[str, BranchDefinition]:
@@ -51,7 +52,7 @@ def load_branches(yaml_path: Path | None) -> dict[str, BranchDefinition]:
         if not isinstance(section, Mapping):
             raise ValueError(f"Varve branch {branch!r} must be a mapping in {yaml_path}")
 
-        unknown = set(section) - {"config", "axes", "is_temporary"}
+        unknown = set(section) - {"config", "axes", "is_temporary", "manual"}
         if unknown:
             raise ValueError(
                 f"Varve branch {branch!r} uses the removed flat config format in {yaml_path}; "
@@ -60,6 +61,7 @@ def load_branches(yaml_path: Path | None) -> dict[str, BranchDefinition]:
         config = section.get("config", {})
         axes = section.get("axes", {})
         is_temporary = section.get("is_temporary", False)
+        manual = section.get("manual", False)
         if not isinstance(config, Mapping):
             raise ValueError(f"Varve branch {branch!r} config must be a mapping in {yaml_path}")
         if not isinstance(axes, Mapping) or any(
@@ -73,10 +75,13 @@ def load_branches(yaml_path: Path | None) -> dict[str, BranchDefinition]:
             )
         if not isinstance(is_temporary, bool):
             raise ValueError(f"Varve branch {branch!r} has non-boolean is_temporary in {yaml_path}")
+        if not isinstance(manual, bool):
+            raise ValueError(f"Varve branch {branch!r} has non-boolean manual in {yaml_path}")
         result[branch] = BranchDefinition(
             config=dict(config),
             axes={name: list(values) for name, values in axes.items()},
             is_temporary=is_temporary,
+            manual=manual,
         )
     return result
 

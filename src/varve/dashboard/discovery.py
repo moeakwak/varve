@@ -4,12 +4,48 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+from importlib.machinery import PathFinder
 from pathlib import Path
 
 from pydantic import ValidationError
 
+from varve.branch import load_branches
 from varve.dashboard.models import PipelineEntry
 from varve.models import Manifest
+
+
+def is_manual_entry(entry: PipelineEntry) -> bool:
+    """Read branch policy next to the persisted module without importing it or its parents."""
+    if entry.module is None or entry.manifest_error is not None:
+        return False
+    search_path = None
+    parts = entry.module.split(".")
+    module_file = None
+    for index in range(len(parts)):
+        name = ".".join(parts[: index + 1])
+        loaded = sys.modules.get(name)
+        if loaded is not None:
+            module_file = getattr(loaded, "__file__", None)
+            search_path = getattr(loaded, "__path__", None)
+        else:
+            # Use the leaf name with the explicit parent path. A dotted namespace
+            # spec otherwise asks sys.modules for a parent we deliberately did not import.
+            spec = PathFinder.find_spec(parts[index], search_path)
+            if spec is None:
+                return False  # Normal state loading reports an unavailable import target.
+            module_file = spec.origin
+            search_path = (
+                list(spec.submodule_search_locations)
+                if spec.submodule_search_locations is not None
+                else None
+            )
+        if index < len(parts) - 1 and search_path is None:
+            return False
+    if module_file is None:
+        return False
+    definition = load_branches(Path(module_file).resolve().parent / "varve.yaml").get(entry.branch)
+    return definition.manual if definition is not None else False
 
 
 def discover_pipelines(root: Path, *, include_temporary: bool = False) -> list[PipelineEntry]:

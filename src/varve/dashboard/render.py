@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from varve.dashboard.models import PipelineState
+from varve.dashboard.models import PipelineEntry, PipelineState
 from varve.style import format_elapsed, make_console, status_text
 
 
@@ -64,10 +64,20 @@ def render_bulk_run(
     states: Sequence[PipelineState],
     *,
     console: Console | None = None,
+    executed: int = 0,
+    hits: int = 0,
+    manual_skipped: Sequence[PipelineEntry] = (),
 ) -> None:
     """Render every final incomplete category from fresh exact states."""
 
     console = console or make_console()
+    console.print(
+        f"Branches: {executed} executed, {hits} hit, {len(manual_skipped)} manual skipped."
+    )
+    if manual_skipped:
+        console.print("\nMANUAL SKIPPED", style="bold yellow")
+        for entry in manual_skipped:
+            console.print(f"{entry.selector}  {entry.branch}")
     incomplete = [state for state in states if not state.complete]
     if not incomplete:
         console.print("All selected pipelines are complete.")

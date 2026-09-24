@@ -57,7 +57,9 @@ def main(argv: list[str] | None = None) -> int:
         target = raw_argv[1] if len(raw_argv) > 1 else None
         if target in {"-h", "--help"}:
             _parse_to_exit(raw_argv)
-        if target == "--all" and command in {"run", "reuse", "invalidate"}:
+        if (command == "run" and (target is None or target.startswith("-"))) or (
+            target == "--all" and command in {"reuse", "invalidate"}
+        ):
             scope = _dynamic_scope(command, raw_argv[1:])
         else:
             if target is None or target.startswith("-"):
@@ -80,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser(pipeline=pipeline, dynamic_command=command)
     namespace = parser.parse_args(raw_argv)
     _validate_surface(parser, namespace)
+    if command in _DYNAMIC_COMMANDS and module is None and namespace.module is not None:
+        parser.error("MODULE must precede command options")
     if module is not None and namespace.module != module:
         parser.error("parsed MODULE does not match the resolved target")
 
@@ -105,13 +109,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         all_targets = getattr(namespace, "all", False)
-        assert namespace.module is not None or all_targets
-        if all_targets:
+        if namespace.module is None and (namespace.command == "run" or all_targets):
             command_scope = DiscoveryScope(
                 namespace.root, namespace.prefix, namespace.branch, namespace.include_temp
             )
             if namespace.command == "run":
-                return bulk_run_command(command_scope, rehash=namespace.rehash)
+                return bulk_run_command(
+                    command_scope, rehash=namespace.rehash, include_manual=all_targets
+                )
             return bulk_review_command(command_scope, decision=namespace.command)
 
         assert entry is not None and pipeline is not None
@@ -175,6 +180,8 @@ def _parser(
             if name in {"status", "plan", "clean"}
             else "(MODULE [OPTIONS] | --all [OPTIONS])"
         )
+        if name == "run":
+            target = "[MODULE | --all] [OPTIONS]"
         dynamic.usage = f"varve {name} {target}"
         _add_dynamic_options(dynamic, name, positional=True, help_text=argmap.STAGE_SELECTOR_HELP)
         if pipeline is not None and dynamic_command == name:
@@ -204,7 +211,11 @@ def _add_dynamic_options(
     if positional:
         parser.add_argument("module", nargs="?", metavar="MODULE")
     if command in {"run", "reuse", "invalidate"}:
-        parser.add_argument("--all", action="store_true")
+        parser.add_argument(
+            "--all",
+            action="store_true",
+            help="include manual branches in bulk run" if command == "run" else None,
+        )
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--branch", metavar="NAME")
     parser.add_argument("--include-temp", action="store_true")
@@ -244,19 +255,21 @@ def _validate_surface(parser: argparse.ArgumentParser, namespace: argparse.Names
     module = getattr(namespace, "module", None)
     all_targets = getattr(namespace, "all", False)
     if command in {"run", "reuse", "invalidate"}:
-        if bool(module) == bool(all_targets):
+        if (module is not None and all_targets) or (
+            command != "run" and module is None and not all_targets
+        ):
             parser.error(f"varve {command} requires exactly one of MODULE or --all")
         if module is not None and namespace.prefix is not None:
-            parser.error("--prefix is only available with --all")
+            parser.error("--prefix is only available for bulk commands")
     if command == "ls" and module is not None:
         if namespace.prefix is not None or namespace.branch is not None or namespace.status:
             parser.error("varve ls MODULE accepts only --root and --include-temp")
         if namespace.rehash:
             parser.error("varve ls MODULE does not evaluate store state")
-    if command == "run" and all_targets:
+    if command == "run" and module is None:
         if any((namespace.upto, namespace.downstream, namespace.only)):
-            parser.error("varve run --all does not accept stage selection")
+            parser.error("bulk varve run does not accept stage selection")
         if namespace.force or namespace.expand or namespace.compact:
-            parser.error("varve run --all does not accept --force or display selection")
+            parser.error("bulk varve run does not accept --force or display selection")
     if command in {"reuse", "invalidate"} and all_targets and namespace.stage:
         parser.error(f"varve {command} --all does not accept stage selection")

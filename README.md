@@ -102,7 +102,7 @@ Each cell gets a concrete identity like `score@bench=unimer,model=large` and its
 
 ### Branches and temporary runs
 
-An optional `varve.yaml` splits a branch's semantic `config` from its active matrix `axes`. Persistent branches materialize under `out/<branch>/`. `run --override JSON` spins up an isolated throwaway branch under `out/.tmp/<branch>/`, snapshotting both the validated Config and the active axes so generated commands and top-level commands with `--include-temp` can find it later.
+An optional `varve.yaml` splits a branch's semantic `config` from its active matrix `axes`. Set `manual: true` alongside them to exclude a branch from default top-level bulk runs; explicit module and generated pipeline commands still run it. This selection policy does not change cache keys or stored results. Persistent branches materialize under `out/<branch>/`. `run --override JSON` spins up an isolated throwaway branch under `out/.tmp/<branch>/`, snapshotting both the validated Config and the active axes so generated commands and top-level commands with `--include-temp` can find it later.
 
 ### Generated and top-level CLIs
 
@@ -122,7 +122,7 @@ Generated `reuse` and `invalidate` default to every Stage with a current Review 
 
 The top-level `varve` command finds existing stores from their manifests. `varve ls` exact-evaluates the discovered branches and reports the user-facing `MODULE` selector, `BRANCH`, and effective `STATUS`. A selector is the package that owns a store's output directory, which is also the name `python -m` accepts whenever that package has a `__main__.py`; declare `varve_name` on a pipeline to choose a different one. Any unambiguous dotted suffix of a selector and the exact persisted module are accepted too. `varve ls MODULE`, `status MODULE`, `run MODULE`, `reuse MODULE`, `invalidate MODULE`, `plan MODULE`, and `clean MODULE` reuse the generated command backends and renderers. Single dynamic commands use `COMMAND MODULE [OPTIONS]`, so MODULE precedes pipeline-specific Args flags.
 
-`varve run --all`, `reuse --all`, and `invalidate --all` operate on entries selected by `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run also accepts `--rehash`. Bulk Review uses each pipeline's default Args and records each store independently. Bulk run skips hits and `needs-review`, executes eligible branches, refreshes observations after every attempt, and reports exact final state. Use repeatable `varve ls --status STATUS` to filter evaluated rows.
+`varve run` runs discovered branches except those marked `manual: true`; `varve run --all` includes manual branches. Both run forms, `reuse --all`, and `invalidate --all` operate on entries selected by `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run also accepts `--rehash`. Bulk Review uses each pipeline's default Args and records each store independently. Bulk run filters manual branches before pipeline import or state evaluation, skips hits and `needs-review`, executes eligible branches, refreshes observations after every attempt, and reports exact final state with separate executed, hit, and manual-skipped branch counts. `--all` neither forces cache hits to rerun nor includes temporary stores without `--include-temp`; YAML-only branches without existing stores are never initialized by bulk run. Use repeatable `varve ls --status STATUS` to filter evaluated rows.
 
 ## Documentation
 

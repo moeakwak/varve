@@ -239,8 +239,9 @@ def test_status_requires_module_and_points_to_overview(capsys) -> None:
 
 @pytest.mark.parametrize("command", ["run", "reuse", "invalidate"])
 def test_module_and_all_are_mutually_exclusive_and_required(command: str) -> None:
-    with pytest.raises(SystemExit):
-        main([command])
+    if command != "run":
+        with pytest.raises(SystemExit):
+            main([command])
     for arguments in (("pkg.demo", "--all"), ("--all", "pkg.demo")):
         with pytest.raises(SystemExit) as exc_info:
             main([command, *arguments])
@@ -356,14 +357,14 @@ def test_dynamic_args_require_module_first_and_keep_help_and_usage_consistent(
         main(["run", "--help"])
     assert static_help_exit.value.code == 0
     static_help = capsys.readouterr().out
-    assert "usage: varve run (MODULE [OPTIONS] | --all [OPTIONS])" in static_help
+    assert "usage: varve run [MODULE | --all] [OPTIONS]" in static_help
     assert "--workers" not in static_help
 
     with pytest.raises(SystemExit) as missing_exit:
         main(["run", "--workers", "4", "--root", str(tmp_path)])
     assert missing_exit.value.code == 2
     error = capsys.readouterr().err
-    assert "requires exactly one of MODULE or --all" in error
+    assert "unrecognized arguments: --workers" in error
     assert "Unknown module: 4" not in error
 
     with pytest.raises(SystemExit) as status_exit:
