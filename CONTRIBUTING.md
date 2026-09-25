@@ -36,13 +36,15 @@ Do not re-export internal store, keying, runner, or dashboard types from `varve.
 - Append `!` only when the final change breaks compatibility with the most recent released version. Judge compatibility against that release, never against an earlier commit in the same unreleased series.
 - Adding, revising, or removing functionality that has not appeared in a release is not a breaking change. If a later commit eliminates a break introduced by an earlier unreleased commit, rewrite or squash the series so the obsolete `!` and `BREAKING CHANGE` notice are removed from the earlier commit as well.
 - Use `!` for public API or store schema breaks that remain relative to the most recent release.
-- Except for truly trivial changes such as an isolated typo fix, include a Markdown-formatted body that explains why the change is needed and summarizes its meaningful behavior or architecture changes. Prefer a short bullet list when the commit contains multiple points.
+- Except for truly trivial changes such as an isolated typo fix, explain the problem or motivation in a short opening paragraph, then describe the resulting behavior in unordered bullets grouped by topic. Use concrete declarative sentences with enough detail to explain important changes and their boundaries. Include meaningful performance or metric changes; omit routine test counts and pass/fail summaries.
 
 ```text
-feat(scope): concise subject
+feat(cli): skip manual branches in default runs
 
-- Explain the motivation or user-visible outcome.
-- Summarize the important implementation or compatibility details.
+Supplementary branches should run only when requested.
+
+- Branches marked `manual: true` are skipped before pipeline import and state evaluation.
+- `--all` and explicit targets still include manual branches.
 ```
 
 ## Releases
