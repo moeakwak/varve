@@ -539,6 +539,26 @@ def test_batch_yield_outside_resume_loop_fails(tmp_path: Path, placement: str) -
     assert failure.exception_type == "RuntimeError"
 
 
+def test_batch_second_resume_loop_fails(tmp_path: Path) -> None:
+    class TwoLoopPipeline(Pipeline):
+        Config = Config
+
+        @batch_stage()
+        async def build(self, ctx):
+            for prefix in ("a", "b"):
+                async for index, _ in ctx.resume(range(2), progress=False):
+                    path = ctx.out / f"{prefix}-{index}.txt"
+                    path.write_text(prefix, encoding="utf-8")
+                    yield path
+
+    with pytest.raises(RuntimeError, match="only one ctx.resume"):
+        run(TwoLoopPipeline, Config(), cli_out=tmp_path)
+
+    failure = Store(_out(tmp_path)).read_failure("build")
+    assert failure is not None
+    assert "called ctx.resume() twice" in failure.message
+
+
 def test_batch_rejects_cwd_relative_output_with_actionable_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -126,6 +126,12 @@ class Ctx(Generic[ConfigT, ArgsT]):
                 f"Batch stage {self._stage_name!r} yielded before ctx.resume(); "
                 "yield outputs only inside the ctx.resume() loop."
             )
+        if self._used_resume:
+            # A second loop would restart positional indexes at 0 and collide.
+            raise RuntimeError(
+                f"Batch stage {self._stage_name!r} called ctx.resume() twice; "
+                "a batch stage may run only one ctx.resume() loop."
+            )
         self._used_resume = True
         inferred_total = total if total is not None else _len_or_none(iterable)
         self._resume_total = inferred_total
