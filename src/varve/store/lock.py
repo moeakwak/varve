@@ -37,6 +37,15 @@ def is_stale_lock(varve_root: Path) -> bool:
         os.close(fd)
 
 
+def _same_file(fd: int, path: Path) -> bool:
+    try:
+        path_stat = path.stat()
+    except FileNotFoundError:
+        return False
+    stat = os.fstat(fd)
+    return (path_stat.st_dev, path_stat.st_ino) == (stat.st_dev, stat.st_ino)
+
+
 class OutputLock:
     def __init__(self, varve_root: Path) -> None:
         self.varve_root = varve_root
@@ -45,11 +54,20 @@ class OutputLock:
 
     def __enter__(self) -> OutputLock:
         self.varve_root.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-        if not _try_file_lock(self._fd):
+        while True:
+            self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+            if not _try_file_lock(self._fd):
+                os.close(self._fd)
+                self._fd = None
+                raise RuntimeError(f"Varve output root is already locked: {self.path}")
+            # A releasing holder unlinks the lock file before unlocking it, so the
+            # inode we opened may no longer be the one at the path. Holding a lock
+            # on an unlinked inode excludes nobody; reopen until they match.
+            if _same_file(self._fd, self.path):
+                break
+            _unlock_file(self._fd)
             os.close(self._fd)
             self._fd = None
-            raise RuntimeError(f"Varve output root is already locked: {self.path}")
         try:
             os.ftruncate(self._fd, 0)
             os.write(self._fd, b"locked\n")
@@ -63,15 +81,7 @@ class OutputLock:
     def __exit__(self, *exc) -> None:
         if self._fd is not None:
             try:
-                stat = os.fstat(self._fd)
-                try:
-                    path_stat = self.path.stat()
-                except FileNotFoundError:
-                    path_stat = None
-                if path_stat is not None and (
-                    path_stat.st_dev,
-                    path_stat.st_ino,
-                ) == (stat.st_dev, stat.st_ino):
+                if _same_file(self._fd, self.path):
                     self.path.unlink()
             finally:
                 _unlock_file(self._fd)
