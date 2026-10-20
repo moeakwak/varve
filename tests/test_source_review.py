@@ -1198,3 +1198,78 @@ def test_review_decision_controls_batch_partial_reuse(
         cli_out=output_base,
     )
     assert calls.read_text(encoding="utf-8").splitlines() == expected_calls
+
+
+def _rerun_access_source(body: str) -> str:
+    return f"""from pathlib import Path
+from pydantic import BaseModel
+from varve import Pipeline, batch_stage
+
+class Config(BaseModel):
+    a: str
+    b: str
+
+class Args(BaseModel):
+    fail: bool = False
+
+class Demo(Pipeline):
+    Config = Config
+    Args = Args
+
+    @batch_stage()
+    async def build(self, ctx):
+        async for index, item in ctx.resume(range(2), progress=False):
+            path = ctx.out / f"part-{{index}}.txt"
+            path.write_text({body}, encoding="utf-8")
+            yield path
+            if ctx.args.fail and index == 0:
+                raise RuntimeError("planned")
+"""
+
+
+def test_rerun_source_change_executes_with_full_config_key(tmp_path: Path) -> None:
+    module_path = tmp_path / "rerun_access.py"
+    module_path.write_text(_rerun_access_source("ctx.config.a"), encoding="utf-8")
+    pipeline = _load_pipeline(module_path, "rerun_access_demo")
+    output_base = tmp_path / "out"
+    output_root = output_base / "main"
+    run(pipeline, pipeline.Config(a="1", b="x"), args=pipeline.Args(), cli_out=output_base)
+
+    # Only the Stage body changes, and it now reads a field outside the old access set.
+    module_path.write_text(
+        _rerun_access_source('ctx.config.a + "-" + ctx.config.b'), encoding="utf-8"
+    )
+    pipeline = _load_pipeline(module_path, "rerun_access_demo")
+    with pytest.raises(RuntimeError, match="planned"):
+        run(
+            pipeline,
+            pipeline.Config(a="1", b="x"),
+            args=pipeline.Args(fail=True),
+            cli_out=output_base,
+        )
+
+    run(pipeline, pipeline.Config(a="1", b="y"), args=pipeline.Args(), cli_out=output_base)
+
+    assert (output_root / "part-0.txt").read_text(encoding="utf-8") == "1-y"
+    assert (output_root / "part-1.txt").read_text(encoding="utf-8") == "1-y"
+
+
+def test_source_change_recovers_precise_config_access(tmp_path: Path) -> None:
+    module_path = tmp_path / "access_heal.py"
+    module_path.write_text(
+        _rerun_access_source("str(sorted(ctx.config.model_dump()))"), encoding="utf-8"
+    )
+    pipeline = _load_pipeline(module_path, "access_heal_demo")
+    output_base = tmp_path / "out"
+    config = pipeline.Config(a="1", b="x")
+    run(pipeline, config, args=pipeline.Args(), cli_out=output_base)
+    store = Store(output_base / "main")
+    success = store.read_success("build")
+    assert success is not None and success.key_components.config_access is None
+
+    module_path.write_text(_rerun_access_source("ctx.config.a"), encoding="utf-8")
+    pipeline = _load_pipeline(module_path, "access_heal_demo")
+    run(pipeline, pipeline.Config(a="1", b="x"), args=pipeline.Args(), cli_out=output_base)
+
+    success = store.read_success("build")
+    assert success is not None and success.key_components.config_access == ["a"]

@@ -500,13 +500,11 @@ def _merge_config_access(
 
     if recorded is None:
         return None
-    if previous is None:
+    if previous is None or not previous.executed_source.matches(source):
         return recorded
     prev_access = previous.key_components.config_access
     if prev_access is None:
         return None
-    if not previous.executed_source.matches(source):
-        return recorded
     return sorted(set(prev_access) | set(recorded))
 
 
@@ -943,13 +941,18 @@ def _execution_probe(
     decision, partial, failure = probe.decision, probe._partial, probe.failure
     partial_adoption = None
 
+    previous = probe.previous
+    source_differs = review.relationship == "changed" or (
+        previous is not None and not previous.executed_source.matches(source_observation)
+    )
     if (
-        review.relationship == "changed"
+        source_differs
         and components.config_access is not None
         and (decision.status != "hit" or force)
     ):
-        # Reused changes may probe with the old access set, but execution must
-        # conservatively start from the whole Config and record a fresh set.
+        # Changed source (reviewed or rerun-only) may probe with the old access
+        # set, but execution must conservatively start from the whole Config and
+        # record a fresh set.
         projected_key, projected_partial = current_key, partial
         probe = _stage_decision(
             runtime,
