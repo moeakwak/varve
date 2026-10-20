@@ -357,7 +357,6 @@ def test_external_validation_rejects_a_non_current_recursive_ancestor(
                 rerun_source_fingerprint=record.executed_source.rerun.fingerprint,
                 review_source_fingerprint=record.executed_source.review.fingerprint,
                 started_at="test",
-                touched_existing=True,
             ),
         )
     elif ancestor_state == "stale":

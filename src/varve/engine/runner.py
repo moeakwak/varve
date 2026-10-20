@@ -711,7 +711,9 @@ def _stage_decision(
         previous=previous,
         source_observation=source_observation,
         source_review=review,
-        failure=failure,
+        # A failure under another input key is ignored by the decision, so do
+        # not surface it in status either.
+        failure=failure if failure is not None and failure.input_key == decision_key else None,
         _partial=partial,
         _artifacts_match=artifacts_match,
         _artifact_fingerprint=artifact_root,
@@ -1156,7 +1158,6 @@ async def _drive(
                 rerun_source_fingerprint=source_observation.rerun.fingerprint,
                 review_source_fingerprint=source_observation.review.fingerprint,
                 started_at=_now(),
-                touched_existing=previous is not None,
             ),
         )
         produces, outputs, artifact_root = await _materialize_stage(

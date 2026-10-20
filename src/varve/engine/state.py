@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from varve.keying.fingerprint import file_digest_view
-from varve.models import AttemptMarker, BatchRecord, KeyComponents, SuccessRecord
+from varve.models import AttemptMarker, BatchRecord, FailureRecord, KeyComponents, SuccessRecord
 
 ExecutionStatus = Literal[
     "hit",
@@ -129,8 +129,14 @@ def decide(
     partial: dict[int, BatchRecord] | None = None,
     output_exists: Callable[[str], bool] | None = None,
     artifacts_match: bool = True,
-    failure: object | None = None,
+    failure: FailureRecord | None = None,
 ) -> Decision:
+    # Failure and attempt records under another input key describe a different
+    # materialization; they must not shadow a valid success for this key.
+    if failure is not None and failure.input_key != current_key:
+        failure = None
+    if attempt is not None and attempt.input_key != current_key:
+        attempt = None
     outputs_exist = produces_exist
     if kind == "batch" and success is not None and success.input_key == current_key:
         assert success.outputs is not None

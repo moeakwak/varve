@@ -1139,15 +1139,17 @@ def test_top_level_and_bulk_review_routes_record_without_running(tmp_path: Path)
 
 
 @pytest.mark.parametrize(
-    ("decision", "expected_calls"),
+    ("decision", "expected_status", "expected_calls"),
     [
-        ("reuse", ["0", "1", "2"]),
-        ("invalidate", ["0", "1", "0", "1", "2"]),
+        ("reuse", "failed", ["0", "1", "2"]),
+        # Invalidate probes the whole-Config key, so the projected-key failure is ignored.
+        ("invalidate", "needs-run", ["0", "1", "0", "1", "2"]),
     ],
 )
 def test_review_decision_controls_batch_partial_reuse(
     tmp_path: Path,
     decision: ReviewAction,
+    expected_status: str,
     expected_calls: list[str],
 ) -> None:
     helper = tmp_path / "helper.py"
@@ -1189,7 +1191,7 @@ def test_review_decision_controls_batch_partial_reuse(
         args=pipeline.Args(),
         out=output_base / "main",
     )[0]
-    assert probe.decision.status == "failed"
+    assert probe.decision.status == expected_status
     assert probe.source_review == SourceReviewState("changed", decision)
     run(
         pipeline,

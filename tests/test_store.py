@@ -163,6 +163,27 @@ def test_store_rebuilds_older_schema_on_initialization(
     assert store.read_success("sample") is None
 
 
+def test_legacy_attempt_marker_with_touched_existing_is_readable(tmp_path: Path) -> None:
+    store = Store(tmp_path)
+    store.ensure_initialized("Demo")
+    path = store.root / "attempts" / "sample.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "input_key": "sha256:a",
+                "rerun_source_fingerprint": "rerun",
+                "review_source_fingerprint": "review",
+                "started_at": "now",
+                "touched_existing": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    marker = store.read_attempt("sample")
+    assert marker is not None and marker.input_key == "sha256:a"
+
+
 def test_attempt_and_partial_round_trip(tmp_path: Path) -> None:
     store = Store(tmp_path)
     store.ensure_initialized("Demo")
@@ -171,7 +192,6 @@ def test_attempt_and_partial_round_trip(tmp_path: Path) -> None:
         rerun_source_fingerprint="rerun",
         review_source_fingerprint="review",
         started_at="now",
-        touched_existing=False,
     )
     store.write_attempt("sample", marker)
     assert store.read_attempt("sample") == marker

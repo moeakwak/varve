@@ -677,3 +677,40 @@ def test_batch_stage_rejects_produces() -> None:
         @batch_stage(produces="out.txt")
         async def bad(self, ctx):  # pragma: no cover - decorator raises first
             yield ctx.out / "out.txt"
+
+
+class KeyFlipPipeline(Pipeline):
+    Config = Config
+    Args = Args
+
+    @stage(produces="flip.txt")
+    def build(self, ctx):
+        path = ctx.out / "flip.txt"
+        path.write_text(ctx.config.token, encoding="utf-8")
+        if ctx.args.fail_after is not None:
+            raise RuntimeError("planned failure")
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_other_key_failure_or_attempt_does_not_shadow_success(
+    tmp_path: Path, interrupt: bool
+) -> None:
+    run(KeyFlipPipeline, Config(token="a"), cli_out=tmp_path)
+    store = Store(_out(tmp_path))
+    success = store.read_success("build")
+    assert success is not None
+    with pytest.raises(RuntimeError, match="planned failure"):
+        run(KeyFlipPipeline, Config(token="b"), args=Args(fail_after=0), cli_out=tmp_path)
+    if interrupt:
+        store.clear_failure("build")
+    # The K1 attempt overwrote the K0 artifact, so going back is not a hit.
+    probe = probe_pipeline(KeyFlipPipeline, Config(token="a"), args=Args(), out=_out(tmp_path))[0]
+    assert probe.decision_key == success.input_key
+    assert (probe.decision.status, probe.decision.reason) == ("needs-run", "artifact-changed")
+    assert probe.failure is None
+
+    # With the K0 artifact intact again, the stale K1 records are ignored.
+    (_out(tmp_path) / "flip.txt").write_text("a", encoding="utf-8")
+    probe = probe_pipeline(KeyFlipPipeline, Config(token="a"), args=Args(), out=_out(tmp_path))[0]
+    assert (probe.decision.status, probe.decision.reason) == ("hit", "hit")
+    assert probe.failure is None

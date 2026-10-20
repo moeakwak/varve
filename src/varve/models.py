@@ -145,7 +145,14 @@ class AttemptMarker(VarveModel):
     rerun_source_fingerprint: str
     review_source_fingerprint: str
     started_at: str
-    touched_existing: bool
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_removed_fields(cls, data: Any) -> Any:
+        # Older stores wrote an unused `touched_existing` flag; accept and drop it.
+        if isinstance(data, dict) and "touched_existing" in data:
+            data = {key: value for key, value in data.items() if key != "touched_existing"}
+        return data
 
 
 class ReviewRecord(VarveModel):
