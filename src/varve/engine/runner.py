@@ -37,7 +37,12 @@ from varve.engine.state import (
     effective_reason,
     effective_status,
 )
-from varve.keying.config_access import ConfigAccess, RecordingConfig, project_config
+from varve.keying.config_access import (
+    ConfigAccess,
+    check_config,
+    project_config,
+    record_config,
+)
 from varve.keying.fingerprint import (
     FingerprintSession,
     artifact_fingerprint,
@@ -1134,7 +1139,7 @@ async def _drive(
         access = ConfigAccess()
         ctx = runtime.context(
             stage_spec,
-            config=RecordingConfig(runtime.config, access),
+            config=record_config(runtime.config, access),
             resume_skip=decision.resume_skip,
         )
         _validate_static_produces_location(stage_spec.produces, ctx)
@@ -1223,6 +1228,7 @@ def run(
     display_mode: RunDisplayMode = "auto",
     rehash: bool = False,
 ) -> list[StageOutcome]:
+    check_config(config)
     if args is None:
         args = pipeline.Args()
     out = pipeline.output_root(

@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from varve.decorators import StageSpec
 from varve.dependencies import Dependencies, DependencyContext
-from varve.keying.config_access import project_config
+from varve.keying.config_access import check_config, project_config
 from varve.keying.fingerprint import (
     FingerprintSession,
     file_digest_view,
@@ -23,11 +23,12 @@ _MATRIX_LAYOUT_VERSION = 2
 
 
 def config_data(config: Any) -> dict[str, Any]:
+    """Return the JSON view of a pydantic or dict Config used for keying."""
+
+    check_config(config)
     if isinstance(config, BaseModel):
         return config.model_dump(mode="json")
-    if isinstance(config, dict):
-        return config
-    return vars(config)
+    return config
 
 
 def compute_key_components(

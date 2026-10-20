@@ -69,6 +69,8 @@ branch or override value > environment > .env > field default
 
 Stage code reads it through `ctx.config`. Varve records which top-level fields each stage reads and, after the stage's first successful run, keys it only on those fields, so changing an unrelated field is still a hit. Operations that cannot be attributed to one field, such as `model_dump()` or iterating the whole model, conservatively depend on the complete Config. See [Config access projection](ARCHITECTURE.md#config-access-projection) for the exact two-phase keying.
 
+The generated CLI always builds a pydantic Config. Calling `varve.engine.runner.run()` programmatically also accepts a plain `dict` with string keys; any other Config type is rejected. During a stage run `ctx.config` is a read-only recording proxy: a pydantic proxy passes `isinstance(ctx.config, Config)` and can be assigned to pydantic fields annotated with the Config type, and a dict proxy is a real `dict`. `type(ctx.config)` still reveals the proxy. When code needs a plain object, for example an exact type check or a native serializer such as orjson, pass `ctx.config.model_copy()` or `dict(ctx.config)`; both depend on the whole Config.
+
 An optional `Args` pydantic model defines operational command-line flags for `run`, `status`, and `clean`:
 
 ```python
