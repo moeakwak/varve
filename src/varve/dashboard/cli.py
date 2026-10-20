@@ -238,7 +238,6 @@ def _add_dynamic_options(
     elif command in {"reuse", "invalidate"}:
         argmap.add_review_selection(parser)
     elif command == "clean":
-        parser.add_argument("--downstream", metavar="STAGE_SELECTOR", help=help_text)
         parser.add_argument("--yes", "-y", action="store_true")
 
 

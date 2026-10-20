@@ -128,13 +128,8 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
         help="Show concrete matrix cells or detailed stage state.",
     )
 
-    clean_parser = subparsers.add_parser("clean", help="delete selected store records and outputs")
+    clean_parser = subparsers.add_parser("clean", help="delete the whole branch output root")
     clean_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
-    clean_parser.add_argument(
-        "--downstream",
-        metavar="STAGE_SELECTOR",
-        help=f"Clean the selector and all downstream stages. {selector_help}",
-    )
     clean_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
     clean_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation.")
 

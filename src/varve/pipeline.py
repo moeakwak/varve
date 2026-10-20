@@ -135,10 +135,10 @@ class Pipeline:
 
     @classmethod
     def clean_roots(cls, config: Any) -> list[Path] | None:
-        """Optionally restrict full-clean (no target) to specific roots.
+        """Optionally restrict clean to specific roots.
 
         Returning None (default) keeps current behavior: only the dangerous blacklist
-        (/, home, cwd) and manifest anchor guard a full clean. Override to declare
+        (/, home, cwd) and manifest anchor guard a clean. Override to declare
         pipeline-specific allowed roots (for example, pipeline outputs and /tmp).
         """
         return None

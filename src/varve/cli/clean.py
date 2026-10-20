@@ -7,8 +7,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from varve.engine.runner import selected_stages
-from varve.matrix import PipelineGraph, build_graph
 from varve.pipeline import Pipeline
 from varve.store.lock import OutputLock
 from varve.store.store import Store
@@ -49,19 +47,6 @@ def _read_manifest_anchor(store: Store, pipeline: type[Pipeline]) -> None:
         raise ValueError(f"Varve manifest belongs to {manifest.pipeline}, not {pipeline.__name__}")
 
 
-def _validate_record_paths(root: Path, records: dict[str, Any]) -> None:
-    resolved_root = root.resolve()
-    outside = [
-        root / relative
-        for record in records.values()
-        for relative in record.paths
-        if not (root / relative).resolve().is_relative_to(resolved_root)
-    ]
-    if outside:
-        listed = ", ".join(str(path) for path in outside)
-        raise ValueError(f"Refusing to clean output outside root: {listed}")
-
-
 def clean(
     pipeline: type[Pipeline],
     config: Any,
@@ -69,12 +54,9 @@ def clean(
     cli_out: Path | None = None,
     branch: str = "main",
     is_temporary: bool = False,
-    target: str | None = None,
     yes: bool = False,
     allowed_roots: list[Path] | None = None,
     confirm: Callable[[str], bool] | None = None,
-    axes: dict[str, tuple[str, ...]] | None = None,
-    graph: PipelineGraph | None = None,
 ) -> None:
     root = pipeline.output_root(
         config,
@@ -85,31 +67,6 @@ def clean(
     store = Store(root)
     with OutputLock(store.root):
         _read_manifest_anchor(store, pipeline)
-
-        if target is None:
-            _validate_destructive(root, allowed_roots)
-            _confirm(f"Clean full varve output root {root}?", yes, confirm)
-            shutil.rmtree(root)
-            return
-
-        stage_names = selected_stages(graph or build_graph(pipeline, axes), downstream=target)
-        records = {
-            stage_name: record
-            for stage_name in stage_names
-            if (record := store.read_success(stage_name)) is not None
-        }
-        _validate_record_paths(root, records)
-        _confirm(f"Clean varve stage subtree {target}?", yes, confirm)
-
-        for stage_name, record in records.items():
-            for relative in record.paths:
-                path = root / relative
-                if path.is_dir():
-                    shutil.rmtree(path, ignore_errors=True)
-                else:
-                    path.unlink(missing_ok=True)
-        for stage_name in stage_names:
-            (store.root / "stages" / f"{stage_name}.json").unlink(missing_ok=True)
-            store.clear_attempt(stage_name)
-            store.clear_partial(stage_name)
-            store.clear_failure(stage_name)
+        _validate_destructive(root, allowed_roots)
+        _confirm(f"Clean full varve output root {root}?", yes, confirm)
+        shutil.rmtree(root)

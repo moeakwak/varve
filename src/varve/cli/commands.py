@@ -142,7 +142,6 @@ def dispatch_command(
             cli_out=context.resolved.output_base,
             branch=context.resolved.branch,
             is_temporary=context.resolved.is_temporary,
-            target=namespace.downstream,
             yes=namespace.yes,
             allowed_roots=(
                 None
@@ -150,8 +149,6 @@ def dispatch_command(
                 else context.pipeline.clean_roots(context.resolved.config)
             ),
             confirm=confirm,
-            axes=context.resolved.axes,
-            graph=context.graph,
         )
         return 0
     raise ValueError(f"Unknown command: {namespace.command}")

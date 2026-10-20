@@ -11,7 +11,6 @@ from pydantic import BaseModel
 
 from varve import Axis, Ctx, Pipeline, batch_stage, matrix, stage
 from varve.branch_config import resolve_branch
-from varve.cli.clean import clean
 from varve.command import resolved_command_context
 from varve.engine import runner as runner_module
 from varve.engine.runner import probe_pipeline, run, selected_stages
@@ -224,7 +223,7 @@ def test_matrix_callable_produces_records_the_cell_output_path(tmp_path: Path) -
     ]
 
 
-def test_matrix_artifact_existence_and_clean_use_recorded_paths(tmp_path: Path) -> None:
+def test_matrix_artifact_existence_uses_recorded_paths(tmp_path: Path) -> None:
     run(MatrixPipeline, Config(), cli_out=tmp_path)
     out = tmp_path / "main"
     missing = out / ".matrix" / "score" / "bench=a" / "model=small" / "score.txt"
@@ -236,9 +235,6 @@ def test_matrix_artifact_existence_and_clean_use_recorded_paths(tmp_path: Path) 
     assert repaired.status == "needs-run"
     assert repaired.reason == "artifact-missing"
     assert missing.exists()
-    clean(MatrixPipeline, Config(), cli_out=tmp_path, target="score", yes=True)
-    assert not missing.exists()
-    assert (out / ".matrix" / "source" / "bench=a" / "source.txt").exists()
 
 
 def test_matrix_absolute_output_must_stay_in_cell_directory(tmp_path: Path) -> None:

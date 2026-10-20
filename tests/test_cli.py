@@ -211,37 +211,6 @@ def test_cli_config_commands_with_unsupported_args_still_fast_fail(command: str)
         UnsupportedConfigPipeline.cli([command])
 
 
-def test_cli_clean_target_after_equals_option_does_not_clean_root(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    assert CliPipeline.cli(["run", f"--out={out}"]) == 0
-    root = out / "main"
-    extra = root / "extra.txt"
-    extra.write_text("extra", encoding="utf-8")
-
-    assert CliPipeline.cli(["clean", f"--out={out}", "--downstream", "sample", "--yes"]) == 0
-    assert root.exists()
-    assert extra.exists()
-    assert not (root / "sample.txt").exists()
-
-
-def test_cli_clean_target_after_nested_bool_option_does_not_clean_root(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    assert NestedCliPipeline.cli(["run", f"--out={out}"]) == 0
-    root = out / "main"
-    extra = root / "extra.txt"
-    extra.write_text("extra", encoding="utf-8")
-
-    assert (
-        NestedCliPipeline.cli(
-            ["clean", f"--out={out}", "--no-inner.enabled", "--downstream", "sample", "--yes"]
-        )
-        == 0
-    )
-    assert root.exists()
-    assert extra.exists()
-    assert not (root / "sample.txt").exists()
-
-
 def test_cli_command_args_do_not_pollute_conflicting_args_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -570,7 +539,6 @@ def test_cli_root_help_lists_only_unified_commands(capsys) -> None:
     [
         ("run", "--only STAGE_SELECTOR"),
         ("status", "STAGE_SELECTOR"),
-        ("clean", "--downstream STAGE_SELECTOR"),
         ("plan", "--only STAGE_SELECTOR"),
     ],
 )

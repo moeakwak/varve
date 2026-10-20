@@ -157,8 +157,10 @@ def test_top_level_subcommand_help_uses_unified_surface(command: str, capsys) ->
         assert "MODULE" in output and "--all" in output
     elif command in {"status", "plan", "clean"}:
         assert "MODULE" in output
-    if command in {"status", "run", "plan", "clean"}:
+    if command in {"status", "run", "plan"}:
         assert "STAGE_SELECTOR" in output
+    if command == "clean":
+        assert "--downstream" not in output
     if command in {"reuse", "invalidate"}:
         assert "--stage BASE_STAGE" in output
 

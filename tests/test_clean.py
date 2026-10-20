@@ -5,11 +5,9 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from varve import Axis, Pipeline, matrix, stage
+from varve import Pipeline, stage
 from varve.cli.clean import _validate_destructive, clean
 from varve.engine.runner import run
-from varve.matrix import build_graph
-from varve.models import ProducedPath, ReviewRecord, SourceFingerprint
 from varve.store.lock import OutputLock
 from varve.store.store import Store
 
@@ -38,32 +36,6 @@ class RestrictedCleanPipeline(CleanPipeline):
     @classmethod
     def clean_roots(cls, config: Config) -> list[Path] | None:
         return [Path("/tmp/varve-allowed-results")]
-
-
-BENCH = Axis("bench", ["a", "b"])
-MODEL = Axis("model", ["x", "y"])
-
-
-class MatrixCleanPipeline(Pipeline):
-    Config = Config
-
-    @matrix(BENCH)
-    @stage(produces="prepare.txt")
-    def prepare(self, ctx, *, bench: str):
-        ctx.cell_out.mkdir(parents=True, exist_ok=True)
-        (ctx.cell_out / "prepare.txt").write_text(bench, encoding="utf-8")
-
-    @matrix(BENCH, MODEL)
-    @stage(needs="prepare", produces="score.txt")
-    def score(self, ctx, *, bench: str, model: str):
-        ctx.cell_out.mkdir(parents=True, exist_ok=True)
-        (ctx.cell_out / "score.txt").write_text(f"{bench}:{model}", encoding="utf-8")
-
-    @matrix(BENCH)
-    @stage(needs="score", produces="report.txt")
-    def report(self, ctx, *, bench: str):
-        ctx.cell_out.mkdir(parents=True, exist_ok=True)
-        (ctx.cell_out / "report.txt").write_text(bench, encoding="utf-8")
 
 
 def test_validate_destructive_rejects_dangerous_paths(tmp_path: Path) -> None:
@@ -113,41 +85,11 @@ def test_clean_yes_skips_confirm_callback(tmp_path: Path) -> None:
     assert not root.exists()
 
 
-def test_clean_target_keeps_upstream(tmp_path: Path) -> None:
-    run(CleanPipeline, Config(), cli_out=tmp_path)
-    clean(CleanPipeline, Config(), cli_out=tmp_path, target="summarize", yes=True)
-    root = tmp_path / "main"
-    assert (root / "sample.txt").exists()
-    assert not (root / "summary.txt").exists()
-
-
 def test_clean_respects_output_lock(tmp_path: Path) -> None:
     run(CleanPipeline, Config(), cli_out=tmp_path)
     with OutputLock(Store(tmp_path / "main").root):
         with pytest.raises(RuntimeError, match="already locked"):
             clean(CleanPipeline, Config(), cli_out=tmp_path, yes=True)
-
-
-def test_clean_target_preflights_external_outputs(tmp_path: Path) -> None:
-    run(CleanPipeline, Config(), cli_out=tmp_path)
-    root = tmp_path / "main"
-    record = Store(root).read_success("summarize")
-    assert record is not None
-    assert record.produces is not None
-    record.produces = [
-        ProducedPath(
-            path="/tmp/outside-varve.txt",
-            kind="file",
-            artifact=record.produces[0].artifact.model_copy(
-                update={"root": "/tmp/outside-varve.txt"}
-            ),
-        )
-    ]
-    Store(root).write_success(record)
-
-    with pytest.raises(ValueError, match="outside root"):
-        clean(CleanPipeline, Config(), cli_out=tmp_path, target="sample", yes=True)
-    assert (root / "sample.txt").exists()
 
 
 def test_default_clean_roots_does_not_restrict_full_clean(tmp_path: Path) -> None:
@@ -238,77 +180,3 @@ def test_cli_clean_full_output_root_rejects_outside_clean_roots(tmp_path: Path) 
     with pytest.raises(ValueError, match="outside allowed roots"):
         RestrictedCleanPipeline.cli(["clean", f"--out={out}", "--yes"])
     assert (out / "main").exists()
-
-
-def test_cli_clean_target_ignores_clean_roots_restriction(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    assert RestrictedCleanPipeline.cli(["run", f"--out={out}"]) == 0
-
-    assert (
-        RestrictedCleanPipeline.cli(["clean", f"--out={out}", "--downstream", "summarize", "--yes"])
-        == 0
-    )
-    root = out / "main"
-    assert root.exists()
-    assert (root / "sample.txt").exists()
-    assert not (root / "summary.txt").exists()
-
-
-def test_clean_partial_matrix_selector_deletes_only_matching_descendants(
-    tmp_path: Path,
-) -> None:
-    run(MatrixCleanPipeline, Config(), cli_out=tmp_path)
-    store = Store(tmp_path / "main")
-    store.write_review(
-        "score",
-        ReviewRecord(
-            review_fingerprint="review",
-            review_observation=SourceFingerprint(fingerprint="review", files=[]),
-            decision="invalidate",
-            decided_at="2026-07-14T00:00:00+00:00",
-        ),
-    )
-    root = tmp_path / "main" / ".matrix"
-
-    clean(
-        MatrixCleanPipeline,
-        Config(),
-        cli_out=tmp_path,
-        target="score@bench=a",
-        yes=True,
-    )
-
-    assert (root / "prepare" / "bench=a" / "prepare.txt").exists()
-    assert (root / "prepare" / "bench=b" / "prepare.txt").exists()
-    assert not (root / "score" / "bench=a" / "model=x" / "score.txt").exists()
-    assert not (root / "score" / "bench=a" / "model=y" / "score.txt").exists()
-    assert (root / "score" / "bench=b" / "model=x" / "score.txt").exists()
-    assert (root / "score" / "bench=b" / "model=y" / "score.txt").exists()
-    assert not (root / "report" / "bench=a" / "report.txt").exists()
-    assert (root / "report" / "bench=b" / "report.txt").exists()
-    assert store.read_review("score") is not None
-
-
-def test_clean_inactive_partial_selector_fails_before_confirmation(tmp_path: Path) -> None:
-    axes = {"bench": ("a",), "model": ("x", "y")}
-    graph = build_graph(MatrixCleanPipeline, axes)
-    run(MatrixCleanPipeline, Config(), cli_out=tmp_path, axes=axes, graph=graph)
-    confirmation_requested = False
-
-    def confirm(message: str) -> bool:
-        nonlocal confirmation_requested
-        confirmation_requested = True
-        return True
-
-    with pytest.raises(ValueError, match="declared but inactive"):
-        clean(
-            MatrixCleanPipeline,
-            Config(),
-            cli_out=tmp_path,
-            target="score@bench=b",
-            confirm=confirm,
-            axes=axes,
-            graph=graph,
-        )
-    assert confirmation_requested is False
-    assert (tmp_path / "main" / ".matrix" / "score" / "bench=a").exists()

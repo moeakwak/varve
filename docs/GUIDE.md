@@ -114,7 +114,7 @@ def normalize(self, ctx: Ctx) -> None:
 
 `ctx.input("extract")` requires exactly one recorded upstream artifact. `ctx.inputs("extract")` always returns `list[Path]` and is appropriate for stages or matrix fan-in that produce several artifacts. Reading an undeclared upstream fails because its artifact fingerprint would otherwise be absent from the downstream input key.
 
-Varve fingerprints managed output contents before committing a successful stage and checks them again when evaluating its record. Missing and changed artifacts produce `needs-run` with `artifact-missing` or `artifact-changed`. Stage code may write unrecorded scratch files, but varve does not track, expose, or remove them during per-stage clean.
+Varve fingerprints managed output contents before committing a successful stage and checks them again when evaluating its record. Missing and changed artifacts produce `needs-run` with `artifact-missing` or `artifact-changed`. Stage code may write unrecorded scratch files, but varve does not track or expose them.
 
 The stage materialization fingerprint preserves the order exposed by `ctx.inputs()`: declaration order for ordinary `produces`, and batch index plus yield order within each index for batch stages. Reordering the same artifact set therefore invalidates downstream consumers whose positional input changed.
 
@@ -288,9 +288,9 @@ Branches may activate a subset of each Axis by canonical id. Omitted axes use th
 
 ### Matrix selection and display
 
-Execution, status, plan, and clean selectors use `STAGE` or `STAGE@AXIS=VALUE[,AXIS=VALUE...]`. A bare Matrix base selects all active Cells, a partial selector filters the named axes and treats omitted axes as wildcards, and full coordinates select one Cell. Axis input order does not matter, but canonical selectors always follow declaration order. Review commands are intentionally different: `--stage` accepts only ordinary or Matrix base Stage names because a Review Decision always covers the whole logical Stage. A coordinate target fails before any write and reports the copyable base name.
+Execution, status, and plan selectors use `STAGE` or `STAGE@AXIS=VALUE[,AXIS=VALUE...]`. A bare Matrix base selects all active Cells, a partial selector filters the named axes and treats omitted axes as wildcards, and full coordinates select one Cell. Axis input order does not matter, but canonical selectors always follow declaration order. Review commands are intentionally different: `--stage` accepts only ordinary or Matrix base Stage names because a Review Decision always covers the whole logical Stage. A coordinate target fails before any write and reports the copyable base name.
 
-`run --only score@bench=a` selects the matching active score Cells without automatically running their upstreams; external upstreams must already be current. `--upto`, `--downstream`, and `--only` are mutually exclusive and apply their respective closure after the shared resolver returns concrete seeds. `clean --downstream` applies descendant closure, while status applies no implicit upstream or downstream expansion. Repeated Review base targets form a topology-ordered stable union. `--slice axis=id` remains a separate temporary-run constraint across selected stages and their aligned upstream closure.
+`run --only score@bench=a` selects the matching active score Cells without automatically running their upstreams; external upstreams must already be current. `--upto`, `--downstream`, and `--only` are mutually exclusive and apply their respective closure after the shared resolver returns concrete seeds. Status applies no implicit upstream or downstream expansion. Repeated Review base targets form a topology-ordered stable union. `--slice axis=id` remains a separate temporary-run constraint across selected stages and their aligned upstream closure.
 
 `run` opens with a short base-Stage `Run order:` summary that always folds Matrix Cells and never prints concrete Cell names. Lifecycle logs and the outcome table still share one display policy: in automatic mode, large matrix groups fold to a single summary line, while small groups and groups with known slow cells stay expanded. `run --expand` and `run --compact` control only those later views; failures and slow cells keep their concrete identities, and `-v` keeps concrete lifecycle and key diagnostics. The exact fold thresholds live in [Matrix graph expansion](ARCHITECTURE.md#matrix-graph-expansion).
 
@@ -386,10 +386,10 @@ ls
 ### clean
 
 ```text
-clean [--branch NAME] [--downstream STAGE_SELECTOR] [--out PATH] [--yes]
+clean [--branch NAME] [--out PATH] [--yes]
 ```
 
-Without `--downstream`, clean removes the complete selected output root after confirmation. With a selector, it deletes recorded artifacts and store state for the concrete seeds and their descendants. Clean does not infer ownership from filenames; it relies on manifest anchors and recorded paths.
+Clean removes the complete selected branch output root after confirmation. To invalidate one stage and everything that consumes it, rerun with `run --downstream STAGE --force` instead.
 
 All commands accept the global `-v` or `--verbose` flag before the command. Generated Args flags are available on `run`, `status`, `plan`, `reuse`, `invalidate`, and `clean`.
 
@@ -427,11 +427,9 @@ Bulk run reports separate counts for executed branches (including failed attempt
 
 ## Clean safety and recovery
 
-All clean operations require a valid `.varve/manifest.json` anchor. Full clean rejects dangerous roots such as `/`, the home directory, and the current working directory. Override `Pipeline.clean_roots(config)` to restrict full clean further for a particular pipeline.
+Clean requires a valid `.varve/manifest.json` anchor and rejects dangerous roots such as `/`, the home directory, and the current working directory. Override `Pipeline.clean_roots(config)` to restrict clean further for a particular pipeline. Clean also removes every ReviewRecord together with the output root.
 
-Per-stage clean removes only recorded managed artifacts and the selected concrete stages' success, attempt, failure, and partial state. Paths are checked against the branch output root, and Matrix artifacts remain contained by their Cell roots. Targeted ordinary, Matrix base, and partial-selector clean preserve the shared base Stage ReviewRecord because inactive Cells may still need that decision when reactivated. Full store clean removes every ReviewRecord with the output root.
-
-If a stage body raises after its attempt begins, Varve records a `FailureRecord` and reports `failed`; a matching batch partial also reports its resumable progress. If a process exits without recording that failure, a valid partial reports `resume`, while a bare attempt reports `needs-run · interrupted`. Running the pipeline again retries an ordinary failure or continues eligible batch indexes. Failure and attempt records belong to the input key they ran under: when Config or inputs return to a key whose success is still valid, the stage is a `hit` again, or `artifact-changed` if the abandoned attempt overwrote its artifacts. If a successful artifact was deleted, rerun rebuilds the `artifact-missing` stage. Use `clean --downstream STAGE` when intentional invalidation should remove both one stage and all materializations that consume it.
+If a stage body raises after its attempt begins, Varve records a `FailureRecord` and reports `failed`; a matching batch partial also reports its resumable progress. If a process exits without recording that failure, a valid partial reports `resume`, while a bare attempt reports `needs-run · interrupted`. Running the pipeline again retries an ordinary failure or continues eligible batch indexes. Failure and attempt records belong to the input key they ran under: when Config or inputs return to a key whose success is still valid, the stage is a `hit` again, or `artifact-changed` if the abandoned attempt overwrote its artifacts. If a successful artifact was deleted, rerun rebuilds the `artifact-missing` stage. Use `run --downstream STAGE --force` when one stage and all materializations that consume it should be rebuilt intentionally.
 
 ## Limitations
 
