@@ -202,6 +202,8 @@ class Demo(Pipeline):
     @batch_stage(depends=Dependencies(review_sources=[Path("helper.py")]))
     async def build(self, ctx):
         async for index, item in ctx.resume(range(3), progress=False):
+            if ctx.args.fail and index == 1:
+                raise RuntimeError("planned")
             if index == 0:
                 _ = ctx.config.special
             with (ctx.out / "calls.txt").open("a", encoding="utf-8") as stream:
@@ -209,8 +211,6 @@ class Demo(Pipeline):
             path = ctx.out / f"part-{index}.txt"
             path.write_text(str(item), encoding="utf-8")
             yield path
-            if ctx.args.fail and index == 0:
-                raise RuntimeError("planned")
 """
 
 
@@ -280,14 +280,14 @@ class Demo(Pipeline):
     )
     async def build(self, ctx):
         async for index, item in ctx.resume(range(3), progress=False):
+            if ctx.args.fail_after is not None and index > ctx.args.fail_after:
+                raise RuntimeError("planned failure")
             calls = ctx.out / "calls.txt"
             with calls.open("a", encoding="utf-8") as stream:
                 stream.write(f"{index}\\n")
             path = ctx.out / f"part-{index}.txt"
             path.write_text(str(item), encoding="utf-8")
             yield path
-            if ctx.args.fail_after is not None and index >= ctx.args.fail_after:
-                raise RuntimeError("planned failure")
 """
 
 
@@ -1219,11 +1219,11 @@ class Demo(Pipeline):
     @batch_stage()
     async def build(self, ctx):
         async for index, item in ctx.resume(range(2), progress=False):
+            if ctx.args.fail and index == 1:
+                raise RuntimeError("planned")
             path = ctx.out / f"part-{{index}}.txt"
             path.write_text({body}, encoding="utf-8")
             yield path
-            if ctx.args.fail and index == 0:
-                raise RuntimeError("planned")
 """
 
 

@@ -57,6 +57,9 @@ class Ctx(Generic[ConfigT, ArgsT]):
         self._current_batch_index: int | None = None
         self._used_resume = False
         self._resume_total: int | None = None
+        self._yielded_outside_resume = False
+        # Runner hook called once the stage body finishes one resume index.
+        self._on_batch_complete: Callable[[int], None] | None = None
 
     def _check_declared_need(self, stage: str) -> None:
         if self._declared_needs is None or stage in self._declared_needs:
@@ -118,6 +121,11 @@ class Ctx(Generic[ConfigT, ArgsT]):
         downstream stage when shape matters.
         """
 
+        if self._yielded_outside_resume:
+            raise RuntimeError(
+                f"Batch stage {self._stage_name!r} yielded before ctx.resume(); "
+                "yield outputs only inside the ctx.resume() loop."
+            )
         self._used_resume = True
         inferred_total = total if total is not None else _len_or_none(iterable)
         self._resume_total = inferred_total
@@ -149,10 +157,14 @@ class Ctx(Generic[ConfigT, ArgsT]):
                     continue
                 self._current_batch_index = index
                 yield index, item
+                self._current_batch_index = None
+                if self._on_batch_complete is not None:
+                    self._on_batch_complete(index)
                 if progress_handle is not None:
                     if postfix is not None:
                         progress_handle.set_postfix_str(postfix(item))
                     progress_handle.update(1)
         finally:
+            self._current_batch_index = None
             if progress_handle is not None:
                 progress_handle.close()

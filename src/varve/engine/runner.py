@@ -868,6 +868,27 @@ async def _materialize_stage(
     }
     partial_enabled = True
     saw_yield = False
+
+    def complete_batch(index: int) -> None:
+        # Checkpoint an index only after its body finished, so a crash between
+        # two yields of one index cannot resume with part of its outputs.
+        if not partial_enabled:
+            return
+        # An index that yielded nothing is still complete.
+        yielded = outputs_by_index.setdefault(index, [])
+        store.write_batch(
+            stage_spec.name,
+            current_key,
+            BatchRecord(
+                index=index,
+                yielded=yielded,
+                artifacts=[_fresh_artifact(runtime, item) for item in yielded],
+                committed_at=_now(),
+                total=ctx._resume_total,
+            ),
+        )
+
+    ctx._on_batch_complete = complete_batch
     batch_iterator = _execute_batch(instance, stage_spec, ctx).__aiter__()
     while True:
         try:
@@ -878,6 +899,15 @@ async def _materialize_stage(
             _record_stage_failure(runtime, stage_spec.name, error)
             raise
         saw_yield = True
+        if yielded_index is None and ctx._used_resume:
+            error = RuntimeError(
+                f"Batch stage {stage_spec.name!r} yielded after its ctx.resume() loop; "
+                "yield outputs only inside the ctx.resume() loop."
+            )
+            _record_stage_failure(runtime, stage_spec.name, error)
+            raise error
+        if not ctx._used_resume:
+            ctx._yielded_outside_resume = True
         if not ctx._used_resume and partial_enabled:
             warnings.warn(
                 f"batch stage {stage_spec.name!r} yielded without iterating ctx.resume; "
@@ -899,19 +929,7 @@ async def _materialize_stage(
                 cwd_hint=True,
             )
             yielded.append(relative)
-        if partial_enabled:
-            store.write_batch(
-                stage_spec.name,
-                current_key,
-                BatchRecord(
-                    index=index,
-                    yielded=yielded,
-                    artifacts=[_fresh_artifact(runtime, item) for item in yielded],
-                    committed_at=_now(),
-                    total=ctx._resume_total,
-                ),
-            )
-        outputs_by_index[index] = yielded
+        outputs_by_index.setdefault(index, []).extend(yielded)
     if not ctx._used_resume:
         store.clear_partial(stage_spec.name, current_key)
         if not saw_yield:

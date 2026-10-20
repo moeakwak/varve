@@ -220,7 +220,7 @@ Resume is positional. Varve records completed indexes under the execution input 
 
 A successful batch record is not resumable partial state. If one of its managed artifacts is missing, the stage reports `needs-run · artifact-missing` and starts from the beginning; remaining success outputs are not silently reused as checkpoints.
 
-`ctx.resume()` can show tqdm progress and accepts `desc`, `total`, `unit`, and a `postfix` callable. An item may yield zero or several paths. Varve records the completed index but does not validate item-level output shape; validate shape in a downstream stage when it matters.
+`ctx.resume()` can show tqdm progress and accepts `desc`, `total`, `unit`, and a `postfix` callable. An item may yield zero or several paths; every yield belongs to the index currently being iterated. Varve checkpoints an index once its loop body finishes and asks for the next item, so a failure between two yields of the same index reruns that whole index. Varve does not validate item-level output shape; validate shape in a downstream stage when it matters. Once a stage iterates `ctx.resume()`, yielding before that loop starts or after it ends fails the stage.
 
 A batch stage that yields without iterating `ctx.resume()` is allowed but non-resumable. Varve warns, does not retain resumable partial state for that run, and starts the stage body again after failure.
 

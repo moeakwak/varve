@@ -45,14 +45,14 @@ class ToyPipeline(Pipeline):
     async def transform(self, ctx):
         items = list(range(4))
         async for index, item in ctx.resume(items):
+            if ctx.args.fail_after is not None and index > ctx.args.fail_after:
+                raise RuntimeError("planned failure")
             path = ctx.out / "transform" / f"part-{index}.txt"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
                 f"{item}:{ctx.input('sample').read_text(encoding='utf-8')}", encoding="utf-8"
             )
             yield path
-            if ctx.args.fail_after is not None and index >= ctx.args.fail_after:
-                raise RuntimeError("planned failure")
 
     @stage(needs="transform", produces="summary.txt")
     def summarize(self, ctx):
@@ -471,6 +471,73 @@ def test_batch_multi_output_index_requires_all_paths(tmp_path: Path) -> None:
         (1, "1-left.txt"),
         (1, "1-right.txt"),
     ]
+
+
+class RepeatedYieldBatchPipeline(Pipeline):
+    Config = Config
+    Args = Args
+
+    @batch_stage()
+    async def split(self, ctx):
+        async for index, _ in ctx.resume(range(2), progress=False):
+            for side in ("left", "right"):
+                path = ctx.out / f"{index}-{side}.txt"
+                path.write_text(side, encoding="utf-8")
+                yield path
+                if ctx.args.fail_after is not None and index > ctx.args.fail_after:
+                    raise RuntimeError("planned failure")
+
+
+def test_batch_repeated_yields_in_one_index_keep_every_output(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="planned failure"):
+        run(RepeatedYieldBatchPipeline, Config(), args=Args(fail_after=0), cli_out=tmp_path)
+    store = Store(_out(tmp_path))
+    attempt = store.read_attempt("split")
+    assert attempt is not None
+    # Index 1 failed between its two yields, so only index 0 is checkpointed.
+    partial = store.read_partial("split", attempt.input_key)
+    assert {index: batch.yielded for index, batch in partial.items()} == {
+        0: ["0-left.txt", "0-right.txt"]
+    }
+
+    run(RepeatedYieldBatchPipeline, Config(), cli_out=tmp_path)
+    record = store.read_success("split")
+    assert record is not None and record.outputs is not None
+    assert [(output.index, output.path) for output in record.outputs] == [
+        (0, "0-left.txt"),
+        (0, "0-right.txt"),
+        (1, "1-left.txt"),
+        (1, "1-right.txt"),
+    ]
+
+
+@pytest.mark.parametrize("placement", ["before", "after"])
+def test_batch_yield_outside_resume_loop_fails(tmp_path: Path, placement: str) -> None:
+    class OutsideYieldPipeline(Pipeline):
+        Config = Config
+
+        @batch_stage()
+        async def build(self, ctx):
+            if placement == "before":
+                yield ctx.out / "early.txt"
+            async for index, _ in ctx.resume(range(1), progress=False):
+                path = ctx.out / f"part-{index}.txt"
+                path.write_text("part", encoding="utf-8")
+                yield path
+            summary = ctx.out / "summary.txt"
+            summary.write_text("summary", encoding="utf-8")
+            yield summary
+
+    (tmp_path / "main").mkdir()
+    (tmp_path / "main" / "early.txt").write_text("early", encoding="utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(RuntimeError, match=f"yielded {placement}"):
+            run(OutsideYieldPipeline, Config(), cli_out=tmp_path)
+
+    failure = Store(_out(tmp_path)).read_failure("build")
+    assert failure is not None
+    assert failure.exception_type == "RuntimeError"
 
 
 def test_batch_rejects_cwd_relative_output_with_actionable_error(
