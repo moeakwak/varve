@@ -10,7 +10,6 @@ from pydantic import BaseModel
 
 from varve import Dependencies, Pipeline, batch_stage, stage
 from varve.engine.runner import (
-    evaluate_state,
     probe_pipeline,
     record_source_review,
     run,
@@ -257,9 +256,9 @@ def test_runner_hit_stale_and_artifact_missing(tmp_path: Path) -> None:
     assert repaired[-1].reason == "artifact-missing"
 
 
-def test_evaluate_state_does_not_initialize_store(tmp_path: Path) -> None:
-    outcomes = evaluate_state(ToyPipeline, Config(), cli_out=tmp_path)
-    assert [outcome.status for outcome in outcomes] == ["needs-run"] * 3
+def test_probe_does_not_initialize_store(tmp_path: Path) -> None:
+    probes = probe_pipeline(ToyPipeline, Config(), args=Args(), out=_out(tmp_path))
+    assert [probe.decision.status for probe in probes] == ["needs-run"] * 3
     assert not (_out(tmp_path) / ".varve").exists()
 
 
@@ -305,11 +304,11 @@ def test_run_persists_stage_elapsed(
     assert record.elapsed >= 0
 
 
-def test_evaluate_state_propagates_current_upstream_keys(tmp_path: Path) -> None:
+def test_probe_propagates_current_upstream_keys(tmp_path: Path) -> None:
     run(ToyPipeline, Config(token="a"), cli_out=tmp_path)
-    dry = evaluate_state(ToyPipeline, Config(token="b"), cli_out=tmp_path)
+    dry = probe_pipeline(ToyPipeline, Config(token="b"), args=Args(), out=_out(tmp_path))
     actual = run(ToyPipeline, Config(token="b"), cli_out=tmp_path)
-    assert [outcome.status for outcome in dry] == ["needs-run", "hit", "hit"]
+    assert [probe.decision.status for probe in dry] == ["needs-run", "hit", "hit"]
     assert [outcome.status for outcome in actual] == ["needs-run"] * 3
 
 

@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from varve import Axis, Dependencies, Pipeline, batch_stage, matrix, stage
 from varve.engine import runner as runner_module
-from varve.engine.runner import _KeyingSession, evaluate_state, probe_pipeline, run
+from varve.engine.runner import _KeyingSession, probe_pipeline, run
 from varve.keying.fingerprint import FingerprintSession, file_fingerprint
 from varve.keying.keys import input_key
 from varve.keying.source import SourceFingerprintSession
@@ -240,15 +240,14 @@ def test_probe_without_upstream_record_keeps_source_fingerprint(tmp_path: Path) 
 
 
 def test_status_missing_upstream_is_needs_run(tmp_path: Path) -> None:
-    outcomes = evaluate_state(
+    probes = probe_pipeline(
         MissingUpstreamStrictUsesPipeline,
         Config(),
-        downstream="downstream",
-        cli_out=tmp_path,
+        args=MissingUpstreamStrictUsesPipeline.Args(),
+        out=tmp_path / "main",
     )
-    assert [(outcome.stage, outcome.status) for outcome in outcomes] == [
-        ("downstream", "needs-run")
-    ]
+    downstream = next(probe for probe in probes if probe.stage == "downstream")
+    assert downstream.decision.status == "needs-run"
 
 
 def test_probe_shares_matrix_template_source_fingerprint(tmp_path: Path) -> None:

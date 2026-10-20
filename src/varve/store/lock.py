@@ -22,21 +22,6 @@ def _unlock_file(fd: int) -> None:
     fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-def is_stale_lock(varve_root: Path) -> bool:
-    path = varve_root / "lock"
-    try:
-        fd = os.open(path, os.O_RDWR)
-    except FileNotFoundError:
-        return False
-    try:
-        if not _try_file_lock(fd):
-            return False
-        _unlock_file(fd)
-        return True
-    finally:
-        os.close(fd)
-
-
 def _same_file(fd: int, path: Path) -> bool:
     try:
         path_stat = path.stat()

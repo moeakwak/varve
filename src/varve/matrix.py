@@ -9,6 +9,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from difflib import get_close_matches
 from enum import Enum
+from functools import cached_property
 from graphlib import TopologicalSorter
 from itertools import product
 from pathlib import Path
@@ -115,9 +116,13 @@ class PipelineGraph:
     base_cells: Mapping[str, tuple[str, ...]]
     axes: Mapping[str, tuple[str, ...]]
 
-    def topo_order(self) -> list[str]:
+    @cached_property
+    def _topo_order(self) -> tuple[str, ...]:
         dependencies = {name: set(spec.needs) for name, spec in self.stages.items()}
-        return list(TopologicalSorter(dependencies).static_order())
+        return tuple(TopologicalSorter(dependencies).static_order())
+
+    def topo_order(self) -> list[str]:
+        return list(self._topo_order)
 
     def names_for(self, name: str) -> tuple[str, ...]:
         return self.resolve_selector(name).concrete_stages
