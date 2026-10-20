@@ -164,18 +164,45 @@ def test_stage_exception_persists_failure_record(tmp_path: Path) -> None:
     assert probe.failure == failure
 
 
-def test_artifact_fingerprint_error_is_not_recorded_as_stage_failure(tmp_path: Path) -> None:
+def test_artifact_fingerprint_error_is_recorded_as_stage_failure(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Symlinks are not supported in managed artifacts"):
         run(InvalidArtifactPipeline, Config(), cli_out=tmp_path)
 
     store = Store(tmp_path / "main")
-    assert store.read_failure("build") is None
-    assert store.read_attempt("build") is not None
+    failure = store.read_failure("build")
+    assert failure is not None
+    assert failure.exception_type == "ValueError"
+    assert "Symlinks are not supported in managed artifacts" in failure.message
     probe = probe_pipeline(
         InvalidArtifactPipeline,
         Config(),
         args=InvalidArtifactPipeline.Args(),
         out=tmp_path / "main",
     )[0]
-    assert probe.decision.status == "error"
-    assert "Symlinks are not supported in managed artifacts" in probe.decision.reason
+    assert probe.decision.status == "failed"
+    assert probe.failure == failure
+
+
+class MissingProducesPipeline(Pipeline):
+    Config = Config
+
+    @stage(produces="missing.txt")
+    def build(self, ctx):
+        pass
+
+
+def test_missing_declared_output_is_recorded_as_stage_failure(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="Declared varve output does not exist"):
+        run(MissingProducesPipeline, Config(), cli_out=tmp_path)
+
+    failure = Store(tmp_path / "main").read_failure("build")
+    assert failure is not None
+    assert failure.exception_type == "FileNotFoundError"
+    assert "missing.txt" in failure.message
+    probe = probe_pipeline(
+        MissingProducesPipeline,
+        Config(),
+        args=MissingProducesPipeline.Args(),
+        out=tmp_path / "main",
+    )[0]
+    assert probe.decision.status == "failed"

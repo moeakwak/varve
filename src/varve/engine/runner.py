@@ -805,17 +805,6 @@ def probe_pipeline(
                 known_upstream_fingerprints=known_upstream_fingerprints,
                 source_observation=source_observation,
             )
-            attempt = store.read_attempt(stage_name)
-            if (
-                probe.previous is None
-                and attempt is not None
-                and store.read_failure(stage_name) is None
-                and stage_spec.kind == "single"
-            ):
-                try:
-                    _produced_paths(stage_spec.produces, runtime.context(stage_spec))
-                except FileNotFoundError:
-                    pass
         except Exception as error:  # noqa: BLE001 - status must retain evaluation errors.
             probe = _unavailable_probe(
                 stage_name,
@@ -855,15 +844,30 @@ async def _materialize_stage(
     partial: dict[int, BatchRecord] | None,
     current_key: str,
 ) -> tuple[list[ProducedPath] | None, list[OutputHandle] | None, str]:
+    # Invalid or missing outputs fail the stage just like a raising body.
+    try:
+        return await _materialize_stage_outputs(
+            runtime, instance, stage_spec, ctx, decision, partial, current_key
+        )
+    except Exception as error:
+        _record_stage_failure(runtime, stage_spec.name, error)
+        raise
+
+
+async def _materialize_stage_outputs(
+    runtime: _Runtime,
+    instance: Pipeline,
+    stage_spec,
+    ctx: Ctx,
+    decision: Decision,
+    partial: dict[int, BatchRecord] | None,
+    current_key: str,
+) -> tuple[list[ProducedPath] | None, list[OutputHandle] | None, str]:
     if stage_spec.kind == "single":
-        try:
-            coordinates = {axis.name: value for axis, value in stage_spec.cell}
-            result = stage_spec.func(instance, ctx, **coordinates)
-            if inspect.isawaitable(result):
-                await result
-        except Exception as error:
-            _record_stage_failure(runtime, stage_spec.name, error)
-            raise
+        coordinates = {axis.name: value for axis, value in stage_spec.cell}
+        result = stage_spec.func(instance, ctx, **coordinates)
+        if inspect.isawaitable(result):
+            await result
         produces = _produced_paths(stage_spec.produces, ctx)
         return produces, None, artifacts_root_fingerprint([item.artifact for item in produces])
 
@@ -902,17 +906,12 @@ async def _materialize_stage(
             yielded_index, index_paths = await anext(batch_iterator)
         except StopAsyncIteration:
             break
-        except Exception as error:
-            _record_stage_failure(runtime, stage_spec.name, error)
-            raise
         saw_yield = True
         if yielded_index is None and ctx._used_resume:
-            error = RuntimeError(
+            raise RuntimeError(
                 f"Batch stage {stage_spec.name!r} yielded after its ctx.resume() loop; "
                 "yield outputs only inside the ctx.resume() loop."
             )
-            _record_stage_failure(runtime, stage_spec.name, error)
-            raise error
         if not ctx._used_resume:
             ctx._yielded_outside_resume = True
         if not ctx._used_resume and partial_enabled:
