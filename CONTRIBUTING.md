@@ -5,12 +5,14 @@ Varve is still alpha-stage. Keep changes small, tested, and easy to review.
 ## Setup
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra ui
 uv run ruff check .
 uv run ruff format --check .
 uv run pytest
-uv run pyright
+uv run pyright -p pyproject.toml
 ```
+
+CI installs the same `dev` and `ui` extras. Without the `ui` extra (Starlette) or `httpx`, the tests under `tests/ui/` are skipped. Run `pyright` with `-p pyproject.toml` when the checkout sits inside another project that has its own `pyrightconfig.json`.
 
 `pyright` is currently a pre-flight signal, not a blocking quality bar.
 
@@ -19,10 +21,10 @@ uv run pyright
 The public import surface is intentionally small:
 
 ```python
-from varve import Axis, Ctx, JSON, Dependencies, Pipeline, StageSpec, batch_stage, matrix, stage
+from varve import Axis, Ctx, Dependencies, Pipeline, Ref, Resource, stage
 ```
 
-Do not re-export internal store, keying, runner, or dashboard types from `varve.__all__`. Treat public API and `.varve/` store schema changes as breaking.
+Do not re-export internal store, keying, engine, workspace, or UI types from `varve.__all__`. Treat public API and `.varve/` store schema changes as breaking.
 
 ## Style
 

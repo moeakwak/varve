@@ -2,18 +2,25 @@
 
 [![PyPI](https://img.shields.io/pypi/v/varve.svg)](https://pypi.org/project/varve/) [![License](https://img.shields.io/pypi/l/varve.svg)](LICENSE)
 
-Varve runs Python pipelines and caches their outputs, so re-running only re-executes stages whose deterministic inputs, deterministic source dependencies, or managed artifacts require it. Source changes that Varve cannot classify safely open an explicit Stage-level review gate.
+Varve runs Python pipelines on one machine and caches every output it materializes. A pipeline is a plain Python class; its stages are methods. Re-running executes only the units whose inputs, upstream artifacts, Config fields, or source code actually changed, and `status` tells you which ones and why.
 
-A varve is an annual layer of lake sediment — thin, ordered, and datable. Varve treats pipeline outputs the same way: each stage writes a materialized layer whose input key records config, external inputs, explicit values, and upstream artifact contents. When nothing changes, nothing re-runs; when something does, `status` tells you exactly what and why.
+A varve is an annual layer of lake sediment: thin, ordered, and datable. Varve treats stage outputs the same way. Each unit of work writes one read-only layer whose key records what it was built from.
 
-It runs on a single machine — no daemon, no database, no pipeline DSL. Stages are ordinary Python methods, and the `run` / `status` / `reuse` / `invalidate` / `plan` / `ls` / `clean` CLI is generated from your pipeline class. Varve is built for local experiments, evaluations, dataset preparation, render/compare jobs, and report generation, where Python is already the source of truth. It is not a distributed scheduler, a deployment platform, a data-version-control system, or a remote artifact store.
+What it is:
+
+- Zero daemon, zero services. State lives in one SQLite file per pipeline (`.varve/state.db`); commands are short-lived processes.
+- Pure-Python definitions. No DSL, no YAML graph. Dependencies are declared by parameter names, so editors and type checkers see ordinary methods.
+- One model from a 20-line script to thousands of shards. A stage without axes is one unit; `foreach=` expands it into static cells, resolver-driven shards (including shards discovered from an upstream stage's output), or both, scheduled with async, thread, or process-pool windows.
+
+What it is not: a distributed scheduler, a workflow server, a data-version-control system, or a remote artifact store.
 
 ## Install
 
-Varve requires Python 3.10 or newer.
+Varve requires Python 3.10 or newer and a POSIX system.
 
 ```bash
-pip install varve
+pip install varve           # core library and CLIs
+pip install 'varve[ui]'     # plus the local read-only web UI (Starlette + Uvicorn)
 ```
 
 ## Quick start
@@ -21,7 +28,10 @@ pip install varve
 Create `demo.py`:
 
 ```python
+from pathlib import Path
+
 from pydantic import BaseModel
+
 from varve import Ctx, Pipeline, stage
 
 
@@ -33,109 +43,125 @@ class Demo(Pipeline):
     Config = Config
 
     @stage(produces="items.txt")
-    def prepare(self, ctx: Ctx) -> None:
+    def prepare(self, ctx: Ctx[Config]) -> None:
         (ctx.out / "items.txt").write_text("alpha\nbeta\n")
 
-    @stage(needs="prepare", produces="result.txt")
-    def render(self, ctx: Ctx) -> None:
-        items = ctx.input("prepare").read_text().splitlines()
-        (ctx.out / "result.txt").write_text(
-            "\n".join(f"{ctx.config.prefix} {item}" for item in items)
-        )
+    @stage(produces="result.txt", publish=True)
+    def render(self, ctx: Ctx[Config], prepare: Path) -> None:
+        items = prepare.read_text().splitlines()
+        lines = [f"{ctx.config.prefix} {item}" for item in items]
+        (ctx.out / "result.txt").write_text("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":
     raise SystemExit(Demo.cli())
 ```
 
-Run it twice, then look at what happened:
-
 ```bash
-python demo.py run
-python demo.py run
-python demo.py status
-python demo.py plan
+python demo.py run      # executes prepare, then render
+python demo.py run      # both stages are hits; nothing executes
+python demo.py status   # per-stage decisions
+cat out/main/result.txt
 ```
 
-The first run executes both stages and records their keys and artifacts under `out/main/`. The second run is a straight cache hit. Changing `prefix`, changing a declared external input, changing a Stage callable, or deleting `result.txt` makes the affected stage non-current for a reason `status` will name. Changes to surrounding pipeline code may instead open a Stage-level review gate that must be resolved with `reuse` or `invalidate` before a normal run.
+`render` names `prepare` as a parameter, which makes it a dependency and injects the path of `prepare`'s artifact. Each stage writes into its private `ctx.out` directory; varve verifies `produces=`, fingerprints the files, makes them read-only, and moves them to `out/.internal/main/<stage>/`. `publish=True` hardlinks `result.txt` into the human-facing `out/main/`.
 
-## How it works
+Varve records which `Config` fields each stage reads. Changing `prefix` (in `varve.yaml`, the environment, or the default) reruns `render` only; `prepare` never read it. Editing `render`'s body reruns `render` with reason `source-changed`; editing an unrelated helper in the same file reruns nothing. Deleting a managed file reruns its unit with `artifact-missing`.
 
-Each stage declares upstream stages with `needs=`, non-stage dependencies with `depends=`, and outputs with `produces=`. Varve builds an input key from Config, declared inputs and values, and the actual fingerprints of upstream artifacts.
-
-Running a stage writes a record into `<output-root>/.varve/`: the committed key plus the output paths, relative to the branch root. The next command recomputes the key and checks that the recorded artifacts still exist — a matching key is not a hit if the file it points to is gone. The store is latest-wins and guarded by an output-root lock.
-
-Inside a stage, `ctx.input("prepare")` returns the single artifact of an upstream and `ctx.inputs("prepare")` returns all of them in deterministic order. Both require the name to appear in `needs=`.
-
-## Core capabilities
-
-### Deterministic source invalidation and review
-
-Varve fingerprints each complete Stage callable AST, including its decorators, signature, docstring, and body. A callable change is part of the input key and produces `needs-run · source-changed` without Review. Python files or directories declared with `Dependencies.sources` have the same deterministic invalidation behavior. The remaining AST in the pipeline and callable definition files, plus paths declared with `Dependencies.review_sources`, forms the Review fingerprint. A changed Review fingerprint opens `needs-review` only when an existing success or validated partial could otherwise be reused: use `reuse` to keep it reusable or `invalidate` to require a rerun. Varve does not infer call graphs, imports, registries, or runtime dispatch. External data and non-Python runtime files belong in `Dependencies.inputs`; explicit values belong in `Dependencies.values`.
-
-### Resumable batch stages
-
-A `@batch_stage` iterates deterministic work through `ctx.resume(...)` and yields the files each item produces. Interrupt a run and the next one skips the indexes that already finished, continuing the same keyed batch. Varve schedules stages serially; a stage body is still free to use asyncio, process pools, or long-lived clients internally.
-
-### Matrix stages
-
-Stack `@matrix(...)` over a stage to expand a Cartesian product of axes into independently keyed cells. Shared axes align dependencies automatically; axes that exist only upstream become a deterministic fan-in.
+## A short tour
 
 ```python
-from varve import Axis, Ctx, Pipeline, matrix, stage
+import json
+from pathlib import Path
 
-BENCH = Axis("bench", ["ocrbench", "unimer"])
+from pydantic import BaseModel
+
+from varve import Axis, Ctx, Pipeline, stage
+
+
+class Config(BaseModel):
+    data_dir: Path = Path("data")
+
+
+class Args(BaseModel):
+    workers: int = 2
+
+
+# A static axis: a fixed, ordered domain.
 MODEL = Axis("model", ["small", "large"])
 
+# A dynamic axis: resolved from Config at probe time; each unit receives one
+# path, and only that file (by size and mtime) enters the unit's key.
+SHARD = Axis(
+    "shard",
+    resolver=lambda ctx: {p.stem: p for p in sorted(ctx.config.data_dir.glob("*.txt"))},
+    input_fingerprint="stat",
+)
 
-class Evaluation(Pipeline):
+
+class Tour(Pipeline):
     Config = Config
+    Args = Args
 
-    @matrix(BENCH, MODEL)
-    @stage(produces="score.json")
-    def score(self, ctx: Ctx, *, bench: str, model: str) -> None:
-        ctx.cell_out.mkdir(parents=True, exist_ok=True)
-        evaluate(bench, model, ctx.cell_out / "score.json")
+    @stage(foreach=SHARD, produces="words.json", workers=lambda ctx: ctx.args.workers)
+    def tokenize(self, ctx: Ctx[Config, Args], shard: Path) -> None:
+        words = shard.read_text().split()
+        (ctx.out / "words.json").write_text(json.dumps(words))
+        ctx.metric(items=len(words))
+
+    # Shares SHARD with tokenize: 1-to-1, so `tokenize` is one file.
+    @stage(foreach=(MODEL, SHARD), produces="score.json")
+    def score(self, ctx: Ctx, model: str, tokenize: Path) -> None:
+        words = json.loads(tokenize.read_text())
+        factor = 1 if model == "small" else 2
+        (ctx.out / "score.json").write_text(json.dumps(factor * len(words)))
+
+    # Drops SHARD: fan-in, so `score` is {shard_key: path} for this model.
+    @stage(foreach=MODEL, produces="total.json", publish={"total.json": "{model}.json"})
+    def total(self, ctx: Ctx, model: str, score: dict[str, Path]) -> None:
+        total = sum(json.loads(path.read_text()) for path in score.values())
+        (ctx.out / "total.json").write_text(json.dumps(total))
+
+
+if __name__ == "__main__":
+    raise SystemExit(Tour.cli())
 ```
 
-Each cell gets a concrete identity like `score@bench=unimer,model=large` and its own input key, attempt, partial state, success record, and artifact directory under `.matrix/score/bench=unimer/model=large/`. Review Decision belongs to the logical `score` Stage and applies to all relevant cells through one base-stage ReviewRecord. A StageSelector may name the base, a partial subset such as `score@bench=unimer`, or one concrete cell for execution and status; Review commands accept only the base Stage name. Large matrices fold to one line per base stage in `run` and `status` output — keeping concrete failures and slow cells visible — and `--expand` shows every cell.
+- **Units.** `tokenize` has one unit per file, `score` one per (model, shard), `total` one per model. Each unit has its own key, record, and artifact directory such as `out/.internal/main/score/model=large/shard=s2/`. Adding a file runs only the new units; modifying one reruns its `tokenize` unit, and downstream units only if that unit's output bytes changed; removing one marks its units `orphaned` (reclaimed by `clean --orphans`).
+- **Alignment.** Upstream and downstream units are matched through the `Axis` objects they share; axes only the upstream has are folded into an ordered `dict` (fan-in).
+- **Concurrency.** `workers=2` on a plain `def` stage runs units in a `spawn` process pool; `async def` stages run in an asyncio window; `backend="thread"` uses threads. `Args` fields become CLI flags (`run --workers 8`) and never enter keys.
+- **Upstream-driven shards.** A resolver may take an upstream stage as a parameter, for example one that writes `batches.json`: the stage stays `awaiting` until that upstream is done, then expands into one unit per batch file, and each unit keys on its own batch file only.
+- **Resources.** `Resource(name, depends=..., preflight=..., open=..., scope=...)` packages a session (an engine, a server endpoint, a client) together with the files and sources it depends on. Stages receive the opened session by parameter name; nothing is opened when every unit is a hit.
+- **Cross-pipeline inputs.** `counts = Ref("corpus", stage="count")` on a pipeline class injects another pipeline's committed artifacts like an upstream stage, aligned by axis name, read from the upstream `state.db` without importing it. `varve run` orders and runs whole chains declared in a `varve.toml`.
 
-### Branches and temporary runs
+## Command line
 
-An optional `varve.yaml` splits a branch's semantic `config` from its active matrix `axes`. Set `manual: true` alongside them to exclude a branch from default top-level bulk runs; explicit module and generated pipeline commands still run it. This selection policy does not change cache keys or stored results. Persistent branches materialize under `out/<branch>/`. `run --override JSON` spins up an isolated throwaway branch under `out/.tmp/<branch>/`, snapshotting both the validated Config and the active axes so generated commands and top-level commands with `--include-temp` can find it later.
-
-### Generated and top-level CLIs
-
-Every `Pipeline` gets seven commands:
+Every pipeline gets a generated CLI (`python demo.py COMMAND` or `python -m package COMMAND`):
 
 | Command | Purpose |
 | --- | --- |
-| `run` | Evaluate cache decisions and execute the selected stages. |
-| `status` | Explain each Stage's input key, materialization, artifact, source relationship, and Review state. |
-| `plan` | Exact-probe the selected stages and draw their logical Stage topology. |
-| `ls` | Show branch-independent stage templates and matrix axes. |
-| `clean` | Safely remove a whole branch output root. |
-| `reuse` | Keep existing materializations reusable after Review-source changes. |
-| `invalidate` | Mark existing materializations as needing a rerun after Review-source changes. |
+| `run` | Execute every unit that is not a hit (`--only/--upto/--downstream`, `--force`, `--failed-only`, `--slice`, `--sample`, `--temp`, `--override`). |
+| `status [STAGE[@AXIS=ID,...]]` | Per-stage decisions with reasons and labels; `--expand` lists units. |
+| `plan` | The stage DAG with per-stage decision counts. |
+| `ls` | Stage declarations and stored branches. |
+| `inspect STAGE[@AXIS=ID,...]` | One unit's paths, key segments that changed, source symbols (`--sources`), captured log (`--log`), and last traceback. |
+| `reuse STAGE` | Accept the current source change of a stage without rerunning it. |
+| `clean` | Remove managed outputs: the whole store, `--branch`, `--storage`, or `--orphans`. |
 
-Generated `reuse` and `invalidate` default to every Stage with a current Review candidate; repeat `--stage BASE_STAGE` for a topology-ordered union. They only write fingerprint-bound Stage ReviewRecords: they do not execute Stage bodies, alter success records, or immediately delete partial state. A normal `run` stops before executing any Stage body when its selection or required external upstreams contain `needs-review`. `run --force` reruns selected concrete stages without writing ReviewRecord; external upstreams that are only being reused must still pass the normal Review gate.
-
-The top-level `varve` command finds existing stores from their manifests. `varve ls` exact-evaluates the discovered branches and reports the user-facing `MODULE` selector, `BRANCH`, and effective `STATUS`. A selector is the package that owns a store's output directory, which is also the name `python -m` accepts whenever that package has a `__main__.py`; declare `varve_name` on a pipeline to choose a different one. Any unambiguous dotted suffix of a selector and the exact persisted module are accepted too. `varve ls MODULE`, `status MODULE`, `run MODULE`, `reuse MODULE`, `invalidate MODULE`, `plan MODULE`, and `clean MODULE` reuse the generated command backends and renderers. Single dynamic commands use `COMMAND MODULE [OPTIONS]`, so MODULE precedes pipeline-specific Args flags.
-
-`varve run` runs discovered branches except those marked `manual: true`; `varve run --all` includes manual branches. Both run forms, `reuse --all`, and `invalidate --all` operate on entries selected by `--root`, `--prefix`, `--branch`, and `--include-temp`; bulk run also accepts `--rehash`. Bulk Review uses each pipeline's default Args and records each store independently. Bulk run filters manual branches before pipeline import or state evaluation, skips hits and `needs-review`, executes eligible branches, refreshes observations after every attempt, and reports exact final state with separate executed, hit, and manual-skipped branch counts. `--all` neither forces cache hits to rerun nor includes temporary stores without `--include-temp`; YAML-only branches without existing stores are never initialized by bulk run. Use repeatable `varve ls --status STATUS` to filter evaluated rows.
+The top-level `varve` command works across a workspace: `varve ls` (zero-import overview), `varve plan` / `varve run` (ordered `(pipeline, branch)` runs following `Ref`s, with `--set FIELD=VALUE` routed to pipelines whose `Args` declare it and a printed `--from` resume command on failure), `varve status|inspect|reuse|clean MODULE`, and `varve ui` (requires `varve[ui]`). Set `VARVE_ROOT_BASE=/scratch/dir` to run any pipeline or chain in a scratch location without touching real outputs.
 
 ## Documentation
 
-- [User guide](docs/GUIDE.md): stage authoring, keys, batch resume, matrix, branches, CLI behavior, dashboard, and recovery.
-- [Architecture](docs/ARCHITECTURE.md): package boundaries, store invariants, graph expansion, probing, and implementation decisions.
+- [User guide](docs/GUIDE.md): the complete author-facing reference.
+- [Architecture](docs/ARCHITECTURE.md): package layout, store schema, execution lifecycle, keying, and boundaries.
 - [Contributing](CONTRIBUTING.md): setup, public API policy, style, commits, and releases.
 - [Changelog](CHANGELOG.md): released behavior and migration notes.
 
 ## Platform and stability
 
-Varve is currently Unix-only, because output locking uses `fcntl`. Source fingerprints use `ast.dump`, so a CPython minor-version upgrade may rebuild cached stages.
+Varve is Unix-only (it uses `fcntl` locks and hardlinks). Source fingerprints hash Python ASTs, so a CPython minor-version upgrade may rerun stages.
 
-Varve follows SemVer, but 0.x releases are alpha: a minor release may change the public API or the `.varve/` store schema, so check the changelog before upgrading.
+Varve follows SemVer, but 0.x releases are alpha: a minor release may change the public API or the `.varve/` store schema. There is no store migration; after a schema change, `clean` and rerun.
 
 ## License
 

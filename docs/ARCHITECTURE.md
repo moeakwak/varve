@@ -1,209 +1,213 @@
 # varve Architecture
 
-`varve` is a small single-machine runner for Python-defined pipelines with a materialized, content-addressed cache. Users define `Pipeline` classes and stages; varve owns branch-aware output roots, cache keys, store records, generated CLI commands, and clean/status behavior.
-
-For author-facing behavior and examples, see the [user guide](GUIDE.md). For the project overview and quick start, see the [README](../README.md).
+This document describes how varve is built: package boundaries, the store, the execution lifecycle, keying, cross-pipeline references, workspace orchestration, and the web UI. Author-facing behavior is specified in [GUIDE.md](GUIDE.md).
 
 ## Package layout
 
 ```text
 src/varve/
-├── __init__.py          # public re-export surface
-├── pipeline.py          # Pipeline base class, stage collection, CLI hook
-├── matrix.py            # axes and branch-scoped concrete graph expansion
-├── decorators.py        # @stage, @batch_stage, StageSpec
-├── context.py           # Ctx passed to stage methods
-├── command.py           # frontend-independent resolved command context
-├── status.py            # read-only structured pipeline and stage status
-├── branch.py            # varve.yaml and override branch helpers
-├── branch_config.py     # Config construction and output-root selection
-├── dependencies.py           # JSON and Dependencies declarations
-├── models.py            # persisted pydantic store models
-├── style.py             # shared Rich status colors for cli and dashboard
-├── keying/              # source discovery and file/config/upstream key components
-├── store/               # file lock and latest-wins Store
-├── engine/              # execution decisions, review planning, runner, and run display
-├── cli/                 # generated commands and shared single-pipeline renderers
-└── dashboard/           # manifest discovery, top-level commands, and overview rendering
+├── __init__.py          # public surface: Axis, Ctx, Dependencies, Pipeline, Ref, Resource, stage
+├── axis.py              # Axis (static values | dynamic resolver), AxisDomain, canonical ids, Cell
+├── decorators.py        # @stage, StageSpec, PublishEntry, coordinate selector parsing
+├── dependencies.py      # Dependencies (+ glob/stat), PathSet, Glob, DepCtx, merging
+├── resource.py          # Resource, RunCtx
+├── ref.py               # Ref (declaration only)
+├── pipeline.py          # Pipeline base class: declarations, roots, graph(), cli()
+├── context.py           # Ctx and the CtxSink protocol
+├── signature.py         # parameter-name binding of stage methods and resolvers
+├── graph.py             # StageGraph/StageNode, validation, unit expansion, alignment, publish targets
+├── branch.py            # varve.yaml parsing, branch name validation
+├── branch_config.py     # branch resolution: Config construction, temporary branches, slice/sample
+├── selector.py          # pipeline selector derivation and suffix matching
+├── status.py            # view models for status/plan/inspect
+├── style.py, log.py     # Rich theme, status styles, CLI logging
+├── keying/
+│   ├── config_access.py # recording Config proxies, access projection
+│   ├── fingerprint.py   # canonical JSON, file walking, content/stat digests, stat cache, artifact manifests
+│   ├── source.py        # single-file symbol closure, whole-file fallback, declared sources
+│   └── keys.py          # 5-segment input_key, segment reasons, source-match rule
+├── store/
+│   ├── db.py            # SQLite schema, connections, schema checks, transactions
+│   ├── repo.py          # typed row dataclasses and queries
+│   ├── layout.py        # metadata, managed, staging, and publish paths; storage root resolution
+│   └── lock.py          # fcntl pipeline and branch locks
+├── engine/
+│   ├── session.py       # one command's pipeline, branch, Config, Args, roots, store, caches
+│   ├── probe.py         # stage evaluation: expansion, resolvers, keys, decisions, orphans
+│   ├── run.py           # Runner: locking, recovery, stage loop, bookkeeping
+│   ├── scheduler.py     # sliding window with exclusive and max_failures
+│   ├── backends.py      # inline, thread, async, and spawn process-pool execution
+│   ├── unit.py          # unit lifecycle: Ctx, call, produces check, read-only finalize, promote
+│   ├── commit.py        # unit rows and cross-branch hardlink reuse
+│   ├── writer.py        # batched store writes
+│   ├── resources.py     # preflight and scoped sessions
+│   ├── publish.py       # hardlink publishing
+│   ├── capture.py       # per-unit stdout/stderr routing and fd redirection
+│   ├── events.py, tui.py# event bus, live display, plain reporter, progress sinks
+│   ├── housekeeping.py  # run ids, git state, startup recovery, log rotation
+│   ├── clean.py         # clean planning and execution
+│   ├── refs.py          # RefResolver protocol, RefBinding, RefInfo, NoRefResolver
+│   └── service.py       # in-process services: run/probe/inspect/reuse/clean
+├── cli/                 # generated pipeline CLI (app.py, argmap.py, render.py)
+├── workspace/           # varve.toml, VARVE_ROOT_BASE, discovery, Ref resolution, macro runs, top-level CLI
+└── ui/                  # optional varve[ui] web UI: discovery, SQL queries, Starlette app, static assets
 ```
 
 ## Public surface
 
-Only these names are exported from `varve.__all__`:
-
-```python
-from varve import Axis, Ctx, Pipeline, JSON, Dependencies, StageSpec, batch_stage, matrix, stage
-```
-
-`Pipeline.graph(axes)` is the public convenience entry point for constructing an immutable, branch-scoped `PipelineGraph`. The graph view exposes concrete stages, topology, base-to-cell lookup, and selection. `PipelineGraph` and the lower-level `build_graph(pipeline, axes)` constructor live in `varve.matrix` and are supported graph APIs, but they are not re-exported from the top-level package; author code should normally prefer `Pipeline.graph()`.
-
-Everything else is internal unless this document, `GUIDE.md`, or `README.md` says otherwise. `Store`, persisted models, keying helpers, runner helpers, and dashboard models may be used by internal code and tests through full module paths, but they are not public API.
+`varve.__all__` is exactly `Axis, Ctx, Dependencies, Pipeline, Ref, Resource, stage`. `import varve` loads the declaration modules (`axis`, `decorators`, `dependencies`, `resource`, `ref`, `pipeline`, `context`, `selector`) and nothing from `engine`, `cli`, `workspace`, or `ui`; `Pipeline.cli()` and `Pipeline.graph()` import their modules lazily. Everything else, including `varve.engine` services, is internal and may change between minor releases.
 
 ## Dependency direction
 
-- Low-level packages: `keying`, `store`, and `engine.state`. They depend only on leaf modules such as `models`, `log`, `selector`, and `dependencies`.
-- Middle layer: `branch_config`, `command`, `status`, and `engine.runner`.
-- Top layers: `cli` and `dashboard`; both call shared command services and renderers rather than invoking each other through argv.
-- Public-facing modules such as `pipeline`, `decorators`, and `context` may use internals to keep the user API small.
-- The only intentional reverse edge is the lazy import inside `Pipeline.cli()`: `from varve.cli.app import main`.
+```mermaid
+flowchart TD
+    decl["declarations: axis, decorators, dependencies, resource, ref, context, signature"]
+    pipeline["pipeline, graph"]
+    keying["keying"]
+    store["store"]
+    branch["branch, branch_config"]
+    engine["engine"]
+    status["status"]
+    cli["cli"]
+    workspace["workspace"]
+    ui["ui"]
 
-There is no import-direction tool. Keep the graph boring by review.
-
-## Cache and store
-
-The store lives under `<output_root>/.varve/` and is latest-wins, not append-only:
-
-```text
-.varve/
-├── manifest.json
-├── lock
-├── stages/<stage>.json
-├── reviews/<base-stage>.json
-├── failures/<stage>.json
-├── attempts/<stage>.json
-└── partial/<stage>/<input_key>/
+    pipeline --> decl
+    pipeline --> store
+    keying --> decl
+    store --> keying
+    branch --> pipeline
+    branch --> keying
+    engine --> pipeline
+    engine --> keying
+    engine --> store
+    engine --> branch
+    status --> engine
+    cli --> engine
+    cli --> status
+    workspace --> engine
+    workspace --> cli
+    workspace --> store
+    ui --> store
 ```
 
-Schema version 6 is intentionally incompatible with schema 5 source records. A schema 5 whole-file source fingerprint cannot reconstruct the callable/residual split, current rerun key, or partial source provenance. Upgrade therefore leaves managed artifacts in place, makes old successes non-hits, and clears reviews, attempts, failures, and partial state so the pipeline rebuilds schema 6 records on its next run. Migration interruption recovery is not part of the local pre-1.0 store contract; clean the store if an interrupted upgrade cannot continue.
+- Declaration modules depend only on each other. `graph` depends on declarations and on `store.layout` for unit paths.
+- `keying` and `store` never import `engine`. `store.repo` uses `keying` types for stat-cache and file-set rows.
+- `engine` is the only layer that writes stores and managed directories. It depends on `workspace.config` for `WorkspaceSettings`, and imports `workspace.refs.WorkspaceRefResolver` lazily as the default Ref resolver; it otherwise reaches other pipelines only through the `RefResolver` protocol in `engine.refs`.
+- `cli` parses argv and renders; it calls `engine.service` functions, which take a Pipeline class and keyword options and never parse argv. The top-level `varve` command calls the same services and reuses the generated CLI's renderers.
+- `workspace.discovery` reuses `ui.discovery.discover_state_dbs`, which has no web dependencies. `ui.app` imports Starlette and Uvicorn on first access; nothing else imports them.
 
-`input_key` includes the projected Config, declared `Dependencies.inputs`, declared `Dependencies.values`, current upstream materialization fingerprints, and the rerun source fingerprint. Dependency resolvers receive a stable Config/Cell/output context without runtime Args. The Review source fingerprint and Review Decision never enter the key. Batch partial state is scoped by `input_key`, validates the content fingerprints of yielded artifacts, and uses matching AttemptMarker or FailureRecord rerun/Review fingerprints as its source provenance.
-
-Each file or directory artifact has a content fingerprint. A stage success additionally has an ordered materialization fingerprint matching what downstream `ctx.inputs()` observes: single-output declaration ordinals or batch `(index, ordinal)` positions plus each artifact fingerprint. Matrix fan-in preserves the ordered concrete upstream position around those per-stage fingerprints.
-
-Upstream keys enter through reads. A stage body takes upstream outputs via `ctx.input(stage)` for exactly one path or `ctx.inputs(stage)` for a list, and both require `stage` to appear in the current stage's `needs=`, because only declared upstreams are folded into the input key.
-
-A concrete stage has an execution status of `hit`, `needs-run`, `resume`, `failed`, or `error`. Review source is represented by an orthogonal relationship (`not-applicable`, `current`, or `changed`) and a logical Stage decision (`none`, `reuse`, or `invalidate`). The effective overlay adds `needs-review` for changed plus none and maps changed plus invalidate to `needs-run · source-changed`; these computed states are never persisted. Success, attempt, failure, partial, and artifact state remain concrete, while one ReviewRecord per base Stage stores only the current Review fingerprint, observation, decision, and timestamp.
-
-## Command-scoped observation snapshots
-
-Exact state evaluation shares filesystem fingerprints, normalized Python-file observations, and parsed success records within one command. The snapshot stays in memory and never survives into another command.
-
-Each regular file hash can reuse persisted metadata when path, inode, size, mtime_ns, algorithm, and cache schema match. Dependency resolvers still run for every concrete stage, but each unique returned input root is normalized, symlink-validated, and expanded at most once per filesystem snapshot; a directory tree is walked completely on its first observation. Files written by the current stage are rehashed at commit.
-
-Generated status, top-level single status, and top-level `ls` use the same exact collector and command-scoped `_KeyingSession`. Runs use an independent snapshot for external-upstream validation, refresh filesystem observations after each successful stage, and update the cached success record after commit. Bulk review passes one session through every review probe and refreshes it after each entry. Bulk run clears source, filesystem, and record observations after every attempted entry, including failures, before exact final evaluation can observe source files changed during execution.
-
-## Source observation
-
-`keying/source.py` returns `SourceObservation(rerun, review)`. The rerun side contains the complete Stage callable AST plus whole-file/directory AST entries declared through `Dependencies.sources`; its fingerprint enters the input key. The Review side contains the pipeline class file and the Stage callable file after removing every Stage callable collected from that pipeline, plus whole-file/directory entries declared through `Dependencies.review_sources`. This residual AST prevents a Stage method change from opening Review for another Stage in the same file while still observing shared definitions. If one actual file appears under both declared policies, rerun wins; the same normalized root declared in both fields is an error.
-
-Callable lookup uses definition file, function name, sync/async kind, and `co_firstlineno` to locate exactly one `FunctionDef` or `AsyncFunctionDef`; zero or multiple matches are strict evaluation errors. Missing, unreadable, non-Python, symlinked, or unparsable declarations are also errors. Comments, formatting, encoding headers, and source locations normalize away; decorators, signatures, docstrings, and all other runtime-visible AST remain. Declared roots must exist, while members added, removed, or renamed inside an existing declared directory change its fingerprint. Source reads use the same before/read/after stat stability check as persisted shortcuts so a mixed AST/stat snapshot is never cached.
-
-## Decision probes and status
-
-`engine.runner._stage_decision()` is the shared ready-stage decision unit for both execution probes and structured status. `probe_pipeline()` supplies source observations, upstream projections, and unavailable-state handling while walking the full topology by default, so every displayed decision key uses the same whole-pipeline upstream projection; structured status and dashboard callers keep that complete default.
-
-Scoped runs validate less. An internal stage filter probes only the direct upstreams outside the execution selection and their recursive ancestor closure, in original topology order. Every stage in that closure must be a hit, and current decision keys propagate through it exactly as in a full probe. This keeps `--only`, `--downstream`, and sliced runs from inspecting unrelated source or file key inputs, without weakening validation of external upstream state.
-
-Probes compute source observation before checking for missing upstream records, so callable, declared-root, and AST errors remain strict even when other inputs are unavailable. Review commands complete all probes and target validation before their first ReviewRecord write.
-
-`status.py` turns probes into immutable, Cell-aware view models containing execution reason, source review state, effective status, changed source files, selector metadata, duration, and last-commit metadata. Each concrete Cell retains its exact `SourceReviewState`, while `StageStatusGroup` derives one consistent logical Stage review for folded rendering. Every concrete stage is probed before display selection and folding, so folding never changes a cache decision or Cell identity. Matrix groups and pipelines aggregate effective status, with `needs-review` taking precedence; aggregate duration and its recorded Cell count are derived from the concrete statuses so the renderer can flag missing values.
-
-`cli/status.py` is the shared generated/top-level single-pipeline renderer. It renders folded effective status with one Review value per logical Stage, axis-column Cell tables, partial-selector headings, single-stage key inputs, source relationship, Stage Review, and changed source files. Matrix expanded headings render the Stage decision once; Cell rows never render a decision. It reads base names, canonical coordinates, axis order, and logical needs from the view model rather than parsing concrete stage names. No inferred source dependency graph exists.
-
-The command is read-only — it does not execute stages, initialize the store, or persist dependency graphs. A displayed decision key is the current cache-decision input, not a promise that the next execution will commit the same final key after recording config access.
-
-## Config access projection
-
-A stage's output depends only on the `Config` fields it reads, so folding the whole `Config` into every `input_key` over-invalidates: adding a tool or toggling a flag would rerun stages that never look at that field. Varve instead records which top-level fields each stage reads and keys only on those.
-
-Config is either a pydantic model or a string-keyed `dict`; `run()` and keying reject other types. During a run the stage's `ctx.config` is a read-only recording proxy. Plain top-level field reads (`ctx.config.tools` or `ctx.config["tools"]`, including reads inside helpers the config is passed to) are captured precisely; nested values are returned unwrapped, so `ctx.config.nested.a` and `ctx.config["nested"]["a"]` both record `nested`. Any access that cannot be attributed to one present field — `model_dump()`, `getattr` of an unknown name, a missing dict key, iteration, `keys()`/`items()`, `len`, equality, `repr`, `__dict__`, pickling — marks the whole `Config` as depended-on (`config_access = None`, the conservative fallback). The pydantic proxy reports the model type as its `__class__`, so `isinstance`, `singledispatch`, and pydantic fields annotated with the Config type accept it; a model that revalidates instances reads the whole config. The dict proxy is a `dict` subclass holding a shallow copy, so `json.dumps` and `**` unpacking go through recorded methods, but native serializers that read dict storage directly (pydantic-core serializing an `Any` field, orjson) are not observed, so such callers should receive `dict(ctx.config)`. The recorded set is stored on the success record and, on the next run, the `Config` is projected onto it before hashing, so changing an unread field is a hit.
-
-When the current source observation matches the source that produced a successful materialization, probes use the previous access set. A `reuse` decision may also use that set while deciding whether an existing materialization is a hit; reusing a change that introduces a new Config read is therefore an explicit developer responsibility. If a different source observation will actually execute because of changed inputs, `--force`, or `invalidate`, the execution key starts from the whole `Config` and the run records a new precise set. On unchanged source, committed access is unioned with the previous set so a resume that skips batches or a data-dependent branch not taken never drops a real dependency. When a batch resumes skipped partial without a complete same-source access baseline, success keeps `config_access=None` because the skipped items may have performed Config reads that cannot be reconstructed.
-
-The projected probe key and conservative execution key are distinct identities. A partial whose provenance has an explicit `reuse` decision may be copied from the projected key to the conservative execution key before the attempt begins. `invalidate` leaves partial untouched when the decision is recorded and clears the affected concrete stage's old partial when execution actually starts. Success commit clears every partial key for that concrete stage.
-
-Config reads must be deterministic for fixed keyed inputs. Reading fields before `ctx.resume()` gives the most precise key; reads that occur only in resume-skipped work force the conservative whole-Config fallback when no complete same-source access baseline exists. A Stage that ships the raw `Config` object into a subprocess and reads fields there is not captured — extract the values in the parent process, which reads them through the proxy, and pass those.
-
-`Config` keeps its whole-value role for provenance and branch identity: `override_branch_name`, the manifest snapshot, and anything a stage writes to run metadata still see the full `Config`. Only keying is projected.
-
-## Batch execution
-
-Batch stages are scheduled serially by the runner, which keeps store transitions and partial writes deterministic. A stage body may still parallelize work within an item using `asyncio.gather(...)`, process pools, or long-lived worker sessions.
-
-Resume is positional: varve records the completed indexes from `ctx.resume(...)` and skips them on the next run with the same input key. This requires deterministic iterable order, so callers should sort unstable inputs before passing them in; varve intentionally does not provide order-independent batch resume under the current content-key model. An index is checkpointed with all of its yields once the stage body requests the next item, so a failure between two yields of one index never leaves a partially checkpointed index. A batch item may yield zero paths — the completed index is still recorded, but item-level output completeness is the stage's responsibility.
-
-A FailureRecord is written whenever stage materialization fails after the attempt begins: the body raising, a declared or yielded output that is missing or escapes its root, or an artifact that cannot be fingerprinted. Status reads that record instead of re-validating outputs, so probing never rehashes the artifacts of an unfinished stage. Only partial records under the current execution key whose artifact fingerprints still validate produce resume indexes. Matching AttemptMarker or FailureRecord provenance takes priority over an older SuccessRecord: a current Review fingerprint resumes directly, an older Review fingerprint forms a Stage Review candidate, and a mismatched input key is ignored. The cache decision likewise ignores a FailureRecord or AttemptMarker under another input key, so a stale failure never shadows a success whose key and artifacts still match, and status does not report it. A success record with a missing artifact is `needs-run · artifact-missing` and never contributes `resume_skip` entries. Force writes the current rerun and Review fingerprints when its attempt starts, so current-source partial from a failed or interrupted force run remains resumable by a later normal run.
-
-Batch stages that yield without ever iterating `ctx.resume(...)` are allowed but non-resumable: the runner warns, ignores old partial state for that run, and writes no new partial state from those yielded outputs. A stage that does iterate `ctx.resume(...)` must yield only inside that loop; a yield before the loop starts or after it ends has no owning index and fails the stage with a FailureRecord. A second `ctx.resume(...)` call in the same execution also fails the stage, since its positional indexes would collide with the first loop.
-
-## Output roots and branches
-
-`Pipeline.default_output_root(config)` returns the base output root. The CLI can override that with `--out`. Varve then appends the selected branch:
+## On-disk layout
 
 ```text
-base/<branch>        # persistent branches
-base/.tmp/<branch>   # temporary override branches
+<root>/.varve/state.db (+ -wal, -shm)
+<root>/.varve/lock                              # pipeline lock
+<root>/.varve/locks/<branch>.lock               # branch lock
+<root>/.varve/logs/<run_id>/<stage>/<unit>.log  # captured unit output; process.log while the TUI runs
+<storage_root>/.internal/<branch>/<stage>/<unit_relpath>/   # managed, read-only unit directories
+<storage_root>/.staging/<run_id>/<stage>/<unit_hash>/       # unit scratch during a run
+<publish_root>/<branch>/                        # published files of persistent branches
+<publish_root>/.tmp/<branch>/                   # published files of temporary branches
 ```
 
-`varve.yaml` is discovered next to the pipeline module. Missing `varve.yaml` is allowed for `main`.
+`unit_key` is `"a=x,b=y"` in `foreach` order (`""` without axes); `unit_relpath` is `a=x/b=y` with unsafe characters percent-encoded; `unit_hash` is the first 16 hex digits of SHA-256 of `unit_key`. Roots are resolved by `engine.session.resolve_roots`: explicit `--root`, else `VARVE_ROOT_BASE/<pipeline_name>` (which also forces all storages and the publish root below that root), else `Pipeline.default_root(main Config)`. Storage roots combine `Pipeline.storage_roots(config)`, `varve.toml` `[storage]` bases (`<base>/<pipeline_name>`), and `default = <root>/out`; paths are made absolute without resolving symlinks.
 
-Each branch section has four independent facets: `config`, `axes`, `is_temporary`, and `manual`. The optional boolean `manual` defaults to false and belongs only to bulk run selection; it never enters resolved Config, input keys, source fingerprints, or persisted store records. `config` controls stage behavior and participates in input keys. `axes` selects a branch's active matrix domain and controls graph construction without entering input keys. Temporary manifests snapshot both the validated Config and normalized active axes so later generated commands and explicitly opted-in top-level commands reconstruct the same graph.
+## Store
 
-Recorded artifact paths are always output-root-relative. Ordinary stages write managed artifacts through `ctx.out`; matrix cells write through `ctx.cell_out`, described under Matrix graph expansion.
+Each pipeline root has one SQLite database, opened with WAL, `synchronous=NORMAL`, `busy_timeout=5000`, and foreign keys on. Read-only opens use a `mode=ro` URI and never create files. The schema is created on first writable open; a database without `meta`, or with a different `schema_version`, raises `SchemaError` (there are no migrations).
 
-## Matrix graph expansion
+| Table | Key | Content |
+| --- | --- | --- |
+| `meta` | `key` | `schema_version`, `pipeline_name`, `module`, `qualname`, `root`, `graph_json` |
+| `storages` | `storage_name` | absolute root path per storage, shared by all branches; recorded at the first run, checked at every later run |
+| `branches` | `branch_id` (the branch name) | `is_temp`, `manual`, Config snapshot, active axes snapshot (`{axis: [ids]}` or `{"sample": n, "seed": s}`) |
+| `runs` | `run_id` | branch, start/end, status, argv, git commit and dirty flag, wall time, host |
+| `stage_runs` | `(run_id, stage_name)` | status, executed/hit/failed/total units, workers, wall time, unit p50/p95/max, peak RSS, metric sums |
+| `file_sets` | `fileset_hash` | file lists of inputs with more than 32 files, content-addressed |
+| `units` | `(branch_id, stage_name, unit_key)` | storage, `input_key`, `key_components_json`, `config_access_json`, `source_fp`, `source_detail_json`, `reused_source_fp`, status, artifact relpath/fp/manifest/files/bytes, metrics, duration, peak RSS, error type/summary/traceback, `last_run_id`, `linked_from` |
+| `stat_cache` | `norm_path` | inode, size, `mtime_ns`, content hash, AST hash |
 
-`Pipeline.stages()` collects branch-independent stage templates. After branch resolution, `Pipeline.graph(axes)` delegates to `build_graph(pipeline, axes)` to construct an immutable `PipelineGraph`: it expands each matrix template into concrete cell stages, resolves logical dependencies by equality on shared `Axis` object identities, and computes the concrete topology once. Runners, status, review, and top-level state all consume that branch-scoped graph, while manifest discovery remains zero-import.
+`graph_json` is a zero-import description of the logical graph, written at every run and `reuse`: per stage its dependencies with kind (`data` for injected, `needs`, `resolver`), Ref edges, axes with kind (`static`/`dynamic`; static axes also list their declared `ids` in order), storage, `produces`, publish entries, version, static worker count, and whether it is async; plus every Ref's attribute, target, stage, branches, selector, and `align_by`. The web UI and Ref resolution read it.
 
-`PipelineGraph.resolve_selector()` is the only execution/status/plan StageSelector parser. It resolves an ordinary Stage, a bare Matrix base, any non-empty subset of active `AXIS=VALUE` coordinates, or a full concrete Cell into a canonical selector and stable topology-ordered seed set. Axis declaration order owns canonicalization and diagnostics distinguish unknown from declared-but-inactive values. `resolve_selectors()` validates every repeated selector before returning a stable union. Run and plan apply only/upstream/descendant closure after resolution, and status uses the seeds without implicit topology expansion. Review target validation is deliberately base-only and returns a topology-ordered union of ordinary or Matrix base names; any coordinate fails before the first write. Temporary `--slice` remains a separate cross-stage constraint.
+Invariants:
 
-Concrete Cell names encode coordinates in declaration order, so success, attempt, failure, and partial store slots stay concrete: a Cell has an independent name and input key. Coordinates do not add a key component. Review is the exception: all Cells of one logical Matrix Stage read and write `reviews/<base-stage>.json`. A matrix-only internal layout version enters the input key, so records and partial state from a previous artifact layout become `needs-run` instead of being mixed with current outputs. Logical `ctx.input()` and `ctx.inputs()` calls map to the aligned concrete upstream Cells, ordered by upstream axis declaration order and then batch index.
+- A `units` row with status `ok` points to a complete, read-only directory at `storages[storage_name] / artifact_relpath` (the `produces` file for a single-file stage, else the unit directory), whose files match `artifact_manifest_json` (`[relpath, size, mtime_ns, sha256]`). The probe verifies the manifest by stat (or content with `--rehash`) before calling a unit a hit.
+- A unit directory is renamed into place before its `ok` row is committed. A unit's `running` row is committed before its body starts (the scheduler calls `Writer.flush_running` after submitting), so a hard kill leaves it probing as `interrupted`, and recovery can find any `.old-*` backup next to its final directory. A crash between promotion and the `ok` commit leaves a directory with a `running` row, which is overwritten by the rerun.
+- Storage roots do not depend on the branch: a run whose computed root for a storage differs from the recorded one fails with `StorageRootError`, and `clean` deletes under the recorded roots, so `artifact_relpath` of every branch stays valid.
+- `input_key` never contains source code; `source_fp` and `reused_source_fp` are separate columns compared by the source-match rule.
+- Key material contains no absolute paths: inputs contribute paths relative to their declared roots; upstream entries are artifact fingerprints.
+- Writers hold the pipeline lock (shared for `run`, `reuse`, branch `clean`; exclusive for whole, storage, and orphan `clean`) and, for branch-scoped writes, the branch lock exclusively. Locks are non-blocking `flock`s on files that are never unlinked.
+- During a run, unit rows, file sets, and stat-cache rows are written in one transaction per ~75 ms window (`engine.writer`); a probe reads one stage's rows with one `SELECT`.
 
-Within one probe or run command, concrete cells from the same matrix template share source-file observation. Input and artifact files share a filesystem snapshot across consecutive read-only probes and cache hits.
+## Execution lifecycle
 
-After every stage that actually executes and completes successfully, the runner discards its filesystem observations before keying the next stage, because executed stage code may legitimately change a later stage's declared file input. A run's read-only external-upstream validation likewise uses a separate filesystem snapshot from subsequent stage execution. These caches are isolated by the full source-observation inputs and never survive the command; persisted stage fingerprints remain independent inputs to the cache decision, and no store schema or input-key shape changes.
+`engine.service.run_pipeline` opens a writable `Session` (`engine.session.open_session`): it builds the graph, loads `WorkspaceSettings` (`varve.toml` plus `VARVE_ROOT_BASE`), creates the default `WorkspaceRefResolver`, resolves the branch (`branch_config.resolve_branch`: `varve.yaml`, stored temporary branches, `--override`/`--temp`/`--slice`/`--sample`), resolves roots, validates storage names, opens the store, loads the stat cache, and computes static axis domains (branch `axes:` and samples applied). A `Runner` then:
 
-Run display grouping is an engine-level view over the selected concrete topology. One command-scoped display plan supplies the lifecycle reporter and CLI outcome table; the opening `Run order:` line always folds Matrix Cells by base Stage and uses preflight effective status for completion and progress markers. Grouping cannot affect execution order. Reporters count selected completions by base-stage metadata rather than assuming cells are adjacent in topological order.
+1. Takes the pipeline lock (shared) and the branch lock, checks the storage roots against the recorded ones, writes `meta`, `storages`, the `branches` row, and a `runs` row with status `running`.
+2. Runs startup recovery for this branch (`housekeeping.recover`).
+3. Installs the SIGINT handler and drives the stages in an asyncio loop. The handler only sets a stop flag; the main loop publishes the notice, so it is delayed while an inline unit blocks the loop.
+4. For each needed stage in topological order (selected stages plus their ancestors):
+   - If a dependency did not complete, finishes the stage as `skipped` (selected dependency) or `blocked` (unselected dependency).
+   - Evaluates the stage (`StageEvaluator.evaluate`, below). Unselected ancestors are only evaluated, so their hits become available to selected stages.
+   - Marks orphaned rows, collects hits, and tries cross-branch links for the other units (`Committer.link`).
+   - Resolves `workers` and the backend, writes a `stage_runs` row with status `running`, and builds a `ResourceTable` that indexes the distinct `Resource` objects of the units to run (sessions are keyed by object identity, not name; each job carries `name -> index`). Preflights pending resources (once per object per run) and opens stage-scope sessions, both with a recording `RunCtx.config` whose reads are kept per resource. Installs stdout/stderr routing proxies when capturing an in-process stage (TUI on or `workers > 1`). Starts the backend: process pools get a `WorkerSetup` with the pipeline locator, Config, Args, picklable shared sessions and their Config reads, the distinct cells with their resource indices, `worker_env`, and a progress queue; the pool spawns workers with `worker_env` set and SIGINT blocked, so both hold from interpreter start.
+   - Feeds units through `scheduler.run_window`. `on_start` writes a `running` row keyed with the probe's key; each completed unit is committed (`Committer.commit_ok`: merge the unit's Config reads with those of its resources' `preflight`/`open` and the previous access set, compute the final key, promote, write the `ok` row) or recorded as `failed` with error details. Any exception while committing is recorded as a unit failure.
+   - Publishes when every unit is available (templated targets that collide after expansion fail the stage here), then updates the `stage_runs` row (status, counts, percentiles, peak RSS, metric sums).
+5. Flushes the writer, removes this run's staging directories, finishes the `runs` row (`ok`, `failed`, or `interrupted`; `failed` on an unexpected exception), releases the locks, and rotates logs (20 runs kept).
 
-Ordinary stages are never folded. In `auto` mode a matrix group folds when at least `AUTO_COMPACT_MIN_CELLS` (currently 8) selected cells belong to it, unless any selected cell has a successful record whose elapsed time is at least `AUTO_EXPAND_SLOW_SECONDS` (currently 30 seconds); smaller groups and known slow groups expand. `run --expand` and `run --compact` override the decision. Compact info-level logging emits one group start and one completion summary, preserves concrete cell lifecycle and input keys at debug level, and always surfaces slow cells and failures by concrete identity. These rules inspect existing success metadata only and do not alter records or keys.
+Unit execution (`engine.unit.execute` / `execute_async`) runs wherever the backend runs it: create the staging directory, route output to the unit log if capturing, open unit-scope resources, build `Ctx` with a recording Config proxy, call the stage method with injected arguments, require `None`, check `produces`, hash every file (`artifact_fingerprint`), and chmod files to `0444`. It returns a picklable `UnitOutcome` (metrics, config access, artifact manifest, error fields, peak RSS for process workers). Promotion and the store commit always happen in the main process.
 
-`Ctx` receives structured stage-display metadata from the graph. Matrix batch progress defaults to canonical cell values in declared axis order, without parsing or changing the concrete stage name; ordinary stages retain the stage name, and an explicit `ctx.resume(desc=...)` remains authoritative.
+The scheduler keeps up to `workers` tasks in flight and refills in completion order. An exclusive unit starts only on an empty window and blocks further submissions while it runs; the queue order is kept. A stop request (first Ctrl-C, `max_failures` reached, or a broken process pool) stops submissions and awaits active units. A second Ctrl-C raises `KeyboardInterrupt`, which cancels tasks and terminates process workers.
 
-Generated and top-level single-pipeline status fold concrete Cells by base template by default. `--expand` dispatches by selection: a Matrix base, partial subset, or untargeted Matrix pipeline renders Cells with one column per declared axis and one Stage Review value in the heading, while an ordinary Stage, concrete Cell, or non-Matrix pipeline renders exact key inputs, source relationship, owning Stage Review, and changed source files. Source call-tree expansion flags do not exist.
+Events (`RunStarted`, `StagePlanned`, `UnitStarted`, `UnitProgress`, `UnitMetric`, `UnitFinished`, `StageFinished`, `RunFinished`, `Notice`) go through an `EventBus` to either the `rich.Live` display or the plain reporter (`varve` logger on stderr), and to an optional `on_event` callback. Process workers send progress and metric events through a multiprocessing queue pumped by a thread in the main process.
 
-Managed matrix artifacts are contained under `ctx.cell_out`, which is `<output-root>/.matrix/<base-stage>/<axis-name>=<canonical-id>/...`; each coordinate occupies one directory level in the stage's axis declaration order. For example, `score@bench=unimer,model=qwen3-vl-8b` writes under `.matrix/score/bench=unimer/model=qwen3-vl-8b/` while its concrete stage and store identity remains `score@bench=unimer,model=qwen3-vl-8b`. Relative `produces` declarations and batch yields resolve under `ctx.cell_out`; absolute paths must remain inside it. Store records still hold paths relative to the branch output root, so artifact existence checks and upstream reads operate from recorded paths rather than reconstructing physical paths. Ordinary stages retain `ctx.cell_out == ctx.out`.
+## Probe and decisions
 
-## CLI and config
+`engine.probe.probe(session, stages)` is the read-only path used by `status`, `plan`, `inspect`, and `reuse`; `run` uses the same `StageEvaluator`. Stages are evaluated in topological order, each against the `StageState` of its dependencies: the expanded units, the available artifacts (`unit_key -> (artifact_fp, path)`; hits during a probe, committed units during a run), whether the stage is complete, and which root upstream it awaits.
 
-`Pipeline.cli(argv)` delegates to `varve.cli.app.main` and provides `run`, `status`, `reuse`, `invalidate`, `plan`, `ls`, and `clean`.
+`StageEvaluator.evaluate(node, states)`:
 
-`ResolvedCommandContext` carries the pipeline class, resolved branch/config/axes, output base and root, graph, and runtime Args without probing or mutating the store. The generated frontend constructs it from `ResolvedBranch`; the top-level frontend resolves a user-facing MODULE selector and branch back to the exact manifest identity. Selector and import identity are separate manifest fields: `module` plus `pipeline` is the import target, while `name` is the selector `Pipeline.selector()` derived at run time from `varve_name` or from the package that owns the output directory. Resolution matches an exact selector first, then the exact persisted module, then an unambiguous dotted selector suffix; stores written before `name` existed derive their selector from `module`. Structure listing uses a lighter resolved target because it does not consume Args or probe keys. `plan` shares the same resolved context and exact status collector as `status`, then renders a logical base-Stage DAG through `cli/plan.py` and netext.
+1. **Awaiting.** If a dependency is awaiting, or a dependency read by one of the stage's resolvers is not complete, the stage is `awaiting` and is not expanded.
+2. **Domains.** For each dynamic-axis request (one per combination of the static axes its resolver names), bind the resolver's parameters (`DepCtx`, static values, aligned upstream artifacts, Ref bindings), call it, normalize the result to an `AxisDomain`, memoize it per command by `(axis, cell ids, upstream fingerprints)`, and remember the full domain for orphan detection. Then apply branch active ids and samples.
+3. **Expansion and alignment.** `graph.expand_stage` produces units in `foreach` product order; `graph.align_units` matches them with each upstream's units through hash indexes on shared axis ids; the session's `RefResolver` returns one `RefBinding` per unit for each keyed Ref.
+4. **Cells.** For each distinct cell (or once per stage when no `resources`/`depends` declaration, and no `depends` of a static resource, is callable), resolve resources and merged dependencies, fingerprint inputs, hash values, and compute the source fingerprint (cached per stage and declared sources).
+5. **Keys.** For each unit, assemble segment hashes incrementally: the Config hash projected on the stored row's `config_access_json` (memoized per access set), upstream entries, cell input and value hashes extended by dynamic-axis paths and values, and the version hash (`version` plus the normalized `produces`). NaN or Infinity in values is an evaluation error of the stage. If some upstream unit is unavailable, the key is not computable (`upstream-pending`).
+6. **Decision.** Apply the rule in the order `forced`, `new`, `interrupted`, `upstream-pending`, key change, `source-changed`, `failed`, artifact check, `hit` (see the GUIDE). For key changes, the stored `key_components_json` of the stage is loaded once, and the reasons are the changed segments, followed by `source-changed` when the source also changed; all reasons are kept on the unit plan.
+7. **Orphans** (run only): stored rows whose static coordinates are active but whose dynamic id is absent from the full resolved domain.
 
-`argparse` parses commands and generated `Args` flags. Top-level run/status/plan/clean/reuse/invalidate use two stages: a fixed `COMMAND MODULE [OPTIONS]` target identifies and imports one discovered pipeline, then its Args fields are registered before full parsing. Bulk commands use default Args and reject pipeline-specific flags. `pydantic-settings` builds semantic `Config` values from branch/override values, environment variables, `.env`, and model defaults.
+Resolver memoization and file hashing go through command-scoped caches on the session; content hashes and Python AST hashes are also persisted in `stat_cache`, keyed by path and validated by inode, size, and `mtime_ns`.
 
-Config priority:
+## Keying
 
-```text
-branch or override value > env > dotenv (.env) > field default
-```
+`keying.keys.compute_input_key` hashes the five segments (`config`, `upstream`, `inputs`, `values`, `version`) over canonical JSON (sorted keys, no NaN, models dumped, tuples as lists, paths as POSIX strings) and combines the segment hashes into `input_key`. `key_components_json` keeps each segment's hash and a summary: the projected Config and the access list, upstream entries, per-input digest, file count, bytes, roots and either inline entries or a `file_sets` reference, the values, and the version. The probe's incremental hashing produces identical values.
 
-`run --override JSON` creates a temporary branch by deep-merging JSON over `main`. `run --expand` and `run --compact` control only matrix display folding and are mutually exclusive.
+**Config access.** `keying.config_access.record_config` wraps a pydantic model or dict in a read-only proxy that records top-level field reads into a `ConfigAccess`, or marks the whole Config when a read cannot be attributed. A unit's first key uses the whole Config (`config_access = NULL`). The committed access set is this execution's set plus the reads of its resources' `preflight`/`open` (stage and worker scope: shared by all units using the resource; unit scope: per unit), unioned with the previous row's set when that row was `ok` with the same `source_fp`. The set is only rewritten when a unit executes, so under `version=` or after `reuse` it keeps the reads of the last execution. Process workers resolve the access set in the child and return it in the `UnitOutcome`. Cross-branch linking recomputes the config hash under the candidate's access set.
 
-Do not add Click or Typer. The strict `argparse` behavior is intentional.
+**Inputs.** `keying.fingerprint.FingerprintSession` walks declared roots with `os.scandir` (roots may be symlinks; entries below them may not), walks globs with `walk_glob`, which prunes directories no include pattern can reach (or an exclude removes entirely) and rejects only symlinks the glob would select or descend into, and digests each input as `[mode, [[relpath, sha256] | [relpath, size, mtime_ns], ...]]` per root. Artifact fingerprints are always content hashes, computed right after the unit wrote its files.
 
-## Clean safety
+**Source.** `keying.source.SourceAnalyzer` parses the stage's defining file once per command (keyed by inode, size, `mtime_ns`) into a symbol table: every top-level binding statement under each name it binds, each imported name as its own symbol, and binding-free statements as the preamble. The closure starts at the stage's `FunctionDef` (with decorators, after stripping the `@stage` keywords `workers`, `exclusive`, `max_failures`, `backend`), the class header, every non-method class-body statement except the `Config`/`Args` bindings, every dunder method, and module-level statements that assign to the class. It follows member references (`self.`, `cls.`, `ClassName.`, `type(self).`, `self.__class__.`) within the class and module-level names transitively, and skips the top-level `Config`/`Args` classes of the same file, the main guard, and bare constants. Symbol hashes are SHA-256 of `ast.dump(..., include_attributes=False)`. Dynamic lookups, `getattr` with a non-constant name on the instance or class, or a star import switch to a whole-file AST hash. Declared `sources` contribute whole-file AST hashes through the stat cache. `source_fp` is the hash of `{mode, symbols, external}`; `source_detail_json` stores the file, mode, fallback reason, per-symbol hashes, and external hashes, which `inspect` diffs.
 
-Clean requires a valid `.varve/manifest.json` anchor under the selected output root and always removes that whole output root. It rejects dangerous roots such as empty paths, `/`, the home directory, and the current working directory, and pipelines can narrow allowed roots by overriding `Pipeline.clean_roots(config)`. Clean has no per-stage mode; intentional invalidation of a stage subtree uses `run --downstream STAGE --force`.
+**Source match.** `keys.source_match` returns `match`, `reused` (equals `reused_source_fp`), `code-modified` (differs, `version` set), or `changed`.
 
-## Top-level discovery and commands
+## Cross-pipeline references
 
-The top-level `varve` console script operates only on existing manifest-anchored stores. Discovery is zero-import and stops descending once `_branch_output_id()` confirms a valid branch output root, so materialized artifacts are never treated as further scan roots. Selector prefix, exact branch, and temporary scope filters run before import. Default bulk run additionally reads branch `manual` metadata before calling `load_state`: it locates the persisted module through loaded module paths or a component-wise `PathFinder` lookup, without importing parent packages, and reads the adjacent `varve.yaml`. Output paths and selector aliases are not used to guess the YAML location. Namespace packages are supported. Invalid branch policy is reported as a per-entry resolve error and prevents that entry from running. A valid temporary output root remains terminal even when it is filtered out because `--include-temp` was not passed. An invalid `.varve` directory does not stop traversal and therefore cannot hide a deeper valid store.
+The engine resolves Refs only through `engine.refs.RefResolver.bind(name, ref, axes, coords) -> [RefBinding(value, key)]`, called once per stage for the Refs that enter the key and once per resolver request for Refs a resolver reads. `workspace.refs.WorkspaceRefResolver` implements it without importing upstream modules:
 
-`varve ls` imports filtered manifest modules, resolves branches, and calls `collect_pipeline_status()` once per entry with a shared observation session. The dashboard model only wraps discovery metadata around shared `PipelineStatus`; it has no parallel stage taxonomy. The overview renderer shows the user-facing MODULE selector, BRANCH, and effective STATUS, adds duration and last run when wide enough, and switches to stacked rows rather than truncating MODULE. Status filtering runs after exact evaluation.
+1. Locate the upstream store: a class target uses `pipeline_root` of that class; a string target is matched against `varve.toml` entries and stores discovered under the scan root (exact name, then module or entry, then unambiguous dotted suffix).
+2. Read `meta`, the branch row (including `active_axes_json`), `storages`, and the stage's `units` in rowid order from a read-only connection. Keep rows inside the branch's active domain (declared static `ids` from `graph_json` restricted by the active axes, plus explicit dynamic `axes:` lists); ignore orphaned rows, out-of-domain rows, and rows whose key axes do not match the stage's axes; keep `ok` rows with artifacts and remember the status of in-domain rows that are not `ok`. Cache the result for the resolver's lifetime (one command).
+3. Align by axis name (honoring `align_by` and `selector`), returning a `Path` or an ordered `dict` of paths per coordinate, with `artifact_fp` or `[[unit_key, fp], ...]` as key material; multi-branch Refs wrap both in a dict keyed by branch. A coordinate that would read a `failed` or `running` in-domain unit, or whose 1-to-1 match or fan-in bucket is missing, is an error. Each path gets an existence check.
+4. Record a `RefInfo` per upstream read (root, ok unit count, last commit time, git state of the last run) for the Refs table.
 
-Top-level single commands call the same status, run, review, plan, clean, and structure services as generated commands. `cli/status.py`, `cli/plan.py`, `cli/structure.py`, `cli/review.py`, and `cli/run.py` own the shared single-pipeline rendering; `dashboard/render.py` owns only multi-pipeline overview and bulk-run reports. Engine and store modules do not import Rich, netext, or dashboard code.
+Errors are `RefResolutionError` with the upstream command to run. A resolution error aborts a probe and fails the stage during a run.
 
-`engine.review` owns pure base Stage candidate normalization, idempotent write planning, and result grouping. The runner owns the single locked persistence loop that turns the validated plan into ReviewRecords. Explicit `reuse` or `invalidate` holds one output lock, probes once, validates every source observation and base target before the first write, and returns a Stage-counted structured result. Each ReviewRecord is an atomic replacement; an interruption during a multi-Stage write loop may leave a validated subset that the same command safely completes on retry. Review commands never execute a Stage or mutate success, attempt, failure, partial, artifact fingerprint, or managed artifact state. Forced run is separate: it reruns selected concrete stages without planning or persisting Review writes.
+## Workspace and macro runs
 
-Bulk commands only enumerate filtered entries, reuse a command session, call single-entry services, refresh observations, and aggregate results. Review writes and locks are independent per store, so one failure does not roll back completed entries or stop later entries. Top-level `run` without MODULE defaults to bulk selection excluding manual branches. `--all` includes manual branches within the same discovery scope, without forcing execution or discovering uninitialized YAML branches. Explicit MODULE and generated pipeline commands ignore manual policy, and Review command selection is unchanged. The bulk report counts attempted execution, initial hits, and manual skips separately and lists skipped branches without evaluating their state. Bulk run skips hits and `needs-review`, attempts `needs-run`, `resume`, or `failed`, refreshes observations after every attempt or failure, and exact-evaluates final state. The report groups review blockers, failures, evaluation errors, and remaining runnable work; completion uses the shared effective status rather than a second dashboard rule.
+`workspace.config` parses `varve.toml` (`[workspace] pipelines`, `[storage]`, `[defaults] worker_env`) strictly and reads `VARVE_ROOT_BASE` into `WorkspaceSettings`. `workspace.modules.locate_module` finds registered modules with `PathFinder`, level by level, without executing any package `__init__`; `load_pipeline` imports a module (and, for a package without a pipeline, its `__main__`) only when a command needs the class. `workspace.discovery.discover` merges registered entries with stores found under the scan root, attaching each store to its entry by root, pipeline name, or module, and reads only `meta` and aggregate rows.
 
-The top-level and generated commands share `style.py` for effective status, source reason, Review action, module, branch, and bulk-run heading styles. Invalidate is yellow because it requests a rerun rather than representing an execution failure; reuse is green. Rich drops color automatically when output is not a terminal, and every category remains explicit in text.
+`workspace.macro.build_plan` builds `(pipeline, branch)` nodes from targets or registered pipelines and their `varve.yaml` branches, imports each pipeline to read the Refs of its graph (class attributes and inline `needs=Ref(...)`), adds the upstream nodes of every Ref branch recursively, orders nodes with Kahn's algorithm (ties by `varve.toml` index, name, branch index), applies `--only`/`--skip`/`--from`, and routes `--set` values to nodes whose `Args` declare the field (coerced with a pydantic `TypeAdapter`). `run_plan` calls `run_pipeline` for each selected node in order, in the same process, with a fresh `WorkspaceRefResolver` per node so each node sees its upstreams' newly committed records, and stops at the first node that does not end `ok`.
 
-Potentially slow discovery and exact evaluation use transient Rich status spinners only when the shared console is attached to a TTY. The status context ends before final tables or bulk-run logs are emitted; redirected output contains only final command output.
+`workspace.cli` is the `varve` entry point. CLI output goes through consoles that go quiet after the first `BrokenPipeError`, so a closed stdout or stderr pipe does not fail a command. `ls` and `ui` only touch discovery and SQL; the other commands import pipelines through the `Workspace` object and call `engine.service`.
 
-## Known limitations
+## Web UI
 
-- Source fingerprints use `ast.dump`; a CPython minor-version upgrade may invalidate caches.
-- Symlinks are rejected in declared inputs, source trees, and managed artifacts.
-- Persisted stat metadata is a hash shortcut, not content identity; force rehash is the diagnostic escape hatch for forged or unreliable stat tokens.
-- Windows is not supported yet because locking uses `fcntl`.
+`varve.ui` is a separate layer over store files. `ui.discovery.discover_state_dbs` finds `**/.varve/state.db` without following symlinks, skipping dot-directories, `node_modules`, `__pycache__`, `site-packages`, and storage roots. `ui.queries` holds all SQL: every request opens its own read-only connection (`mode=ro`, schema check, `PRAGMA query_only=ON`, `busy_timeout=2000`), computes counts, pagination, error groups, metric aggregates, and history series in SQL, and closes it. `ui.app` maps six JSON endpoints and the static assets (vanilla JavaScript, SVG, and CSS shipped in the wheel, no build step) with Starlette and serves them with Uvicorn. Missing pipelines, branches, stages, units, or runs are 404, `SchemaError` is 409, a locked database is 503. The UI never writes, never imports user modules, and never takes varve locks; WAL lets it read while a run writes.

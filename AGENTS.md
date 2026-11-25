@@ -4,7 +4,7 @@
 
 - User-facing positioning and examples: `README.md`.
 - Complete author-facing behavior: `docs/GUIDE.md`.
-- Package layout, dependency direction, cache/store, CLI/config, clean, and dashboard boundaries: `docs/ARCHITECTURE.md`.
+- Package layout, dependency direction, store schema and invariants, execution lifecycle, keying, Ref resolution, workspace orchestration, and web UI boundaries: `docs/ARCHITECTURE.md`.
 - Contributor setup, public API policy, style, and commit requirements: `CONTRIBUTING.md`. Read it before creating any varve commit.
 
 ## Agent Rules
@@ -14,7 +14,7 @@
 Keep the public import surface small:
 
 ```python
-from varve import Axis, Ctx, Pipeline, JSON, Dependencies, StageSpec, batch_stage, matrix, stage
+from varve import Axis, Ctx, Dependencies, Pipeline, Ref, Resource, stage
 ```
 
 Prefer compact pre-1.0 APIs over compatibility shims. If an old public name is awkward and there are no external users, update current callers and docs instead of keeping deprecated aliases.
