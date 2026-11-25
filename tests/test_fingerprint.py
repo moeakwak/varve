@@ -1,305 +1,246 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
+from varve import Dependencies
 from varve.keying import fingerprint as fingerprint_module
 from varve.keying.fingerprint import (
     FingerprintSession,
+    StatCache,
     artifact_fingerprint,
-    artifacts_root_fingerprint,
     canonical_json,
-    file_fingerprint,
-    files_fingerprints,
+    glob_match,
+    verify_manifest,
+    walk_files,
 )
 
 
-def test_materialization_fingerprint_preserves_batch_positions(tmp_path: Path) -> None:
-    first_path = tmp_path / "first.txt"
-    second_path = tmp_path / "second.txt"
-    first_path.write_text("first", encoding="utf-8")
-    second_path.write_text("second", encoding="utf-8")
-    artifacts = [
-        artifact_fingerprint(first_path, tmp_path),
-        artifact_fingerprint(second_path, tmp_path),
-    ]
-
-    ordered = artifacts_root_fingerprint(artifacts, positions=[(0, 0), (1, 0)])
-    reassigned = artifacts_root_fingerprint(artifacts, positions=[(1, 0), (0, 0)])
-
-    assert ordered != reassigned
+def write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
 
 
-def test_file_fingerprint_reuses_cached_sha_when_size_and_mtime_match(tmp_path: Path) -> None:
-    path = tmp_path / "input.txt"
-    path.write_text("alpha", encoding="utf-8")
-    first = file_fingerprint(path)
-    reused = file_fingerprint(path, cached=first)
-    assert reused is first
+def test_canonical_json_is_stable_and_strict() -> None:
+    class Model(BaseModel):
+        b: int = 1
+        a: str = "x"
 
-
-def test_file_fingerprint_recomputes_when_mtime_changes(tmp_path: Path) -> None:
-    path = tmp_path / "input.txt"
-    path.write_text("alpha", encoding="utf-8")
-    first = file_fingerprint(path)
-    path.write_text("bravo", encoding="utf-8")
-    second = file_fingerprint(path, cached=first)
-    assert second.content_hash != first.content_hash
-
-
-def test_file_fingerprint_missing_file_fails_fast(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        file_fingerprint(tmp_path / "missing.txt")
-
-
-def test_canonical_json_is_stable_and_rejects_unknown_objects() -> None:
-    assert canonical_json({"b": 2, "a": [1.0, True]}) == canonical_json({"a": [1.0, True], "b": 2})
+    assert canonical_json({"b": 1, "a": [1, (2, 3)]}) == b'{"a":[1,[2,3]],"b":1}'
+    assert canonical_json(Model()) == b'{"a":"x","b":1}'
+    assert canonical_json(Path("a/b")) == b'"a/b"'
+    with pytest.raises(TypeError, match="not JSON-serializable"):
+        canonical_json(object())
     with pytest.raises(TypeError, match="string keys"):
-        canonical_json({1: "not-json"})
-    with pytest.raises(TypeError):
-        canonical_json({"path": Path("not-json")})
-    assert json.loads(canonical_json({"x": 1}).decode("utf-8")) == {"x": 1}
+        canonical_json({1: "x"})
 
 
-def test_files_fingerprints_are_order_independent(tmp_path: Path) -> None:
-    a = tmp_path / "a.txt"
-    b = tmp_path / "b.txt"
-    a.write_text("a", encoding="utf-8")
-    b.write_text("b", encoding="utf-8")
+@pytest.mark.parametrize(
+    ("relpath", "pattern", "expected"),
+    [
+        ("a.py", "**/*.py", True),
+        ("x/y/a.py", "**/*.py", True),
+        ("x/a.py", "*.py", False),
+        ("x/a.py", "x/*.py", True),
+        ("x/a.txt", "**", True),
+        ("a1.py", "a?.py", True),
+        ("ab.py", "a[!b].py", False),
+        ("x/cache/a.py", "**/cache/**", True),
+    ],
+)
+def test_glob_match(relpath: str, pattern: str, expected: bool) -> None:
+    assert glob_match(relpath, pattern) is expected
 
-    class Ctx:
-        pass
 
-    one = files_fingerprints(Ctx(), {"datasets": lambda _ctx: [b, a]})
-    two = files_fingerprints(Ctx(), {"datasets": lambda _ctx: [a, b]})
-    assert [item.content_hash for item in one["datasets"]] == [
-        item.content_hash for item in two["datasets"]
+def test_input_material_uses_relative_paths(tmp_path: Path) -> None:
+    for root in ("one", "two"):
+        write(tmp_path / root / "data" / "a.txt", "alpha")
+        write(tmp_path / root / "data" / "sub" / "b.txt", "beta")
+    session = FingerprintSession()
+    one = session.input_digest(tmp_path / "one" / "data")
+    two = session.input_digest(str(tmp_path / "two" / "data"))
+    assert one.digest == two.digest
+    assert one.files == 2 and one.bytes == 9
+    assert [row[0] for row in one.material[0][1]] == ["a.txt", "sub/b.txt"]
+    assert one.roots == [str(tmp_path / "one" / "data")]
+
+    (tmp_path / "two" / "data" / "a.txt").rename(tmp_path / "two" / "data" / "c.txt")
+    assert FingerprintSession().input_digest(tmp_path / "two" / "data").digest != one.digest
+
+
+def test_content_and_stat_modes(tmp_path: Path) -> None:
+    path = write(tmp_path / "big.bin", "payload")
+    content = FingerprintSession().input_digest(path)
+    stat = FingerprintSession().input_digest(Dependencies.stat(path))
+    assert stat.material[0][0] == "stat" and stat.material[0][1] == [
+        ["big.bin", 7, path.stat().st_mtime_ns]
+    ]
+    os.utime(path, ns=(1, 1))
+    assert FingerprintSession().input_digest(path).digest == content.digest
+    assert FingerprintSession().input_digest(Dependencies.stat(path)).digest != stat.digest
+
+
+def test_glob_sets(tmp_path: Path) -> None:
+    write(tmp_path / "src" / "a.py", "a")
+    write(tmp_path / "src" / "pkg" / "b.py", "b")
+    write(tmp_path / "src" / "pkg" / "__pycache__" / "b.pyc", "c")
+    write(tmp_path / "src" / "notes.md", "d")
+    spec = Dependencies.glob(tmp_path / "src", include="**/*.py", exclude=["**/__pycache__/**"])
+    digest = FingerprintSession().input_digest(spec)
+    assert [row[0] for row in digest.material[0][1]] == ["a.py", "pkg/b.py"]
+    stat_glob = Dependencies.stat(spec)
+    assert FingerprintSession().input_digest(stat_glob).material[0][0] == "stat"
+    with pytest.raises(FileNotFoundError, match="matched no files"):
+        FingerprintSession().input_digest(Dependencies.glob(tmp_path / "src", include="*.rs"))
+    empty = Dependencies.glob(tmp_path / "src", include="*.rs", allow_empty=True)
+    assert FingerprintSession().input_digest(empty).files == 0
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        FingerprintSession().input_digest(Dependencies.glob(tmp_path / "missing"))
+
+
+def test_root_symlink_prefix_allowed_but_not_inside_trees(tmp_path: Path) -> None:
+    write(tmp_path / "real" / "a.txt", "a")
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    assert [rel for rel, _ in walk_files(tmp_path / "link")] == ["a.txt"]
+    (tmp_path / "file-link").symlink_to(tmp_path / "real" / "a.txt")
+    assert [rel for rel, _ in walk_files(tmp_path / "file-link")] == ["a.txt"]
+    (tmp_path / "real" / "inner").symlink_to(tmp_path / "real" / "a.txt")
+    with pytest.raises(ValueError, match="Symlinks are not allowed"):
+        walk_files(tmp_path / "link")
+
+
+def test_stat_cache_avoids_rehashing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = write(tmp_path / "input.txt", "alpha")
+    cache = StatCache()
+    first = FingerprintSession(cache).input_digest(path)
+    rows = cache.drain()
+    assert list(rows) == [str(path.resolve())] and cache.drain() == {}
+
+    calls: list[Path] = []
+    real = fingerprint_module._sha256_file
+
+    def counting(target: Path) -> str:
+        calls.append(target)
+        return real(target)
+
+    monkeypatch.setattr(fingerprint_module, "_sha256_file", counting)
+    assert FingerprintSession(StatCache(rows)).input_digest(path).digest == first.digest
+    assert calls == []
+    FingerprintSession(StatCache(rows), rehash=True).input_digest(path)
+    assert len(calls) == 1
+    path.write_text("beta!")
+    assert FingerprintSession(StatCache(rows)).input_digest(path).digest != first.digest
+    assert len(calls) == 2
+
+
+def test_hash_retries_when_file_changes_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write(tmp_path / "input.txt", "alpha")
+    real = fingerprint_module._sha256_file
+    attempts: list[int] = []
+
+    def racing(target: Path) -> str:
+        if not attempts:
+            target.write_text("changed during hashing")
+        attempts.append(1)
+        return real(target)
+
+    monkeypatch.setattr(fingerprint_module, "_sha256_file", racing)
+    digest, st = FingerprintSession().file_hash(path.resolve())
+    assert len(attempts) == 2 and st.st_size == len("changed during hashing")
+    assert digest == real(path)
+
+
+def test_artifact_manifest_and_verification(tmp_path: Path) -> None:
+    unit = tmp_path / "unit"
+    write(unit / "part.parquet", "rows")
+    write(unit / "img" / "a.png", "png")
+    artifact = artifact_fingerprint(unit)
+    assert [row[0] for row in artifact.manifest] == ["img/a.png", "part.parquet"]
+    assert artifact.files == 2 and artifact.bytes == 7
+    assert verify_manifest(unit, artifact.manifest)
+
+    copy = tmp_path / "copy"
+    write(copy / "part.parquet", "rows")
+    write(copy / "img" / "a.png", "png")
+    assert artifact_fingerprint(copy).fingerprint == artifact.fingerprint
+
+    target = unit / "part.parquet"
+    stat = target.stat()
+    target.write_text("ROWS")
+    os.utime(target, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert verify_manifest(unit, artifact.manifest)  # stat check cannot see it
+    assert not verify_manifest(unit, artifact.manifest, rehash=True)
+    target.write_text("longer rows")
+    assert not verify_manifest(unit, artifact.manifest)
+    target.unlink()
+    assert not verify_manifest(unit, artifact.manifest)
+
+
+def test_inputs_are_sorted_by_name(tmp_path: Path) -> None:
+    write(tmp_path / "a.txt", "a")
+    specs: dict[str, Any] = {"zeta": tmp_path / "a.txt", "alpha": [tmp_path / "a.txt"]}
+    assert list(FingerprintSession().inputs(specs)) == ["alpha", "zeta"]
+
+
+def test_glob_ignores_symlinks_it_cannot_select(tmp_path: Path) -> None:
+    write(tmp_path / "src" / "a.rs", "a")
+    write(tmp_path / "elsewhere" / "b.rs", "b")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "link").symlink_to(tmp_path / "elsewhere")
+    (tmp_path / ".venv").symlink_to(tmp_path / "elsewhere")
+    (tmp_path / "notes.md").symlink_to(tmp_path / "src" / "a.rs")
+    spec = Dependencies.glob(tmp_path, include="src/**/*.rs")
+    assert [row[0] for row in FingerprintSession().input_digest(spec).material[0][1]] == [
+        "src/a.rs"
     ]
 
 
-def test_fingerprint_session_reuses_input_expansion_but_calls_resolver(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = tmp_path / "inputs"
-    root.mkdir()
-    (root / "value.txt").write_text("value", encoding="utf-8")
-    resolver_calls = 0
-    expansion_calls = 0
-    original_tree_entries = fingerprint_module._tree_entries
-
-    def resolve(_ctx):
-        nonlocal resolver_calls
-        resolver_calls += 1
-        return root
-
-    def counted_tree_entries(*args, **kwargs):
-        nonlocal expansion_calls
-        expansion_calls += 1
-        yield from original_tree_entries(*args, **kwargs)
-
-    monkeypatch.setattr(fingerprint_module, "_tree_entries", counted_tree_entries)
-    session = FingerprintSession()
-
-    first = files_fingerprints(object(), {"input": resolve}, session=session)
-    second = files_fingerprints(object(), {"input": resolve}, session=session)
-
-    assert first == second
-    assert resolver_calls == 2
-    assert expansion_calls == 1
+def test_glob_rejects_selected_symlink_file(tmp_path: Path) -> None:
+    write(tmp_path / "src" / "a.rs", "a")
+    (tmp_path / "src" / "b.rs").symlink_to(tmp_path / "src" / "a.rs")
+    with pytest.raises(ValueError, match="Symlinks are not allowed"):
+        FingerprintSession().input_digest(Dependencies.glob(tmp_path, include="src/**/*.rs"))
+    # A symlink matched by include but also by exclude is ignored.
+    spec = Dependencies.glob(tmp_path, include="src/**/*.rs", exclude="src/b.rs")
+    assert FingerprintSession().input_digest(spec).files == 1
 
 
-def test_new_fingerprint_session_observes_input_tree_changes(tmp_path: Path) -> None:
-    root = tmp_path / "inputs"
-    root.mkdir()
-    (root / "first.txt").write_text("first", encoding="utf-8")
-
-    def resolver(_ctx):
-        return root
-
-    session = FingerprintSession()
-
-    first = files_fingerprints(object(), {"input": resolver}, session=session)
-    (root / "second.txt").write_text("second", encoding="utf-8")
-    shared_snapshot = files_fingerprints(object(), {"input": resolver}, session=session)
-    refreshed = files_fingerprints(
-        object(),
-        {"input": resolver},
-        session=FingerprintSession(),
-    )
-
-    assert len(first["input"]) == 2
-    assert shared_snapshot == first
-    assert len(refreshed["input"]) == 3
+def test_glob_symlinked_dir_errors_only_when_patterns_reach_it(tmp_path: Path) -> None:
+    write(tmp_path / "src" / "a.rs", "a")
+    write(tmp_path / "elsewhere" / "b.rs", "b")
+    (tmp_path / "src" / "vendored").symlink_to(tmp_path / "elsewhere")
+    (tmp_path / "node_modules").symlink_to(tmp_path / "elsewhere")
+    # `**` must descend into src/, and src/vendored/x.rs could match.
+    with pytest.raises(ValueError, match="Symlinks are not allowed"):
+        FingerprintSession().input_digest(Dependencies.glob(tmp_path, include="src/**/*.rs"))
+    # A pattern that cannot select below src/vendored leaves it alone.
+    top = Dependencies.glob(tmp_path, include="src/*.rs")
+    assert FingerprintSession().input_digest(top).files == 1
+    # Under a root-level `**`, node_modules could contribute unless excluded.
+    with pytest.raises(ValueError, match="node_modules"):
+        FingerprintSession().input_digest(
+            Dependencies.glob(tmp_path, include="**/*.rs", exclude="src/vendored")
+        )
 
 
-def test_fingerprint_session_shares_path_snapshot_and_keeps_files_distinct(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first_path = tmp_path / "first.txt"
-    second_path = tmp_path / "second.txt"
-    first_path.write_text("first", encoding="utf-8")
-    second_path.write_text("second", encoding="utf-8")
-    cached = file_fingerprint(first_path)
-    stale = cached.model_copy(
-        update={"mtime_ns": cached.mtime_ns - 1, "content_hash": "sha256:stale"}
-    )
-    # Python 3.10 Path.resolve() calls Path.stat() internally. Resolve first so
-    # this test counts only the session's explicit stat calls on every version.
-    resolved_paths = {
-        first_path: first_path.resolve(),
-        second_path: second_path.resolve(),
-    }
-
-    resolve_calls: list[Path] = []
-    stat_calls: list[Path] = []
-    hash_calls: list[Path] = []
-    original_stat = Path.stat
-    original_hash = fingerprint_module._sha256_file
-
-    def counted_resolve(path: Path, *args, **kwargs):
-        del args, kwargs
-        resolve_calls.append(path)
-        return resolved_paths[path]
-
-    def counted_stat(path: Path, *args, **kwargs):
-        stat_calls.append(path)
-        return original_stat(path, *args, **kwargs)
-
-    def counted_hash(path: Path) -> str:
-        hash_calls.append(path)
-        return original_hash(path)
-
-    monkeypatch.setattr(Path, "resolve", counted_resolve)
-    monkeypatch.setattr(Path, "stat", counted_stat)
-    monkeypatch.setattr(fingerprint_module, "_sha256_file", counted_hash)
-
-    session = FingerprintSession()
-    refreshed = file_fingerprint(first_path, cached=stale, session=session)
-    shared = file_fingerprint(first_path, cached=cached, session=session)
-    distinct = file_fingerprint(second_path, session=session)
-
-    assert shared is refreshed
-    assert refreshed.content_hash == cached.content_hash
-    assert distinct.content_hash != refreshed.content_hash
-    assert resolve_calls == [first_path, second_path]
-    assert stat_calls.count(first_path) == 3
-    assert stat_calls.count(second_path) == 3
-    assert hash_calls == [first_path, second_path]
-
-
-def test_fingerprint_session_keeps_stage_cached_fingerprints_independent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = tmp_path / "input.txt"
-    path.write_text("content", encoding="utf-8")
-    first = file_fingerprint(path)
-    second = first.model_copy(update={"sha256": "sha256:other-stage-record"})
-    session = FingerprintSession()
-
-    def unexpected_hash(_path: Path) -> str:
-        raise AssertionError("matching cached fingerprints must not read file content")
-
-    monkeypatch.setattr(fingerprint_module, "_sha256_file", unexpected_hash)
-
-    assert file_fingerprint(path, cached=first, session=session) is first
-    assert file_fingerprint(path, cached=second, session=session) is second
-
-
-def test_commit_artifact_force_rehash_ignores_preexecution_session(tmp_path: Path) -> None:
-    artifact = tmp_path / "artifact.txt"
-    artifact.write_text("before", encoding="utf-8")
-    session = FingerprintSession()
-    before = artifact_fingerprint(artifact, tmp_path, session=session)
-
-    artifact.write_text("after!", encoding="utf-8")
-    committed = artifact_fingerprint(
-        artifact,
+def test_glob_excluded_symlinks_are_fine(tmp_path: Path) -> None:
+    write(tmp_path / "src" / "a.rs", "a")
+    write(tmp_path / "elsewhere" / "b.rs", "b")
+    (tmp_path / "src" / "vendored").symlink_to(tmp_path / "elsewhere")
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "node_modules").symlink_to(tmp_path / "elsewhere")
+    spec = Dependencies.glob(
         tmp_path,
-        cached=before,
-        session=session,
-        force_rehash=True,
+        include="**/*.rs",
+        exclude=["src/vendored", "**/node_modules/**", "elsewhere/**"],
     )
-
-    assert committed.fingerprint != before.fingerprint
-
-
-def test_directory_artifact_fingerprint_tracks_tree_shape_and_empty_directories(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / "tree"
-    root.mkdir()
-    empty = artifact_fingerprint(root, tmp_path)
-
-    (root / "empty").mkdir()
-    with_empty_dir = artifact_fingerprint(root, tmp_path)
-    assert with_empty_dir.fingerprint != empty.fingerprint
-
-    (root / "value.txt").write_text("value", encoding="utf-8")
-    with_file = artifact_fingerprint(root, tmp_path)
-    assert with_file.fingerprint != with_empty_dir.fingerprint
-
-    (root / "value.txt").rename(root / "renamed.txt")
-    renamed = artifact_fingerprint(root, tmp_path)
-    assert renamed.fingerprint != with_file.fingerprint
-
-
-def test_force_rehash_detects_content_changed_with_restored_stat(tmp_path: Path) -> None:
-    artifact = tmp_path / "artifact.txt"
-    artifact.write_text("before", encoding="utf-8")
-    before_stat = artifact.stat()
-    before = artifact_fingerprint(artifact, tmp_path)
-
-    artifact.write_text("after!", encoding="utf-8")
-    artifact.chmod(before_stat.st_mode)
-    artifact.touch()
-    os.utime(artifact, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
-    after = artifact_fingerprint(artifact, tmp_path, cached=before, force_rehash=True)
-    assert after.fingerprint != before.fingerprint
-
-
-def test_input_and_artifact_root_symlinks_are_rejected(tmp_path: Path) -> None:
-    target = tmp_path / "target.txt"
-    target.write_text("value", encoding="utf-8")
-    link = tmp_path / "link.txt"
-    link.symlink_to(target)
-
-    class Ctx:
-        pass
-
-    with pytest.raises(ValueError, match="Symlinks are not supported in input dependencies"):
-        files_fingerprints(Ctx(), {"input": lambda _ctx: link})
-    with pytest.raises(ValueError, match="Symlinks are not supported in managed artifacts"):
-        artifact_fingerprint(link, tmp_path)
-
-
-def test_file_fingerprint_retries_a_concurrent_change_and_records_final_stat(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = tmp_path / "changing.txt"
-    path.write_text("before", encoding="utf-8")
-    original_hash = fingerprint_module._sha256_file
-    calls = 0
-
-    def mutate_once(target: Path) -> str:
-        nonlocal calls
-        calls += 1
-        digest = original_hash(target)
-        if calls == 1:
-            target.write_text("after!", encoding="utf-8")
-        return digest
-
-    monkeypatch.setattr(fingerprint_module, "_sha256_file", mutate_once)
-
-    fingerprint = file_fingerprint(path)
-
-    assert calls == 2
-    assert fingerprint.content_hash == original_hash(path)
-    assert fingerprint.size == path.stat().st_size
-    assert fingerprint.mtime_ns == path.stat().st_mtime_ns
+    assert [row[0] for row in FingerprintSession().input_digest(spec).material[0][1]] == [
+        "src/a.rs"
+    ]

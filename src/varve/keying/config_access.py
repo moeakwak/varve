@@ -9,11 +9,11 @@ unknown name, a missing dict key, whole-object iteration, equality, or
 pickling) conservatively marks the whole config as depended-on.
 
 Projecting the config onto the recorded field set is sound for unchanged
-source: fields that were not read cannot affect the output.  Source review is
-separate from the input key; reusing a source change also reuses
-responsibility for reusing the old access set when deciding whether an
-existing materialization is still valid.  Any execution under a different
-source fingerprint starts from the whole Config and records a new field set.
+source: fields that were not read cannot affect the output. An execution under
+a different source fingerprint starts from the whole Config and records a new
+field set. With the process backend the child wraps the (picklable) bare
+config, returns ``ConfigAccess.resolve()`` with the unit result, and the parent
+folds it in with :func:`merge_access`.
 """
 
 from __future__ import annotations
@@ -83,7 +83,32 @@ class ConfigAccess:
     def resolve(self) -> list[str] | None:
         """Return the sorted recorded fields, or ``None`` when all fields matter."""
 
-        return None if self._all else sorted(self._fields)
+        # Copy first: another thread may record while this one resolves.
+        return None if self._all else sorted(self._fields.copy())
+
+    @classmethod
+    def of(cls, resolved: list[str] | None) -> ConfigAccess:
+        """An access set holding a resolved list (``None``: whole config)."""
+
+        access = cls()
+        access.merge(resolved)
+        return access
+
+    def merge(self, resolved: list[str] | None) -> None:
+        """Fold in a resolved access set (e.g. one returned by a child process)."""
+
+        if resolved is None:
+            self.mark_all()
+        else:
+            self._fields.update(resolved)
+
+
+def merge_access(left: list[str] | None, right: list[str] | None) -> list[str] | None:
+    """Union of two resolved access sets; ``None`` (whole config) absorbs everything."""
+
+    if left is None or right is None:
+        return None
+    return sorted(set(left) | set(right))
 
 
 class RecordingConfig:
@@ -268,8 +293,7 @@ def project_config(config_data: dict[str, Any], access_fields: list[str] | None)
 
     ``None`` means "all fields depended-on" and returns the dump unchanged.
     Fields absent from the dump (for example, removed from Config since the set
-    was recorded) are skipped. Source review remains responsible for deciding
-    whether a changed Config-reading implementation may reuse the old set.
+    was recorded) are skipped.
     """
 
     if access_fields is None:

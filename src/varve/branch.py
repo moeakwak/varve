@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import copy
-import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -86,35 +84,9 @@ def load_branches(yaml_path: Path | None) -> dict[str, BranchDefinition]:
     return result
 
 
-def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
-    merged = copy.deepcopy(dict(base))
-    for key, value in override.items():
-        current = merged.get(key)
-        if isinstance(current, Mapping) and isinstance(value, Mapping):
-            merged[key] = _deep_merge(current, value)
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
-
-
-def merge_override(base_config: Mapping[str, Any], override_json: str) -> dict[str, Any]:
-    """Apply an override JSON object to a raw config mapping."""
-    override = json.loads(override_json)
-    if not isinstance(override, Mapping):
-        raise ValueError("--override must be a JSON object")
-    return _deep_merge(base_config, override)
-
-
 def canonical_config_json(config: Mapping[str, Any]) -> str:
     """Return stable JSON for a validated config snapshot."""
     return json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False)
-
-
-def override_branch_name(config: Mapping[str, Any], axes: Mapping[str, Any] | None = None) -> str:
-    """Derive the hash override branch name from a complete config snapshot."""
-    identity = {"config": dict(config), "axes": dict(axes or {})}
-    digest = hashlib.sha256(canonical_config_json(identity).encode("utf-8")).hexdigest()[:12]
-    return f"main_override_{digest}"
 
 
 def assert_same_config(left: Mapping[str, Any], right: Mapping[str, Any], *, branch: str) -> None:

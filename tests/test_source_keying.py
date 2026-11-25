@@ -1,565 +1,351 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
+import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from varve.engine.runner import probe_pipeline, run
-from varve.engine.state import SourceReviewState
-from varve.keying import source as source_module
-from varve.keying.source import SourceFingerprintSession
-from varve.models import SourceManifestEntry
+from varve.keying import fingerprint as fingerprint_module
+from varve.keying.fingerprint import FingerprintSession, StatCache
+from varve.keying.source import PREAMBLE, SourceAnalyzer
+
+_counter = itertools.count()
+
+BASE = '''\
+"""Module docstring."""
+import json
+from os.path import join as pjoin
+
+from pydantic import BaseModel
+from varve import Pipeline, stage
+
+SCHEMA = {"a": 1}
+SHARED = 10
 
 
-def _load_pipeline(path: Path, module_name: str):
-    spec = importlib.util.spec_from_file_location(module_name, path)
+def helper_a():
+    return SCHEMA
+
+
+def helper_b():
+    return pjoin("x", "y")
+
+
+class Config(BaseModel):
+    size: int = 1
+
+
+class Args(BaseModel):
+    workers: int = 1
+
+
+class Demo(Pipeline):
+    Config = Config
+    Args = Args
+
+    @stage()
+    def a(self, ctx):
+        self._util()
+        return helper_a(), SHARED
+
+    @stage()
+    def b(self, ctx):
+        return helper_b(), json.dumps(SHARED)
+
+    def _util(self):
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(Demo.cli())
+'''
+
+
+def load(directory: Path, source: str) -> type[Any]:
+    path = directory / "demo_pipeline.py"
+    path.write_text(source)
+    name = f"varve_source_demo_{next(_counter)}"
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module.Demo
 
 
-def _two_stage_shared_helper_source() -> str:
-    return """from pathlib import Path
-from pydantic import BaseModel
-from varve import Pipeline, stage
-
-HELPER = 1
-
-class Config(BaseModel):
-    pass
-
-class Demo(Pipeline):
-    Config = Config
-
-    @stage(produces="one.txt")
-    def one(self, ctx):
-        (ctx.out / "one.txt").write_text(str(HELPER), encoding="utf-8")
-
-    @stage(produces="two.txt")
-    def two(self, ctx):
-        (ctx.out / "two.txt").write_text("two", encoding="utf-8")
-"""
+def fps(directory: Path, source: str, **sources: list[Any]) -> dict[str, str]:
+    pipeline = load(directory, source)
+    analyzer = SourceAnalyzer()
+    return {
+        name: analyzer.stage_source(pipeline, name, sources.get(name, ())).fingerprint
+        for name in ("a", "b")
+    }
 
 
-def _source(body: str) -> str:
-    return f"""from pathlib import Path
-from pydantic import BaseModel
-from varve import Pipeline, stage
-
-class Config(BaseModel):
-    pass
-
-class Demo(Pipeline):
-    Config = Config
-    @stage(produces="artifact.txt")
-    def build(self, ctx):
-        {body}
-"""
+def changed(tmp_path: Path, old: str, new: str, *, count: int = 1) -> set[str]:
+    before = fps(tmp_path, BASE)
+    edited = BASE.replace(old, new, count)
+    assert edited != BASE
+    after = fps(tmp_path, edited)
+    return {name for name in before if before[name] != after[name]}
 
 
-def test_comment_only_source_change_keeps_fingerprint(tmp_path: Path) -> None:
-    module_path = tmp_path / "demo.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("same")'))
-    pipeline = _load_pipeline(module_path, "comment_keying_demo")
-    first = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=tmp_path / "out" / "main"
-    )[0]
-    module_path.write_text(module_path.read_text() + "\n# formatting-only comment\n")
-    pipeline = _load_pipeline(module_path, "comment_keying_demo")
-    second = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=tmp_path / "out" / "main"
-    )[0]
-    assert second.source_observation.rerun.fingerprint == first.source_observation.rerun.fingerprint
+def test_closure_detail_lists_reached_symbols(tmp_path: Path) -> None:
+    pipeline = load(tmp_path, BASE)
+    detail = SourceAnalyzer().stage_source(pipeline, "a").detail
+    assert detail["mode"] == "closure" and detail["fallback_reason"] is None
+    assert set(detail["symbols"]) == {
+        "Demo.a",
+        "Demo._util",
+        "Demo.<header>",
+        "helper_a",
+        "SCHEMA",
+        "SHARED",
+        "Pipeline",
+        "stage",
+    }
+    b = SourceAnalyzer().stage_source(pipeline, "b").detail["symbols"]
+    assert {"helper_b", "pjoin", "json", "SHARED"} <= set(b)
+    assert "Config" not in b and "Demo.a" not in b
+
+
+def test_comments_docstring_and_formatting_do_not_matter(tmp_path: Path) -> None:
+    assert changed(tmp_path, '"""Module docstring."""', '"""Edited."""\n# comment\n') == set()
     assert (
-        second.source_observation.review.fingerprint == first.source_observation.review.fingerprint
+        changed(tmp_path, "return helper_a(), SHARED", "return (helper_a(),   SHARED)  # x")
+        == set()
     )
 
 
-def test_stage_body_change_only_affects_that_stage_rerun(tmp_path: Path) -> None:
-    module_path = tmp_path / "two_stage.py"
-    module_path.write_text(_two_stage_shared_helper_source(), encoding="utf-8")
-    pipeline = _load_pipeline(module_path, "body_keying_demo")
-    output_base = tmp_path / "out"
-    run(pipeline, pipeline.Config(), cli_out=output_base)
-    before = {
-        probe.stage: (
-            probe.source_observation.rerun.fingerprint,
-            probe.source_observation.review.fingerprint,
-            probe.decision_key,
-        )
-        for probe in probe_pipeline(
-            pipeline, pipeline.Config(), args=pipeline.Args(), out=output_base / "main"
-        )
-    }
+def test_helper_edit_only_affects_stages_that_reach_it(tmp_path: Path) -> None:
+    assert changed(tmp_path, 'pjoin("x", "y")', 'pjoin("x", "z")') == {"b"}
+    assert changed(tmp_path, 'SCHEMA = {"a": 1}', 'SCHEMA = {"a": 2}') == {"a"}
+    assert changed(tmp_path, "return 1", "return 2") == {"a"}  # self._util
+    assert changed(tmp_path, "SHARED = 10", "SHARED = 11") == {"a", "b"}
 
-    text = module_path.read_text(encoding="utf-8")
-    module_path.write_text(
-        text.replace(
-            '(ctx.out / "one.txt").write_text(str(HELPER), encoding="utf-8")',
-            '(ctx.out / "one.txt").write_text(str(HELPER) + "!", encoding="utf-8")',
-        ),
-        encoding="utf-8",
+
+def test_stage_body_edit_does_not_affect_other_stages(tmp_path: Path) -> None:
+    assert changed(tmp_path, "json.dumps(SHARED)", "json.dumps(SHARED, indent=1)") == {"b"}
+    assert changed(tmp_path, "    @stage()\n    def a", "    @stage(version=2)\n    def a") == {"a"}
+
+
+def test_import_change_only_affects_stages_using_it(tmp_path: Path) -> None:
+    assert changed(
+        tmp_path, "from os.path import join as pjoin", "from posixpath import join as pjoin"
+    ) == {"b"}
+    assert changed(tmp_path, "import json\n", "import json as json\n") == {"b"}
+    assert (
+        changed(
+            tmp_path, "from varve import Pipeline, stage", "from varve import Ctx, Pipeline, stage"
+        )
+        == set()
     )
-    pipeline = _load_pipeline(module_path, "body_keying_demo")
-    after = {
-        probe.stage: probe
-        for probe in probe_pipeline(
-            pipeline, pipeline.Config(), args=pipeline.Args(), out=output_base / "main"
-        )
-    }
 
-    assert after["one"].source_observation.rerun.fingerprint != before["one"][0]
-    assert after["one"].source_observation.review.fingerprint == before["one"][1]
-    assert after["one"].decision_key != before["one"][2]
-    assert after["one"].decision.status == "needs-run"
-    assert after["one"].decision.reason == "source-changed"
-    assert after["one"].source_review.relationship == "current"
-    assert after["two"].source_observation.rerun.fingerprint == before["two"][0]
-    assert after["two"].source_observation.review.fingerprint == before["two"][1]
-    assert after["two"].decision_key == before["two"][2]
-    assert after["two"].decision.status == "hit"
+
+def test_unused_bindings_and_main_block_change_nothing(tmp_path: Path) -> None:
+    assert changed(tmp_path, "import json\n", "import json\nimport csv\n") == set()
+    assert changed(tmp_path, "SHARED = 10\n", "SHARED = 10\nUNUSED = [1, 2]\n") == set()
+    assert changed(tmp_path, "raise SystemExit(Demo.cli())", "Demo.cli()") == set()
+
+
+def test_config_and_args_bodies_affect_nobody(tmp_path: Path) -> None:
+    assert (
+        changed(tmp_path, "    size: int = 1", "    size: int = 2\n    extra: str = 'x'") == set()
+    )
+    assert changed(tmp_path, "    workers: int = 1", "    workers: int = 8") == set()
+
+
+def test_preamble_statements_affect_every_stage(tmp_path: Path) -> None:
+    with_preamble = BASE.replace("SHARED = 10\n", "SHARED = 10\nprint('setup')\n")
+    before = fps(tmp_path, with_preamble)
+    after = fps(tmp_path, with_preamble.replace("print('setup')", "print('changed')"))
+    assert all(before[name] != after[name] for name in before)
+    detail = SourceAnalyzer().stage_source(load(tmp_path, with_preamble), "a").detail
+    assert PREAMBLE in detail["symbols"]
 
 
 @pytest.mark.parametrize(
-    ("case", "before", "after"),
+    ("snippet", "reason"),
     [
-        (
-            "decorator",
-            '@stage(produces="artifact.txt")',
-            '@stage(produces=["artifact.txt"])',
-        ),
-        ("signature", "def build(self, ctx):", "def build(self, ctx) -> None:"),
+        ("globals()", "globals()"),
+        ("eval('1')", "eval()"),
+        ("vars()", "vars()"),
+        ("sys.modules[__name__]", "sys.modules[__name__]"),
+        ("importlib.import_module(__name__)", "importlib.import_module(__name__)"),
     ],
 )
-def test_stage_decorator_and_signature_enter_rerun_fingerprint(
-    tmp_path: Path,
-    case: str,
-    before: str,
-    after: str,
-) -> None:
-    module_path = tmp_path / f"{case}.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("same")'))
-    pipeline = _load_pipeline(module_path, f"{case}_keying_demo")
-    first = SourceFingerprintSession().observe(pipeline, pipeline.stages()["build"])
-    module_path.write_text(module_path.read_text().replace(before, after))
-    pipeline = _load_pipeline(module_path, f"{case}_keying_demo")
-    second = SourceFingerprintSession().observe(pipeline, pipeline.stages()["build"])
-    assert second.rerun.fingerprint != first.rerun.fingerprint
-    assert second.review.fingerprint == first.review.fingerprint
+def test_dynamic_lookup_falls_back_to_whole_file(tmp_path: Path, snippet: str, reason: str) -> None:
+    dynamic = BASE.replace("def helper_b():\n", f"def helper_b():\n    {snippet}\n")
+    pipeline = load(tmp_path, dynamic)
+    detail = SourceAnalyzer().stage_source(pipeline, "a").detail
+    assert detail["mode"] == "whole-file" and detail["fallback_reason"] == reason
+    before = fps(tmp_path, dynamic)
+    after = fps(tmp_path, dynamic.replace('pjoin("x", "y")', 'pjoin("x", "z")'))
+    assert before["a"] != after["a"] and before["b"] != after["b"]
 
 
-def test_shared_helper_change_opens_review_for_both_stages(tmp_path: Path) -> None:
-    module_path = tmp_path / "shared_helper.py"
-    module_path.write_text(_two_stage_shared_helper_source(), encoding="utf-8")
-    pipeline = _load_pipeline(module_path, "helper_keying_demo")
-    output_base = tmp_path / "out"
-    run(pipeline, pipeline.Config(), cli_out=output_base)
-    module_path.write_text(
-        module_path.read_text(encoding="utf-8").replace("HELPER = 1", "HELPER = 2"),
-        encoding="utf-8",
-    )
-    pipeline = _load_pipeline(module_path, "helper_keying_demo")
-    probes = {
-        probe.stage: probe
-        for probe in probe_pipeline(
-            pipeline, pipeline.Config(), args=pipeline.Args(), out=output_base / "main"
-        )
-    }
-    assert probes["one"].source_review == SourceReviewState("changed")
-    assert probes["two"].source_review == SourceReviewState("changed")
-    assert probes["one"].decision.status == "hit"
-    assert probes["two"].decision.status == "hit"
-
-
-def test_declared_sources_enter_rerun_and_review_sources_enter_review(tmp_path: Path) -> None:
-    rerun_helper = tmp_path / "rerun_helper.py"
-    review_helper = tmp_path / "review_helper.py"
-    rerun_helper.write_text("VALUE = 1\n", encoding="utf-8")
-    review_helper.write_text("VALUE = 1\n", encoding="utf-8")
-    module_path = tmp_path / "declared.py"
-    module_path.write_text(
-        """from pathlib import Path
-from pydantic import BaseModel
-from varve import Dependencies, Pipeline, stage
-
-class Config(BaseModel):
-    pass
-
-class Demo(Pipeline):
-    Config = Config
-
-    @stage(
-        produces="artifact.txt",
-        depends=Dependencies(
-            sources=[Path("rerun_helper.py")],
-            review_sources=[Path("review_helper.py")],
-        ),
-    )
-    def build(self, ctx):
-        (ctx.out / "artifact.txt").write_text("same", encoding="utf-8")
-""",
-        encoding="utf-8",
-    )
-    pipeline = _load_pipeline(module_path, "declared_keying_demo")
-    output_base = tmp_path / "out"
-    run(pipeline, pipeline.Config(), cli_out=output_base)
-
-    rerun_helper.write_text("VALUE = 2\n", encoding="utf-8")
-    rerun_probe = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=output_base / "main"
-    )[0]
-    assert rerun_probe.decision.status == "needs-run"
-    assert rerun_probe.decision.reason == "source-changed"
-    assert rerun_probe.source_review.relationship == "current"
-
-    rerun_helper.write_text("VALUE = 1\n", encoding="utf-8")
-    review_helper.write_text("VALUE = 2\n", encoding="utf-8")
-    review_probe = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=output_base / "main"
-    )[0]
-    assert review_probe.source_review == SourceReviewState("changed")
-    assert review_probe.decision.status == "hit"
-
-
-def test_same_declared_root_in_sources_and_review_sources_fast_fails(tmp_path: Path) -> None:
-    helper = tmp_path / "helper.py"
-    helper.write_text("VALUE = 1\n", encoding="utf-8")
-    module_path = tmp_path / "conflict.py"
-    module_path.write_text(
-        """from pathlib import Path
-from pydantic import BaseModel
-from varve import Dependencies, Pipeline, stage
-
-class Config(BaseModel):
-    pass
-
-class Demo(Pipeline):
-    Config = Config
-
-    @stage(
-        produces="artifact.txt",
-        depends=Dependencies(
-            sources=[Path("helper.py")],
-            review_sources=[Path("helper.py")],
-        ),
-    )
-    def build(self, ctx):
-        (ctx.out / "artifact.txt").write_text("same", encoding="utf-8")
-""",
-        encoding="utf-8",
-    )
-    pipeline = _load_pipeline(module_path, "conflict_keying_demo")
-    probe = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=tmp_path / "out" / "main"
-    )[0]
-    assert probe.decision.status == "error"
-    assert "same root" in probe.decision.reason
-
-
-def test_overlapping_declared_files_prefer_rerun(tmp_path: Path) -> None:
+def test_cross_file_sources_enter_the_fingerprint(tmp_path: Path) -> None:
     shared = tmp_path / "shared"
     shared.mkdir()
-    (shared / "member.py").write_text("VALUE = 1\n", encoding="utf-8")
-    module_path = tmp_path / "overlap.py"
-    module_path.write_text(
-        """from pathlib import Path
-from pydantic import BaseModel
-from varve import Dependencies, Pipeline, stage
+    (shared / "render.py").write_text("def render():\n    return 1\n")
+    (shared / "notes.txt").write_text("not python")
+    single = tmp_path / "extra.py"
+    single.write_text("X = 1\n")
 
-class Config(BaseModel):
-    pass
+    before = fps(tmp_path, BASE, a=["shared"], b=[single])
+    pipeline = load(tmp_path, BASE)
+    detail = SourceAnalyzer().stage_source(pipeline, "a", ["shared", single]).detail
+    assert list(detail["external"]) == ["extra.py", "shared/render.py"]
 
-class Demo(Pipeline):
-    Config = Config
+    (shared / "render.py").write_text("def render():\n    # comment only\n    return 1\n")
+    assert fps(tmp_path, BASE, a=["shared"], b=[single]) == before
+    (shared / "render.py").write_text("def render():\n    return 2\n")
+    after = fps(tmp_path, BASE, a=["shared"], b=[single])
+    assert after["a"] != before["a"] and after["b"] == before["b"]
 
-    @stage(
-        produces="artifact.txt",
-        depends=Dependencies(
-            sources=[Path("shared")],
-            review_sources=[Path("shared/member.py")],
-        ),
-    )
-    def build(self, ctx):
-        (ctx.out / "artifact.txt").write_text("same", encoding="utf-8")
-""",
-        encoding="utf-8",
-    )
-    pipeline = _load_pipeline(module_path, "overlap_keying_demo")
-    output_base = tmp_path / "out"
-    run(pipeline, pipeline.Config(), cli_out=output_base)
-    (shared / "member.py").write_text("VALUE = 2\n", encoding="utf-8")
-    probe = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=output_base / "main"
-    )[0]
-    assert probe.decision.status == "needs-run"
-    assert probe.decision.reason == "source-changed"
-    assert probe.source_review.relationship == "current"
-    assert any(entry.path.startswith("declared:") for entry in probe.source_observation.rerun.files)
-    assert not any(
-        entry.path.startswith("review:") for entry in probe.source_observation.review.files
-    )
+    with pytest.raises(ValueError, match="must end in .py"):
+        SourceAnalyzer().stage_source(pipeline, "a", [shared / "notes.txt"])
 
 
-def test_local_class_factory_callable_is_located(tmp_path: Path) -> None:
-    module_path = tmp_path / "factory.py"
-    module_path.write_text(
-        """from pathlib import Path
-from pydantic import BaseModel
-from varve import Pipeline, stage
-
-class Config(BaseModel):
-    pass
-
-def build_effect_experiment():
-    class Demo(Pipeline):
-        Config = Config
-
-        @stage(produces="artifact.txt")
-        def build(self, ctx):
-            (ctx.out / "artifact.txt").write_text("ok", encoding="utf-8")
-
-    return Demo
-
-Demo = build_effect_experiment()
-""",
-        encoding="utf-8",
-    )
-    pipeline = _load_pipeline(module_path, "factory_keying_demo")
-    probe = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=tmp_path / "out" / "main"
-    )[0]
-    assert probe.decision.status == "needs-run"
-    assert probe.source_observation.rerun.fingerprint != "error"
-    assert any(entry.path == "callable:build" for entry in probe.source_observation.rerun.files)
+def test_checkout_location_does_not_enter_the_fingerprint(tmp_path: Path) -> None:
+    first, second = tmp_path / "one", tmp_path / "two"
+    for directory in (first, second):
+        (directory / "lib").mkdir(parents=True)
+        (directory / "lib" / "mod.py").write_text("Y = 2\n")
+    assert fps(first, BASE, a=["lib"]) == fps(second, BASE, a=["lib"])
 
 
-def test_checkout_absolute_path_does_not_enter_fingerprint(tmp_path: Path) -> None:
-    module_path = tmp_path / "abs_path.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("same")'))
-    pipeline = _load_pipeline(module_path, "abs_path_keying_demo")
-    observation = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=tmp_path / "out" / "main"
-    )[0].source_observation
-    for entry in (*observation.rerun.files, *observation.review.files):
-        assert str(tmp_path) not in entry.path
-        assert str(tmp_path) not in entry.digest
+def test_symlinked_source_root_prefix_is_allowed(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "mod.py").write_text("Z = 3\n")
+    (tmp_path / "link").symlink_to(real)
+    assert fps(tmp_path, BASE, a=["link"])["a"]
+    (real / "inner").symlink_to(real / "mod.py")
+    with pytest.raises(ValueError, match="Symlinks are not allowed"):
+        fps(tmp_path, BASE, a=["link"])
 
 
-def test_declared_source_directory_manifest_changes_fingerprint(tmp_path: Path) -> None:
-    helpers = tmp_path / "helpers"
-    helpers.mkdir()
-    (helpers / "first.py").write_text("VALUE = 1\n", encoding="utf-8")
-    module_path = tmp_path / "declared_dir.py"
-    module_path.write_text(
-        """from pathlib import Path
-from pydantic import BaseModel
-from varve import Dependencies, Pipeline, stage
-
-class Config(BaseModel):
-    pass
-
-class Demo(Pipeline):
-    Config = Config
-
-    @stage(produces="artifact.txt", depends=Dependencies(sources=[Path("helpers")]))
-    def build(self, ctx):
-        (ctx.out / "artifact.txt").write_text("same", encoding="utf-8")
-""",
-        encoding="utf-8",
-    )
-    pipeline = _load_pipeline(module_path, "declared_dir_keying_demo")
-    output_base = tmp_path / "out"
-    run(pipeline, pipeline.Config(), cli_out=output_base)
-    first = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=output_base / "main"
-    )[0].source_observation.rerun.fingerprint
-
-    (helpers / "second.py").write_text("VALUE = 2\n", encoding="utf-8")
-    second = probe_pipeline(
-        pipeline, pipeline.Config(), args=pipeline.Args(), out=output_base / "main"
-    )[0]
-    assert second.source_observation.rerun.fingerprint != first
-    assert second.decision.reason == "source-changed"
-
-
-def test_source_stat_cache_requires_same_physical_path(tmp_path: Path) -> None:
-    source_path = tmp_path / "source.py"
-    source_path.write_text("VALUE = 2\n", encoding="utf-8")
-    stat = source_path.stat()
-    stale = SourceManifestEntry(
-        path="pipeline/source.py",
-        cache_path=str(tmp_path / "other-checkout" / "source.py"),
-        digest="sha256:stale",
-        inode=stat.st_ino,
-        size=stat.st_size,
-        mtime_ns=stat.st_mtime_ns,
-    )
-    entries, _paths = source_module._declared_entries(
-        {source_path: "pipeline"},
-        {stale.path: stale},
-        force_rehash=False,
-    )
-    observed = entries["pipeline/source.py"]
-    assert observed.cache_path == str(source_path.resolve())
-    assert observed.digest != stale.digest
-
-
-def test_residual_ast_retries_when_file_changes_during_read(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_external_ast_hash_uses_the_stat_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    module_path = tmp_path / "racing_source.py"
-    initial = _two_stage_shared_helper_source()
-    changed = initial.replace("HELPER = 1", "HELPER = 2")
-    module_path.write_text(initial, encoding="utf-8")
-    pipeline = _load_pipeline(module_path, "racing_source_demo")
-    stage_spec = pipeline.stages()["one"]
-    baseline = SourceFingerprintSession().observe(pipeline, stage_spec)
-    original_read = Path.read_bytes
-    reads = 0
+    (tmp_path / "ext.py").write_text("A = 1\n")
+    pipeline = load(tmp_path, BASE)
+    cache = StatCache()
+    first = SourceAnalyzer(FingerprintSession(cache)).stage_source(pipeline, "a", ["ext.py"])
+    rows = cache.drain()
+    assert any(row.ast_hash for row in rows.values())
 
-    def racing_read(path: Path) -> bytes:
-        nonlocal reads
-        source = original_read(path)
-        if path == module_path:
-            reads += 1
-            if reads == 1:
-                module_path.write_text(changed, encoding="utf-8")
-        return source
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("external file was re-parsed")
 
-    monkeypatch.setattr(Path, "read_bytes", racing_read)
-    observed = SourceFingerprintSession().observe(pipeline, stage_spec)
-
-    assert reads == 2
-    assert observed.review.fingerprint != baseline.review.fingerprint
+    monkeypatch.setattr(fingerprint_module, "normalized_ast", fail)
+    second = SourceAnalyzer(FingerprintSession(StatCache(rows))).stage_source(
+        pipeline, "a", ["ext.py"]
+    )
+    assert second.fingerprint == first.fingerprint
 
 
-def test_unlocatable_stage_callable_is_an_evaluation_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module_path = tmp_path / "unlocatable.py"
-    module_path.write_text(_source('(ctx.out / "artifact.txt").write_text("same")'))
-    pipeline = _load_pipeline(module_path, "unlocatable_source_demo")
-    stage_func = pipeline.stages()["build"].func
-    original_getsourcefile = source_module.inspect.getsourcefile
-    monkeypatch.setattr(
-        source_module.inspect,
-        "getsourcefile",
-        lambda value: None if value is stage_func else original_getsourcefile(value),
+def test_copy_of_pipeline_file_has_same_fingerprint(tmp_path: Path) -> None:
+    other = tmp_path / "copy"
+    other.mkdir()
+    before = fps(tmp_path, BASE)
+    shutil.copy(tmp_path / "demo_pipeline.py", other / "demo_pipeline.py")
+    assert fps(other, BASE) == before
+
+
+def test_class_body_members_enter_every_stage(tmp_path: Path) -> None:
+    with_attrs = BASE.replace(
+        "    Config = Config\n",
+        "    Config = Config\n    defaults = {'workers': SIZE}\n    SCALE = 1\n\n"
+        "    def __init__(self):\n        self.k = 0\n",
+    ).replace("SHARED = 10\n", "SHARED = 10\nSIZE = 2\n")
+
+    def edit(old: str, new: str) -> set[str]:
+        before = fps(tmp_path, with_attrs)
+        after = fps(tmp_path, with_attrs.replace(old, new))
+        return {name for name in before if before[name] != after[name]}
+
+    assert edit("SCALE = 1", "SCALE = 2") == {"a", "b"}
+    assert edit("self.k = 0", "self.k = 1") == {"a", "b"}  # dunder methods run for every stage
+    assert edit("SIZE = 2", "SIZE = 3") == {"a", "b"}  # followed from `defaults`
+    # A stage's private helper still only affects that stage.
+    assert edit('pjoin("x", "y")', 'pjoin("x", "z")') == {"b"}
+
+
+def test_module_level_class_mutation_enters_the_closure(tmp_path: Path) -> None:
+    mutated = BASE.replace(
+        'if __name__ == "__main__":', 'Demo.SCALE = 1\n\n\nif __name__ == "__main__":'
+    )
+    before = fps(tmp_path, mutated)
+    after = fps(tmp_path, mutated.replace("Demo.SCALE = 1", "Demo.SCALE = 2"))
+    assert before["a"] != after["a"] and before["b"] != after["b"]
+
+
+def test_type_self_attribute_reaches_the_member(tmp_path: Path) -> None:
+    source = BASE.replace("        return helper_b(),", "        return type(self).Y, helper_b(),")
+    source = source.replace(
+        "    def _util(self):", "    def Y(self):\n        return 5\n\n    def _util(self):"
+    )
+    before = fps(tmp_path, source)
+    after = fps(tmp_path, source.replace("return 5", "return 6"))
+    assert before["b"] != after["b"]
+
+
+@pytest.mark.parametrize("owner", ["self", "cls", "type(self)", "self.__class__", "Demo"])
+def test_dynamic_class_getattr_falls_back_to_whole_file(tmp_path: Path, owner: str) -> None:
+    source = BASE.replace("        self._util()\n", f"        getattr({owner}, ctx)\n")
+    pipeline = load(tmp_path, source)
+    detail = SourceAnalyzer().stage_source(pipeline, "b").detail
+    assert detail["mode"] == "whole-file"
+    assert detail["fallback_reason"].startswith(f"getattr({owner}, <non-constant>)")
+    constant = BASE.replace("        self._util()\n", f"        getattr({owner}, 'x')\n")
+    detail = SourceAnalyzer().stage_source(load(tmp_path, constant), "b").detail
+    assert detail["mode"] == "closure"
+
+
+def test_scheduling_keywords_do_not_enter_the_fingerprint(tmp_path: Path) -> None:
+    for old, new in [
+        ("    @stage()\n    def a", "    @stage(workers=4, backend='thread')\n    def a"),
+        ("    @stage()\n    def a", "    @stage(exclusive='x=1', max_failures=2)\n    def a"),
+    ]:
+        assert changed(tmp_path, old, new) == set()
+    assert changed(tmp_path, "    @stage()\n    def a", "    @stage(storage='x')\n    def a") == {
+        "a"
+    }
+    aliased = BASE.replace(
+        "from varve import Pipeline, stage", "import varve\nfrom varve import Pipeline"
+    )
+    aliased = aliased.replace("@stage()", "@varve.stage()")
+    before = fps(tmp_path, aliased)
+    after = fps(
+        tmp_path, aliased.replace("@varve.stage()\n    def a", "@varve.stage(workers=3)\n    def a")
+    )
+    assert before == after
+
+
+def test_helper_methods_enter_only_the_stages_that_reach_them(tmp_path: Path) -> None:
+    source = BASE.replace(
+        "        return helper_b(), json.dumps(SHARED)",
+        "        return self._h(), helper_b(), json.dumps(SHARED)",
+    ).replace(
+        "    def _util(self):",
+        "    def _h(self):\n        return type(self)._deep()\n\n"
+        "    @classmethod\n    def _deep(cls):\n        return 'h1'\n\n"
+        "    def _picked(self):\n        return 'p1'\n\n"
+        "    defaults = {'workers': _picked}\n\n"
+        "    def _util(self):",
     )
 
-    probe = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=tmp_path / "out" / "main",
-    )[0]
+    def edit(old: str, new: str) -> set[str]:
+        before = fps(tmp_path, source)
+        after = fps(tmp_path, source.replace(old, new))
+        return {name for name in before if before[name] != after[name]}
 
-    assert probe.decision.status == "error"
-    assert "Cannot locate Python source file for stage build" in probe.decision.reason
-
-
-def test_ambiguous_stage_callable_ast_is_an_evaluation_error(tmp_path: Path) -> None:
-    module_path = tmp_path / "ambiguous.py"
-    module_path.write_text(
-        """from pydantic import BaseModel
-from varve import Pipeline, stage
-
-class Config(BaseModel):
-    pass
-
-def make_build():
-    def build():
-        def build(self, ctx):
-            (ctx.out / "artifact.txt").write_text("same", encoding="utf-8")
-        return build
-    return build()
-
-class Demo(Pipeline):
-    Config = Config
-    build = stage(produces="artifact.txt")(make_build())
-""",
-        encoding="utf-8",
-    )
-    pipeline = _load_pipeline(module_path, "ambiguous_source_demo")
-
-    probe = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=tmp_path / "out" / "main",
-    )[0]
-
-    assert probe.decision.status == "error"
-    assert "Cannot uniquely locate Stage callable AST" in probe.decision.reason
-    assert "found 2 candidates" in probe.decision.reason
-
-
-def test_source_parser_honors_pep_263_encoding(tmp_path: Path) -> None:
-    module_path = tmp_path / "latin1_demo.py"
-    source = "# coding: latin-1\n" + _source(
-        '(ctx.out / "artifact.txt").write_text("é", encoding="utf-8")'
-    )
-    module_path.write_bytes(source.encode("latin-1"))
-    pipeline = _load_pipeline(module_path, "latin1_keying_demo")
-    probe = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=tmp_path / "out" / "main",
-    )[0]
-    assert probe.decision.status == "needs-run"
-    assert probe.source_observation.rerun.fingerprint != "error"
-
-
-@pytest.mark.parametrize(
-    ("declared_name", "contents", "message"),
-    [
-        ("missing.py", None, "Declared source path does not exist"),
-        ("helper.txt", "value\n", "Declared source file must end in .py"),
-        ("broken.py", "def broken(:\n", "Cannot parse Python source file"),
-    ],
-)
-def test_invalid_declared_source_is_an_evaluation_error(
-    tmp_path: Path,
-    declared_name: str,
-    contents: str | None,
-    message: str,
-) -> None:
-    if contents is not None:
-        (tmp_path / declared_name).write_text(contents, encoding="utf-8")
-    module_path = tmp_path / "invalid_source_demo.py"
-    module_path.write_text(
-        f"""from pathlib import Path
-from pydantic import BaseModel
-from varve import Dependencies, Pipeline, stage
-
-class Config(BaseModel):
-    pass
-
-class Demo(Pipeline):
-    Config = Config
-
-    @stage(
-        produces="artifact.txt",
-        depends=Dependencies(sources=[Path("{declared_name}")]),
-    )
-    def build(self, ctx):
-        (ctx.out / "artifact.txt").write_text("same", encoding="utf-8")
-""",
-        encoding="utf-8",
-    )
-    pipeline = _load_pipeline(module_path, f"invalid_source_{declared_name.replace('.', '_')}")
-    probe = probe_pipeline(
-        pipeline,
-        pipeline.Config(),
-        args=pipeline.Args(),
-        out=tmp_path / "out" / "main",
-    )[0]
-    assert probe.decision.status == "error"
-    assert message in probe.decision.reason
+    assert edit("return type(self)._deep()", "return type(self)._deep() + 'x'") == {"b"}
+    assert edit("return 'h1'", "return 'h2'") == {"b"}  # transitively via type(self)
+    assert edit("return 'p1'", "return 'p2'") == {"a", "b"}  # referenced by `defaults`

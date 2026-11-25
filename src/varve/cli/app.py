@@ -1,201 +1,280 @@
-"""Command-line interface for Pipeline subclasses."""
+"""The generated command-line interface of a Pipeline (``Pipeline.cli()``)."""
 
 from __future__ import annotations
 
 import argparse
-import re
+import sqlite3
 import sys
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import ValidationError
 
-from varve.branch_config import resolve_branch
-from varve.cli import argmap
-from varve.cli.clean import default_confirm
-from varve.cli.commands import dispatch_command
-from varve.cli.structure import render_structure
-from varve.command import resolved_command_context
+from varve.branch_config import parse_sample, parse_slice
+from varve.cli import argmap, render
+from varve.engine.probe import ProbeError
+from varve.engine.refs import RefResolutionError
+from varve.engine.resources import ResourceError
+from varve.engine.run import RunOptions
+from varve.engine.service import (
+    clean_pipeline,
+    inspect_pipeline,
+    parse_unit_selector,
+    plan_clean,
+    probe_pipeline,
+    reuse_stage,
+    run_pipeline,
+)
+from varve.graph import GraphError
 from varve.log import configure_cli_logging
-from varve.matrix import build_graph
 from varve.pipeline import Pipeline
+from varve.store.db import SchemaError
+from varve.store.lock import LockBusyError
 from varve.style import make_console
 
-_NEGATIVE_NUMBER_RE = re.compile(r"^-\d+$|^-\d*\.\d+$")
-_REHASH_HELP = "Ignore persisted stat shortcuts while keying."
+USER_ERRORS = (
+    ValueError,
+    GraphError,
+    ProbeError,
+    RefResolutionError,
+    ResourceError,
+    SchemaError,
+    LockBusyError,
+    FileNotFoundError,
+    sqlite3.OperationalError,
+)
 
 
-def _selected_command_index(argv: list[str]) -> int | None:
-    for index, token in enumerate(argv):
-        if token in {"-v", "--verbose"}:
-            continue
-        if token == "--":
-            next_index = index + 1
-            return next_index if next_index < len(argv) else None
-        if token.startswith("-"):
-            return None
-        return index
-    return None
+def _common() -> argparse.ArgumentParser:
+    # Accepted before or after the subcommand; SUPPRESS keeps a later default
+    # from overwriting an earlier value.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--root",
+        type=Path,
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help="Pipeline root holding .varve/ (default: the pipeline module's directory).",
+    )
+    common.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Verbose logging.",
+    )
+    return common
 
 
-def _looks_like_option(token: str) -> bool:
-    return token.startswith("-") and token != "-" and _NEGATIVE_NUMBER_RE.match(token) is None
+def _add_branch(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--branch", default="main", metavar="NAME", help="Branch (default: main).")
 
 
-def _has_unknown_option_before_config_registration(
-    *,
-    parser: argparse.ArgumentParser,
-    command_args: list[str],
-    args_type: type[BaseModel],
-) -> bool:
-    option_arities = argmap.args_option_arities(args_type)
-    option_arities.update(
-        (option, 0 if action.nargs == 0 else 1)
-        for action in parser._actions
-        for option in action.option_strings
+def _add_selection(parser: argparse.ArgumentParser, verb: str) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--only", metavar="STAGE", help=f"{verb} only this stage.")
+    group.add_argument("--upto", metavar="STAGE", help=f"{verb} this stage and its ancestors.")
+    group.add_argument(
+        "--downstream", metavar="STAGE", help=f"{verb} this stage and its descendants."
     )
 
-    for index, token in enumerate(command_args):
-        if token == "--":
-            return False
-        if not _looks_like_option(token):
-            continue
-        option = token.split("=", 1)[0] if token.startswith("--") else token
-        arity = option_arities.get(option)
-        if arity is None:
-            return True
-        if (
-            arity == 1
-            and "=" not in token
-            and (index + 1 == len(command_args) or _looks_like_option(command_args[index + 1]))
-        ):
-            return True
-    return False
+
+def build_parser(pipeline: type[Pipeline]) -> argparse.ArgumentParser:
+    common = _common()
+    parser = argparse.ArgumentParser(
+        prog=_prog(pipeline),
+        parents=[common],
+        description=(pipeline.__doc__ or "").strip().splitlines()[0] if pipeline.__doc__ else None,
+    )
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    run = commands.add_parser("run", parents=[common], help="Run stages whose units are not hits.")
+    _add_branch(run)
+    run.add_argument(
+        "--override", metavar="JSON", help="Merge JSON over main's Config (temporary branch)."
+    )
+    run.add_argument(
+        "--temp", action="store_true", help="Run in a temporary branch derived from --branch."
+    )
+    _add_selection(run, "Run")
+    run.add_argument("--force", "-f", action="store_true", help="Rerun selected stages' units.")
+    run.add_argument(
+        "--rehash",
+        action="store_true",
+        help="Re-hash inputs and artifacts instead of trusting stat.",
+    )
+    run.add_argument(
+        "--failed-only", action="store_true", help="Only rerun units whose last run failed."
+    )
+    run.add_argument(
+        "--slice",
+        action="append",
+        default=[],
+        metavar="AXIS=IDS",
+        help="Restrict an axis to ids (v1,v2 or @file); needs --temp or a new --branch.",
+    )
+    run.add_argument(
+        "--sample",
+        action="append",
+        default=[],
+        metavar="AXIS=N",
+        help="Deterministically sample N ids of an axis; needs --temp or a new --branch.",
+    )
+    run.add_argument("--seed", type=int, default=0, help="Seed for --sample (default 0).")
+    run.add_argument(
+        "--no-tui", action="store_true", help="Plain log output instead of the live TUI."
+    )
+    argmap.register_args(run, pipeline.Args)
+
+    status = commands.add_parser("status", parents=[common], help="Show stage and unit decisions.")
+    status.add_argument("selector", nargs="?", metavar="STAGE[@AXIS=ID,...]")
+    _add_branch(status)
+    status.add_argument("--expand", action="store_true", help="List every unit.")
+    status.add_argument("--rehash", action="store_true", help="Verify artifacts by content hash.")
+    argmap.register_args(status, pipeline.Args)
+
+    plan = commands.add_parser("plan", parents=[common], help="Show the stage DAG with decisions.")
+    _add_selection(plan, "Show")
+    _add_branch(plan)
+    plan.add_argument("--rehash", action="store_true", help="Verify artifacts by content hash.")
+    argmap.register_args(plan, pipeline.Args)
+
+    commands.add_parser("ls", parents=[common], help="List stages and branches.")
+
+    clean = commands.add_parser("clean", parents=[common], help="Remove managed outputs.")
+    clean.add_argument("--branch", metavar="NAME", help="Only this branch.")
+    clean.add_argument("--storage", metavar="NAME", help="Only this storage.")
+    clean.add_argument("--orphans", action="store_true", help="Only orphaned units.")
+    clean.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation.")
+
+    inspect = commands.add_parser("inspect", parents=[common], help="Explain one unit.")
+    inspect.add_argument("selector", metavar="STAGE[@AXIS=ID,...]")
+    _add_branch(inspect)
+    inspect.add_argument("--sources", action="store_true", help="List the stage's source closure.")
+    inspect.add_argument("--log", action="store_true", help="Print the unit's captured log.")
+
+    reuse = commands.add_parser("reuse", parents=[common], help="Accept a stage's source change.")
+    reuse.add_argument("stage", metavar="STAGE")
+    _add_branch(reuse)
+    return parser
+
+
+def _prog(pipeline: type[Pipeline]) -> str:
+    module = pipeline.import_module_name()
+    if module == "__main__":
+        return Path(sys.argv[0]).name if sys.argv and sys.argv[0] else pipeline.__name__
+    return f"python -m {module}"
 
 
 def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
-    raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    selected_command_index = _selected_command_index(raw_argv)
-    selected_command = (
-        raw_argv[selected_command_index] if selected_command_index is not None else None
-    )
-    parser = argparse.ArgumentParser(prog=pipeline.__name__)
-    parser.add_argument("-v", "--verbose", action="store_true")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    parser = build_parser(pipeline)
+    ns = parser.parse_args(raw)
+    verbose = getattr(ns, "verbose", False)
+    configure_cli_logging(verbose, quiet=ns.command != "run")
+    console = make_console()
+    errors = make_console(stderr=True)
+    root: Path | None = getattr(ns, "root", None)
+    try:
+        return _dispatch(pipeline, ns, raw, root, console)
+    except ValidationError as error:
+        errors.print(f"[red]error:[/] invalid configuration or arguments\n{error}", soft_wrap=True)
+        return 1
+    except USER_ERRORS as error:
+        errors.print("[red]error:[/] ", end="")
+        errors.print(str(error), markup=False, highlight=False, soft_wrap=True)
+        return 1
 
-    out_help = (
-        "Override the output base. For named yaml branches this replaces that branch's "
-        "default base; for main and temporary branches it replaces the main base."
-    )
 
-    run_parser = subparsers.add_parser("run", help="run selected stages")
-    run_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
-    run_parser.add_argument(
-        "--override",
-        metavar="JSON",
-        help="Merge JSON over main Config and run a temporary branch.",
-    )
-    selector_help = argmap.STAGE_SELECTOR_HELP
-    argmap.add_stage_selection(run_parser, selector_help, verb="Run")
-    run_parser.add_argument(
-        "--slice", action="append", default=[], metavar="AXIS=ID", help="Slice a temporary branch."
-    )
-    run_parser.add_argument(
-        "--force", "-f", action="store_true", help="Ignore cache for selected stages."
-    )
-    run_parser.add_argument("--rehash", action="store_true", help=_REHASH_HELP)
-    run_view = run_parser.add_mutually_exclusive_group()
-    run_view.add_argument(
-        "--expand", action="store_true", help="Show every selected concrete matrix cell."
-    )
-    run_view.add_argument(
-        "--compact", action="store_true", help="Fold selected cells by matrix stage."
-    )
-    run_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
-
-    status_parser = subparsers.add_parser("status", help="show pipeline and stage status")
-    status_parser.add_argument(
-        "stage",
-        nargs="?",
-        metavar="STAGE_SELECTOR",
-        help=selector_help,
-    )
-    status_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
-    status_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
-    status_parser.add_argument("--rehash", action="store_true", help=_REHASH_HELP)
-    status_parser.add_argument(
-        "--expand",
-        action="store_true",
-        help="Show concrete matrix cells or detailed stage state.",
-    )
-
-    clean_parser = subparsers.add_parser("clean", help="delete the whole branch output root")
-    clean_parser.add_argument("--branch", default="main", metavar="NAME", help="Select a branch.")
-    clean_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
-    clean_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation.")
-
-    config_parsers = {"run": run_parser, "status": status_parser, "clean": clean_parser}
-    for command, help_text in (
-        ("reuse", "Keep existing materializations reusable after source changes."),
-        ("invalidate", "Mark existing materializations as needing a rerun after source changes."),
-    ):
-        review_parser = subparsers.add_parser(command, help=help_text)
-        argmap.add_review_selection(review_parser)
-        review_parser.add_argument("--branch", default="main", metavar="NAME")
-        review_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
-        config_parsers[command] = review_parser
-
-    plan_parser = subparsers.add_parser(
-        "plan", help="show selected logical stage topology with exact status"
-    )
-    argmap.add_stage_selection(plan_parser, selector_help, verb="Show")
-    plan_parser.add_argument("--branch", default="main", metavar="NAME")
-    plan_parser.add_argument("--out", type=Path, metavar="PATH", help=out_help)
-    plan_parser.add_argument("--rehash", action="store_true", help=_REHASH_HELP)
-    config_parsers["plan"] = plan_parser
-
-    subparsers.add_parser("ls", help="list branch-independent pipeline structure")
-
-    if selected_command in config_parsers and selected_command_index is not None:
-        command_args = raw_argv[selected_command_index + 1 :]
-        if _has_unknown_option_before_config_registration(
-            parser=config_parsers[selected_command],
-            command_args=command_args,
-            args_type=pipeline.Args,
-        ):
-            parser.error("unknown option or missing option value")
-
-    if selected_command in config_parsers:
-        argmap.register_args(config_parsers[selected_command], pipeline.Args)
-
-    namespace = parser.parse_args(raw_argv)
-    configure_cli_logging(namespace.verbose, quiet=namespace.command != "run")
-
-    if namespace.command == "ls":
-        render_structure(make_console(), pipeline)
+def _dispatch(
+    pipeline: type[Pipeline], ns: argparse.Namespace, raw: list[str], root: Path | None, console
+) -> int:
+    command = ns.command
+    if command == "ls":
+        render.render_ls(console, pipeline, root)
+        return 0
+    if command == "clean":
+        return _clean(pipeline, ns, root, console)
+    if command == "reuse":
+        result = reuse_stage(pipeline, ns.stage, branch=ns.branch, root=root)
+        render.render_reuse(console, result)
+        return 0
+    if command == "inspect":
+        result = inspect_pipeline(pipeline, ns.selector, branch=ns.branch, root=root)
+        render.render_inspect(console, result, sources=ns.sources, log=ns.log)
         return 0
 
-    resolved = resolve_branch(
-        pipeline,
-        branch=namespace.branch,
-        override_json=namespace.override if namespace.command == "run" else None,
-        cli_out=namespace.out,
-        allow_bare_output_root=namespace.command == "clean",
-    )
-    graph = build_graph(pipeline, resolved.axes)
-    if namespace.command == "run" and namespace.slice and not resolved.is_temporary:
-        raise ValueError("--slice is only allowed on temporary branches")
-    args = argmap.model_from_namespace(namespace, pipeline.Args)
-    context = resolved_command_context(pipeline, resolved, args, graph=graph)
-    try:
-        return dispatch_command(
-            context,
-            namespace,
-            confirm=default_confirm,
-            review_targets=(
-                tuple(namespace.stage) if namespace.command in {"reuse", "invalidate"} else ()
-            ),
+    args = argmap.model_from_namespace(ns, pipeline.Args)
+    if command == "status":
+        stage, coords = parse_unit_selector(ns.selector) if ns.selector else (None, {})
+        view = probe_pipeline(
+            pipeline,
+            branch=ns.branch,
+            stages=[stage] if stage else None,
+            args=args,
+            root=root,
+            rehash=ns.rehash,
+            expand=bool(ns.expand or stage),
         )
-    except ValueError as error:
-        if namespace.command in {"reuse", "invalidate", "status"}:
-            parser.error(str(error))
-        raise
+        render.render_status(console, view, coords=coords, expand=ns.expand or bool(stage))
+        return 0
+    if command == "plan":
+        view = probe_pipeline(pipeline, branch=ns.branch, args=args, root=root, rehash=ns.rehash)
+        render.render_plan(
+            console, view, pipeline.graph(), only=ns.only, upto=ns.upto, downstream=ns.downstream
+        )
+        return 0
+
+    assert command == "run"
+    slices = dict(parse_slice(text, base=Path.cwd()) for text in ns.slice)
+    samples = dict(parse_sample(text) for text in ns.sample)
+    options = RunOptions(
+        only=ns.only,
+        upto=ns.upto,
+        downstream=ns.downstream,
+        force=ns.force,
+        rehash=ns.rehash,
+        failed_only=ns.failed_only,
+        tui=False if ns.no_tui else None,
+        argv=[_prog(pipeline), *raw],
+    )
+    result = run_pipeline(
+        pipeline,
+        branch=ns.branch,
+        overrides=ns.override,
+        args=args,
+        options=options,
+        root=root,
+        temp=ns.temp,
+        slices=slices,
+        samples=samples,
+        seed=ns.seed,
+    )
+    render.render_run_summary(console, result)
+    return result.exit_code
+
+
+def _clean(pipeline: type[Pipeline], ns: argparse.Namespace, root: Path | None, console) -> int:
+    def call(function):
+        return function(
+            pipeline, root=root, branch=ns.branch, storage=ns.storage, orphans=ns.orphans
+        )
+
+    plan = call(plan_clean)
+    if not plan.paths and not plan.rows:
+        console.print(f"Nothing to clean for {plan.description}.")
+        return 0
+    render.render_clean_plan(console, plan)
+    if not ns.yes and not _confirm("Remove these?"):
+        console.print("Aborted.")
+        return 1
+    done = call(clean_pipeline)
+    console.print(f"Removed {len(done.paths)} path(s) and {done.rows} unit row(s).")
+    return 0
+
+
+def _confirm(message: str) -> bool:
+    try:
+        answer = input(f"{message} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")

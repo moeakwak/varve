@@ -4,17 +4,15 @@ import json
 import pickle
 from dataclasses import dataclass
 from functools import singledispatch
-from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
-from varve import Pipeline, stage
-from varve.engine.runner import run
 from varve.keying.config_access import (
     ConfigAccess,
     RecordingConfig,
     RecordingDict,
+    merge_access,
     project_config,
     record_config,
     unwrap_config,
@@ -259,25 +257,25 @@ def test_unsupported_config_types_are_rejected() -> None:
         config_data(Plain())
     with pytest.raises(TypeError, match="keys must be strings"):
         config_data({1: "x"})
-    with pytest.raises(TypeError, match="pydantic BaseModel or a dict"):
-        run(DictPipeline, Plain(), cli_out=Path("unused"))
 
 
-class DictPipeline(Pipeline):
-    @stage(produces="greeting.txt")
-    def greet(self, ctx):
-        assert isinstance(ctx.config, dict)
-        (ctx.out / "greeting.txt").write_text(ctx.config["greeting"]["text"])
+def test_access_merge_and_union() -> None:
+    access = ConfigAccess()
+    access.record("seed")
+    access.merge(["tools"])
+    assert access.resolve() == ["seed", "tools"]
+    access.merge(None)
+    assert access.resolve() is None
+    assert merge_access(["a"], ["b", "a"]) == ["a", "b"]
+    assert merge_access(["a"], None) is None
+    assert pickle.loads(pickle.dumps(["a"])) == ["a"]
 
 
-def test_dict_config_runs_and_projects_unread_keys(tmp_path: Path) -> None:
-    config = {"greeting": {"text": "hi"}, "unused": 1}
-    assert [o.status for o in run(DictPipeline, config, cli_out=tmp_path)] == ["needs-run"]
-    assert (tmp_path / "main" / "greeting.txt").read_text() == "hi"
-
-    unread = run(DictPipeline, {**config, "unused": 2}, cli_out=tmp_path)
-    assert [o.status for o in unread] == ["hit"]
-
-    changed = {"greeting": {"text": "hello"}, "unused": 2}
-    assert [o.status for o in run(DictPipeline, changed, cli_out=tmp_path)] == ["needs-run"]
-    assert (tmp_path / "main" / "greeting.txt").read_text() == "hello"
+def test_child_process_snapshot_round_trip() -> None:
+    config = Config()
+    child_config = pickle.loads(pickle.dumps(config))
+    proxy, access = _wrap(child_config)
+    assert proxy.seed == 42
+    parent = ConfigAccess()
+    parent.merge(pickle.loads(pickle.dumps(access.resolve())))
+    assert parent.resolve() == ["seed"]

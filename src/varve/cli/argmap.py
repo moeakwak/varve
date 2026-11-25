@@ -18,36 +18,6 @@ _DEST_PREFIX = "__varve_args__."
 # CLI sentinel that maps an optional scalar field to None, matching the default
 # pydantic-settings `cli_parse_none_str`.
 _NONE_TOKEN = "null"
-STAGE_SELECTOR_HELP = (
-    "Base selects all active cells; omitted axes are wildcards; full coordinates select one cell."
-)
-
-
-def add_stage_selection(
-    parser: argparse.ArgumentParser,
-    selector_help: str | None = None,
-    *,
-    verb: str | None = None,
-) -> None:
-    group = parser.add_mutually_exclusive_group()
-    descriptions = {
-        "upto": "the selector and all upstream stages",
-        "downstream": "the selector and all downstream stages",
-        "only": "only the selector",
-    }
-    for option, description in descriptions.items():
-        help_text = selector_help if verb is None else f"{verb} {description}. {selector_help}"
-        group.add_argument(f"--{option}", metavar="STAGE_SELECTOR", help=help_text)
-
-
-def add_review_selection(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--stage",
-        action="append",
-        default=[],
-        metavar="BASE_STAGE",
-        help="Review this base Stage; repeat to take a union. Coordinates are not accepted.",
-    )
 
 
 def _unwrap_optional(annotation: Any) -> Any:
@@ -102,19 +72,6 @@ def _iter_fields(args_type: type[BaseModel], prefix: str = "") -> Iterator[tuple
             yield from _iter_fields(inner, f"{dotted}.")
         else:
             yield dotted, field, inner
-
-
-def args_option_arities(args_type: type[BaseModel]) -> dict[str, int]:
-    """Return possible Args option strings without validating field support."""
-    result: dict[str, int] = {}
-    for dotted, _field, inner in _iter_fields(args_type):
-        flag = "--" + dotted.replace("_", "-")
-        if inner is bool:
-            result[flag] = 0
-            result["--no-" + dotted.replace("_", "-")] = 0
-        else:
-            result[flag] = 1
-    return result
 
 
 def _help_text(dotted: str, description: str | None) -> str:

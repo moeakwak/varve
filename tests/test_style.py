@@ -13,7 +13,7 @@ from varve.style import VarveStatusHighlighter, format_elapsed, status_text
 
 def test_status_text_uses_semantic_style() -> None:
     assert status_text("hit").style == "green"
-    assert status_text("needs-review").style == "bold yellow"
+    assert status_text("needs-run").style == "yellow"
     assert status_text("failed").style == "red"
 
 
@@ -27,44 +27,25 @@ def test_format_elapsed_uses_shared_precision_and_configurable_missing_text() ->
     assert format_elapsed(None, missing="-") == "-"
 
 
-def test_dependency_styles_are_available_from_shared_theme() -> None:
-    expected = {
-        "stage": "bold cyan",
-        "function": "cyan",
-        "class": "magenta",
-        "module": "blue",
-        "value": "green",
-        "broad": "yellow",
-        "metadata": "dim",
-        "changed": "yellow",
-        "added": "green",
-        "removed": "red",
-    }
-    assert style.DEPENDENCY_STYLES == expected
-    for kind in expected:
-        assert style._THEME.styles[f"varve.dependency.{kind}"]
+def test_diff_styles_are_available_from_shared_theme() -> None:
+    for kind in style.DIFF_STYLES:
+        assert style._THEME.styles[f"varve.diff.{kind}"]
 
 
-def test_review_styles_are_available_from_shared_theme() -> None:
-    assert style.REVIEW_STYLES["reuse_action"] == "green"
-    assert style.REVIEW_STYLES["invalidate_action"] == "yellow"
-    assert style.REVIEW_STYLES["invalidate_action"] != "red"
-    assert style.REVIEW_STYLES["module"] == "blue"
-    assert style.REVIEW_STYLES["stage"] == "cyan"
-    assert style.REVIEW_STYLES["noop"] == "dim"
-    assert style.REVIEW_STYLES["error"] == "red"
-    for name in style.REVIEW_STYLES:
-        assert style._THEME.styles[f"varve.review.{name}"]
+def test_new_status_tokens_are_styled() -> None:
+    for status in ("awaiting", "linked", "reused", "code-modified", "orphaned"):
+        assert status_text(status).style == style.STATUS_STYLES[status]
+    assert status_text("linked@main").style == style.STATUS_STYLES["linked"]
 
 
 def test_highlighter_maps_tokens_to_theme_styles() -> None:
     highlighter = VarveStatusHighlighter()
-    text = Text("run done needs-review needs-run failed")
+    text = Text("run done awaiting needs-run failed")
     highlighter.highlight(text)
     spans = {text.plain[span.start : span.end]: span.style for span in text.spans}
     assert spans["run"] == "varve.run"
     assert spans["done"] == "varve.done"
-    assert spans["needs-review"] == "varve.needs_review"
+    assert spans["awaiting"] == "varve.awaiting"
     assert spans["needs-run"] == "varve.needs_run"
     assert spans["failed"] == "varve.failed"
 
@@ -127,3 +108,29 @@ def test_themed_console_omits_color_for_non_terminal_output() -> None:
     )
     console.print("run done", markup=False)
     assert buffer.getvalue() == "run done\n"
+
+
+def test_format_timestamp_renders_stored_utc_in_local_time(monkeypatch) -> None:
+    import time
+
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+    time.tzset()
+    try:
+        assert style.format_timestamp("2026-11-25T19:30:24.123+00:00") == "2026-11-26 03:30:24"
+        assert style.format_timestamp("2026-11-25T19:30:24") == "2026-11-26 03:30:24"
+        assert style.format_timestamp(None) == "-"
+        assert style.format_timestamp("garbage-value-x") == "garbage-value-x"
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+def test_compact_rows_collapses_vertical_edge_runs() -> None:
+    from rich.segment import Segment
+
+    from varve.cli.render import compact_rows
+
+    rows = ["╰─╯", " │ ", " │ ", "   ", " │ ", " ▼ ", "╭─╮", " │ "]
+    lines = [[Segment(row)] for row in rows]
+    kept = ["".join(s.text for s in line) for line in compact_rows(lines)]
+    assert kept == ["╰─╯", " │ ", " ▼ ", "╭─╮", " │ "]

@@ -1,102 +1,201 @@
-"""Input key assembly."""
+"""The 5-segment ``input_key`` and the source-match rule.
+
+``input_key = H(config, upstream, inputs, values, version)``; the source
+fingerprint is kept separate (``units.source_fp``) and compared by
+:func:`source_match`.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+import hashlib
+import json
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from varve.decorators import StageSpec
-from varve.dependencies import Dependencies, DependencyContext
 from varve.keying.config_access import check_config, project_config
-from varve.keying.fingerprint import (
-    FingerprintSession,
-    file_digest_view,
-    files_fingerprints,
-    json_sha256,
-)
-from varve.models import FileFingerprint, KeyComponents
+from varve.keying.fingerprint import InputDigest, json_hash
 
-_MATRIX_LAYOUT_KEY = "__varve_matrix_layout__"
-_MATRIX_LAYOUT_VERSION = 2
+SEGMENTS = ("config", "upstream", "inputs", "values", "version")
+SEGMENT_REASONS = {
+    "config": "config-changed",
+    "upstream": "upstream-changed",
+    "inputs": "input-changed",
+    "values": "value-changed",
+    "version": "version-changed",
+}
+FILESET_THRESHOLD = 32
 
 
 def config_data(config: Any) -> dict[str, Any]:
-    """Return the JSON view of a pydantic or dict Config used for keying."""
+    """JSON view of a pydantic or dict Config used for keying."""
 
     check_config(config)
     if isinstance(config, BaseModel):
         return config.model_dump(mode="json")
-    return config
+    return dict(config)
 
 
-def compute_key_components(
-    stage_spec: StageSpec,
-    ctx: Any,
-    upstream_keys: Mapping[str, str],
-    cached_inputs: Mapping[str, list[FileFingerprint]] | None = None,
-    *,
-    config_access: list[str] | None = None,
-    dependencies: Dependencies | None = None,
-    fingerprint_session: FingerprintSession | None = None,
-    rerun_source_fingerprint: str,
-) -> KeyComponents:
-    """Assemble a stage's key components.
+def plain_hash(obj: Any) -> str:
+    """``json_hash`` for data that is already plain JSON (str/int/float/bool/None/list/dict).
 
-    `config_access` projects the config onto the top-level fields the stage is
-    known to read (from the previous success record); `None` folds in the whole
-    config, the conservative default used on the first run and after source
-    changes.
+    Skips the normalization pass; the result equals ``json_hash(obj)`` for such data.
     """
 
-    config = project_config(config_data(ctx.config), config_access)
-    dependencies = dependencies or stage_spec.depends
-    dependency_ctx = DependencyContext(
-        config=ctx.config,
-        out=ctx.out,
-        cell=ctx.cell,
-        cell_out=ctx.cell_out,
+    try:
+        text = json.dumps(
+            obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        )
+    except ValueError as error:
+        raise ValueError(f"NaN and Infinity are not allowed in varve keys ({error})") from None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def version_hash(version: str | None, produces: str | list[str] | None) -> str:
+    """Hash of the ``version`` segment: ``version=`` plus the normalized ``produces=``.
+
+    Changing ``produces=`` changes the artifact contract, so it invalidates even
+    when ``version=`` pins the source.
+    """
+
+    if produces is None:
+        return json_hash(version)
+    return json_hash({"version": version, "produces": produces})
+
+
+def combine_hashes(hashes: Mapping[str, str]) -> str:
+    """The ``input_key`` from the five segment hashes (equals ``json_hash(hashes)``)."""
+
+    text = (
+        f'{{"config":"{hashes["config"]}","inputs":"{hashes["inputs"]}",'
+        f'"upstream":"{hashes["upstream"]}","values":"{hashes["values"]}",'
+        f'"version":"{hashes["version"]}"}}'
     )
-    files = files_fingerprints(
-        dependency_ctx,
-        dependencies.inputs,
-        cached_by_name=cached_inputs,
-        session=fingerprint_session,
-    )
-    values = {name: getter(dependency_ctx) for name, getter in sorted(dependencies.values.items())}
-    if stage_spec.cell:
-        if _MATRIX_LAYOUT_KEY in values:
-            raise ValueError(
-                f"Dependencies.values name {_MATRIX_LAYOUT_KEY!r} is reserved by varve"
-            )
-        values[_MATRIX_LAYOUT_KEY] = _MATRIX_LAYOUT_VERSION
-    need_cells = getattr(stage_spec, "need_cells", None) or {}
-    has_matrix_fan_in = any(len(names) > 1 for names in need_cells.values())
-    upstreams = {
-        name: {
-            "artifact_fingerprint": upstream_keys[name],
-            **({"position": str(index)} if has_matrix_fan_in else {}),
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def inputs_hash(inputs: Mapping[str, InputDigest]) -> str:
+    return plain_hash({name: inputs[name].digest for name in inputs})
+
+
+@dataclass(frozen=True)
+class FileSetRow:
+    """A ``file_sets`` row: an input's material stored once, referenced by hash."""
+
+    fileset_hash: str
+    file_count: int
+    total_bytes: int
+    entries: list[Any]
+
+
+@dataclass(frozen=True)
+class InputKey:
+    input_key: str
+    components: dict[str, Any]
+    """``key_components_json``: ``{segment: {"hash": ..., "summary": ...}}``."""
+    file_sets: list[FileSetRow]
+    """Large input materials to upsert into ``file_sets`` before committing the unit."""
+
+
+def compute_input_key(
+    *,
+    config: Any,
+    config_access: list[str] | None,
+    upstream: Mapping[str, Any],
+    inputs: Mapping[str, InputDigest],
+    values: Mapping[str, Any],
+    version: str | None,
+    produces: str | list[str] | None = None,
+    fileset_threshold: int = FILESET_THRESHOLD,
+) -> InputKey:
+    """Assemble the key of one unit.
+
+    ``config`` is projected on ``config_access`` (``None``: whole config).
+    ``upstream`` maps upstream/Ref names to :func:`upstream_entry` values.
+    ``inputs`` come from ``FingerprintSession.inputs`` (Dependencies inputs
+    plus ``Unit.axis_inputs()``); ``values`` are Dependencies values plus
+    ``Unit.axis_values()``.
+    """
+
+    projected = project_config(config_data(config), config_access)
+    input_summary: dict[str, Any] = {}
+    file_sets: list[FileSetRow] = []
+    for name in sorted(inputs):
+        digest = inputs[name]
+        summary: dict[str, Any] = {
+            "digest": digest.digest,
+            "files": digest.files,
+            "bytes": digest.bytes,
+            "roots": digest.roots,
         }
-        for index, name in enumerate(stage_spec.needs)
+        if digest.files > fileset_threshold:
+            summary["fileset"] = digest.digest
+            file_sets.append(FileSetRow(digest.digest, digest.files, digest.bytes, digest.material))
+        else:
+            summary["entries"] = digest.material
+        input_summary[name] = summary
+    hashes = {
+        "config": json_hash(projected),
+        "upstream": json_hash(dict(upstream)),
+        "inputs": inputs_hash(inputs),
+        "values": json_hash(dict(values)),
+        "version": version_hash(version, produces),
     }
-
-    return KeyComponents(
-        config=config,
-        inputs=files,
-        values=values,
-        upstreams=upstreams,
-        config_access=config_access,
-        rerun_source_fingerprint=rerun_source_fingerprint,
-    )
-
-
-def input_key(components: KeyComponents) -> str:
-    digest_view = {
-        "config": components.config,
-        "inputs": file_digest_view(components.inputs),
-        "values": components.values,
-        "upstreams": components.upstreams,
-        "rerun_source_fingerprint": components.rerun_source_fingerprint,
+    components = {
+        "config": {"hash": hashes["config"], "summary": projected, "access": config_access},
+        "upstream": {"hash": hashes["upstream"], "summary": dict(upstream)},
+        "inputs": {"hash": hashes["inputs"], "summary": input_summary},
+        "values": {"hash": hashes["values"], "summary": dict(values)},
+        "version": {"hash": hashes["version"], "summary": version, "produces": produces},
     }
-    return json_sha256(digest_view)
+    return InputKey(combine_hashes(hashes), components, file_sets)
+
+
+def upstream_entry(binding: Any, artifact_fp: Callable[[Any], str]) -> str | list[list[str]]:
+    """Key material of one aligned upstream: an artifact fp, or ``[[unit_key, fp], ...]`` for fan-in.
+
+    ``binding`` is what ``graph.align`` returned (a Unit or a fan-in dict of Units);
+    ``artifact_fp`` maps an upstream unit to its committed ``artifact_fp``.
+    """
+
+    if isinstance(binding, Mapping):
+        return [[unit.unit_key, artifact_fp(unit)] for unit in binding.values()]
+    return artifact_fp(binding)
+
+
+def changed_segments(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
+    """Segments whose hash differs between two ``key_components`` documents."""
+
+    return [
+        segment
+        for segment in SEGMENTS
+        if old.get(segment, {}).get("hash") != new.get(segment, {}).get("hash")
+    ]
+
+
+SourceMatch = Literal["match", "reused", "code-modified", "changed"]
+
+
+def source_match(
+    *,
+    version: str | None,
+    current: str,
+    recorded: str,
+    reused: str | None,
+) -> SourceMatch:
+    """Compare the current ``source_fp`` with a unit record (spec §4.4.1).
+
+    With ``version`` set, a differing source never invalidates (``code-modified``
+    is a display label). Otherwise the current fp must equal the recorded one
+    (``match``) or the ``varve reuse`` exemption (``reused``), else ``changed``.
+    """
+
+    if current == recorded:
+        return "match"
+    if version is not None:
+        return "code-modified"
+    if reused is not None and current == reused:
+        return "reused"
+    return "changed"
