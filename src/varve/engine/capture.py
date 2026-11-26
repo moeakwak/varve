@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import sys
@@ -136,20 +137,58 @@ def routed_std_streams() -> Iterator[None]:
         sys.stdout, sys.stderr = previous
 
 
-def _open_log(path: Path) -> TextIO:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path.open("a", encoding="utf-8", buffering=1)
+class LazyLog(io.TextIOBase):
+    """A unit log file that is created on the first write (silent units leave no file)."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle: TextIO | None = None
+
+    def _open(self) -> TextIO:
+        if self._handle is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = self.path.open("a", encoding="utf-8", buffering=1)
+        return self._handle
+
+    def write(self, text: str) -> int:  # type: ignore[override]
+        return self._open().write(text)
+
+    def flush(self) -> None:
+        if self._handle is not None:
+            self._handle.flush()
+
+    @property
+    def buffer(self) -> Any:
+        return self._open().buffer
+
+    @property
+    def encoding(self) -> str:  # type: ignore[override]
+        return "utf-8"
+
+    @property
+    def errors(self) -> str:  # type: ignore[override]
+        return "strict"
+
+    def writable(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        super().close()  # flushes first
+        if self._handle is not None:
+            self._handle.close()
 
 
 @contextmanager
 def unit_output(log_path: Path | None) -> Iterator[None]:
-    """Route this context's ``print``/stdout/stderr writes to ``log_path``."""
+    """Route this context's ``print``/stdout/stderr writes to ``log_path`` (created lazily)."""
 
     if log_path is None:
         yield
         return
-    handle = _open_log(log_path)
-    token = _target.set(handle)
+    handle = LazyLog(log_path)
+    token = _target.set(handle)  # type: ignore[arg-type]
     try:
         yield
     finally:
@@ -159,7 +198,10 @@ def unit_output(log_path: Path | None) -> Iterator[None]:
 
 @contextmanager
 def fd_output(log_path: Path | None) -> Iterator[None]:
-    """Redirect fds 1 and 2 (and Python's std streams) to ``log_path`` (process workers)."""
+    """Redirect fds 1 and 2 (and Python's std streams) to ``log_path`` (process workers).
+
+    The file is removed again when the unit wrote nothing to it.
+    """
 
     if log_path is None:
         yield
@@ -178,8 +220,12 @@ def fd_output(log_path: Path | None) -> Iterator[None]:
             _flush(stream)
         os.dup2(saved[0], 1)
         os.dup2(saved[1], 2)
+        empty = os.fstat(fd).st_size == 0
         for item in (*saved, fd):
             os.close(item)
+        if empty:
+            with contextlib.suppress(OSError):
+                os.unlink(log_path)
 
 
 @contextmanager

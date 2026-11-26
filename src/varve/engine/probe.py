@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from stat import S_ISREG
@@ -283,7 +283,8 @@ class StageEvaluator:
         name = request.axis.name
         ids = branch.active.get(name)
         if ids is not None:
-            unknown = [item for item in ids if item not in set(domain.ids)]
+            known = set(domain.ids)
+            unknown = [item for item in ids if item not in known]
             if unknown:
                 raise ProbeError(
                     f"--slice {name}: ids {unknown} are not produced by the axis resolver"
@@ -305,7 +306,11 @@ class StageEvaluator:
         *,
         force: bool = False,
         find_orphans: bool = False,
+        select: Callable[[Unit], bool] | None = None,
     ) -> StagePlan:
+        """Expand, key, and decide ``node``; ``select`` keeps only matching units
+        (before cells are evaluated; not combined with ``find_orphans``)."""
+
         session = self.session
         graph = session.graph
         waiting = self._awaiting(node, states)
@@ -318,6 +323,8 @@ class StageEvaluator:
                 continue
             dynamics[request.key] = self.restrict(request, self.resolve(request, states))
         units = expand_stage(graph, node, session.statics, dynamics)
+        if select is not None:
+            units = [unit for unit in units if select(unit)]
         rows = session.repo.probe_rows(session.branch_id, node.name) if session.repo else {}
 
         bindings: dict[str, list[Upstream]] = {
@@ -566,8 +573,17 @@ def probe_state(session: Session, plan: StagePlan) -> StageState:
     return StageState(units, artifacts, complete=len(artifacts) == len(units))
 
 
-def probe(session: Session, stages: Collection[str] | None = None) -> dict[str, StagePlan]:
-    """Read-only evaluation of ``stages`` (default: all) and their ancestors, in order."""
+def probe(
+    session: Session,
+    stages: Collection[str] | None = None,
+    *,
+    select: Mapping[str, Callable[[Unit], bool]] | None = None,
+) -> dict[str, StagePlan]:
+    """Read-only evaluation of ``stages`` (default: all) and their ancestors, in order.
+
+    ``select`` maps stage names to unit filters applied before their cells are
+    evaluated; a filtered stage's state is incomplete, so use it for leaves only.
+    """
 
     graph = session.graph
     needed = set(graph.order)
@@ -581,7 +597,7 @@ def probe(session: Session, stages: Collection[str] | None = None) -> dict[str, 
     for name in graph.order:
         if name not in needed:
             continue
-        plan = evaluator.evaluate(graph.nodes[name], states)
+        plan = evaluator.evaluate(graph.nodes[name], states, select=(select or {}).get(name))
         plans[name] = plan
         states[name] = probe_state(session, plan)
     return plans

@@ -8,7 +8,6 @@ fingerprint is kept separate (``units.source_fp``) and compared by
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -16,7 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel
 
 from varve.keying.config_access import check_config, project_config
-from varve.keying.fingerprint import InputDigest, json_hash
+from varve.keying.fingerprint import CANONICAL_ENCODER, InputDigest, json_hash, normalize_json
 
 SEGMENTS = ("config", "upstream", "inputs", "values", "version")
 SEGMENT_REASONS = {
@@ -45,9 +44,7 @@ def plain_hash(obj: Any) -> str:
     """
 
     try:
-        text = json.dumps(
-            obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-        )
+        text = CANONICAL_ENCODER.encode(obj)
     except ValueError as error:
         raise ValueError(f"NaN and Infinity are not allowed in varve keys ({error})") from None
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -109,6 +106,7 @@ def compute_input_key(
     version: str | None,
     produces: str | list[str] | None = None,
     fileset_threshold: int = FILESET_THRESHOLD,
+    hashes: Mapping[str, str] | None = None,
 ) -> InputKey:
     """Assemble the key of one unit.
 
@@ -116,9 +114,18 @@ def compute_input_key(
     ``upstream`` maps upstream/Ref names to :func:`upstream_entry` values.
     ``inputs`` come from ``FingerprintSession.inputs`` (Dependencies inputs
     plus ``Unit.axis_inputs()``); ``values`` are Dependencies values plus
-    ``Unit.axis_values()``.
+    ``Unit.axis_values()``. ``hashes`` may carry segment hashes the probe
+    already computed for this material (any of the five segments); they must
+    equal what this function would compute.
+
+    Every segment summary is a function of the segment hash (the store keeps
+    long summaries once per hash), so input summaries carry no absolute paths:
+    an input records how many roots it declared (``root_count``), not where
+    they are. Inputs with more than ``fileset_threshold`` files store their
+    entries in ``file_sets``.
     """
 
+    known = hashes or {}
     projected = project_config(config_data(config), config_access)
     input_summary: dict[str, Any] = {}
     file_sets: list[FileSetRow] = []
@@ -128,7 +135,7 @@ def compute_input_key(
             "digest": digest.digest,
             "files": digest.files,
             "bytes": digest.bytes,
-            "roots": digest.roots,
+            "root_count": len(digest.roots),
         }
         if digest.files > fileset_threshold:
             summary["fileset"] = digest.digest
@@ -136,21 +143,23 @@ def compute_input_key(
         else:
             summary["entries"] = digest.material
         input_summary[name] = summary
-    hashes = {
-        "config": json_hash(projected),
-        "upstream": json_hash(dict(upstream)),
-        "inputs": inputs_hash(inputs),
-        "values": json_hash(dict(values)),
-        "version": version_hash(version, produces),
+    upstream_summary = dict(upstream)
+    values_summary = normalize_json(dict(values))
+    segment_hashes = {
+        "config": known.get("config") or json_hash(projected),
+        "upstream": known.get("upstream") or json_hash(upstream_summary),
+        "inputs": known.get("inputs") or inputs_hash(inputs),
+        "values": known.get("values") or plain_hash(values_summary),
+        "version": known.get("version") or version_hash(version, produces),
     }
     components = {
-        "config": {"hash": hashes["config"], "summary": projected, "access": config_access},
-        "upstream": {"hash": hashes["upstream"], "summary": dict(upstream)},
-        "inputs": {"hash": hashes["inputs"], "summary": input_summary},
-        "values": {"hash": hashes["values"], "summary": dict(values)},
-        "version": {"hash": hashes["version"], "summary": version, "produces": produces},
+        "config": {"hash": segment_hashes["config"], "summary": projected, "access": config_access},
+        "upstream": {"hash": segment_hashes["upstream"], "summary": upstream_summary},
+        "inputs": {"hash": segment_hashes["inputs"], "summary": input_summary},
+        "values": {"hash": segment_hashes["values"], "summary": values_summary},
+        "version": {"hash": segment_hashes["version"], "summary": version, "produces": produces},
     }
-    return InputKey(combine_hashes(hashes), components, file_sets)
+    return InputKey(combine_hashes(segment_hashes), components, file_sets)
 
 
 def upstream_entry(binding: Any, artifact_fp: Callable[[Any], str]) -> str | list[list[str]]:

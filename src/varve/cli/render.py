@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Hashable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rich import box as rich_box
 from rich.console import Console
@@ -13,18 +13,20 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
-from varve.engine.clean import CleanPlan, pipeline_roots
-from varve.engine.refs import RefInfo
-from varve.engine.run import RunResult
-from varve.engine.service import InspectResult, ReuseResult
 from varve.graph import StageGraph
 from varve.pipeline import Pipeline
 from varve.ref import Ref
-from varve.status import PipelineView, StageView
 from varve.store import layout
 from varve.store.db import connect
 from varve.store.repo import Repo
 from varve.style import STATUS_STYLES, format_ms, format_timestamp, status_text
+
+if TYPE_CHECKING:  # the engine is imported by the commands that produce these views
+    from varve.engine.clean import CleanPlan
+    from varve.engine.refs import RefInfo
+    from varve.engine.run import RunResult
+    from varve.engine.service import InspectResult, ReuseResult
+    from varve.status import PipelineView, StageView
 
 STAGE_NAME_LIMIT = 32
 
@@ -299,6 +301,8 @@ def render_ls(console: Console, pipeline: type[Pipeline], root: Path | None) -> 
             str(node.workers) if isinstance(node.workers, int) else "callable",
         )
     console.print(table)
+    from varve.engine.clean import pipeline_roots
+
     roots = pipeline_roots(pipeline, root)
     db_path = layout.state_db_path(roots.root)
     if not db_path.exists():

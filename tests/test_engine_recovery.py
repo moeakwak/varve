@@ -270,10 +270,15 @@ class Demo(Pipeline):
 """
 
 
-def test_running_marker_is_committed_before_the_unit_body_starts(ws) -> None:
+def test_running_marker_is_committed_before_a_rerun_unit_body_starts(ws) -> None:
     (ws.src / "varve.yaml").write_text(json.dumps({"main": {"config": {"root": str(ws.root)}}}))
     Demo = ws.write(RUNNING_MARK)
     assert ws.run(Demo).status == "ok"
+    for item in ("a", "b"):
+        seen = ws.root / f"out/.internal/main/work/item={item}/seen.txt"
+        # New units' marks are batched (without a row they probe as `new` anyway).
+        assert seen.read_text() in ("missing", "running")
+    assert ws.run(Demo, options=RunOptions(force=True, tui=False)).status == "ok"
     for item in ("a", "b"):
         seen = ws.root / f"out/.internal/main/work/item={item}/seen.txt"
         assert seen.read_text() == "running"

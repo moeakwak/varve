@@ -272,20 +272,7 @@ def finalize_staging(staging: Path, node: StageNode) -> ArtifactFingerprint:
         raise FileNotFoundError(
             f"Stage {node.name!r}: produces={spec.produces_file!r} must be a regular file"
         )
-    artifact = artifact_fingerprint(staging)
-    make_read_only(staging)
-    return artifact
-
-
-def make_read_only(root: Path) -> None:
-    """Managed files become 0444; directories stay 0755 (so units can be replaced/cleaned)."""
-
-    for directory, dirs, files in os.walk(root):
-        os.chmod(directory, DIR_MODE)
-        for name in files:
-            os.chmod(os.path.join(directory, name), READ_ONLY)
-        for name in dirs:
-            os.chmod(os.path.join(directory, name), DIR_MODE)
+    return artifact_fingerprint(staging, read_only=True, file_mode=READ_ONLY, dir_mode=DIR_MODE)
 
 
 def old_dir(final: Path, run_id: str) -> Path:

@@ -14,7 +14,7 @@ import sqlite3
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 from rich import box as rich_box
@@ -22,34 +22,23 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from varve.cli import render
-from varve.cli.app import USER_ERRORS
-from varve.engine.service import (
-    clean_pipeline,
-    inspect_pipeline,
-    parse_unit_selector,
-    plan_clean,
-    probe_pipeline,
-    reuse_stage,
-)
 from varve.log import configure_cli_logging
-from varve.pipeline import Pipeline
 from varve.style import STATUS_STYLES, format_ms, format_timestamp, make_console, status_text
 from varve.workspace.config import WorkspaceSettings, load_workspace
 from varve.workspace.discovery import Entry, discover
-from varve.workspace.macro import (
-    MacroError,
-    MacroPlan,
-    MacroResult,
-    Node,
-    Workspace,
-    build_plan,
-    parse_sets,
-    run_plan,
-)
-from varve.workspace.refs import WorkspaceRefResolver
 
-ERRORS = (*USER_ERRORS, MacroError)
+if TYPE_CHECKING:  # the engine and macro modules load only for commands that need them
+    from varve.pipeline import Pipeline
+    from varve.workspace.macro import MacroPlan, MacroResult, Node, Workspace
+
+
+def user_errors() -> tuple[type[BaseException], ...]:
+    """Errors reported as one line; importing them loads the engine, so only on demand."""
+
+    from varve.cli.app import USER_ERRORS
+    from varve.workspace.macro import MacroError
+
+    return (*USER_ERRORS, MacroError)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -155,7 +144,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValidationError as error:
         errors.print(f"[red]error:[/] invalid configuration or arguments\n{error}", soft_wrap=True)
         return 1
-    except ERRORS as error:
+    except Exception as error:
+        if not isinstance(error, user_errors()):
+            raise
         errors.print("[red]error:[/] ", end="")
         errors.print(str(error), markup=False, highlight=False, soft_wrap=True)
         return 1
@@ -173,6 +164,16 @@ def _dispatch(
         return 0
     if command == "ui":
         return _ui(settings, host=ns.host, port=ns.port)
+    from varve.cli import render
+    from varve.engine.service import (
+        inspect_pipeline,
+        parse_unit_selector,
+        probe_pipeline,
+        reuse_stage,
+    )
+    from varve.workspace.macro import Workspace, build_plan, parse_sets
+    from varve.workspace.refs import WorkspaceRefResolver
+
     workspace = Workspace(settings)
     if command in ("plan", "run"):
         plan = build_plan(
@@ -277,6 +278,9 @@ def _probe_summary(
 ) -> tuple[Text, bool]:
     """(summary, all hit) of one node's read-only probe."""
 
+    from varve.engine.service import probe_pipeline
+    from varve.workspace.refs import WorkspaceRefResolver
+
     try:
         view = probe_pipeline(
             node.pipeline,
@@ -285,7 +289,7 @@ def _probe_summary(
             refs=WorkspaceRefResolver(workspace.settings),
             workspace=workspace.settings,
         )
-    except ERRORS as error:
+    except user_errors() as error:
         if upstream_pending:
             return Text(f"waits for {', '.join(upstream_pending)}", style="dim"), False
         return Text(f"error: {error}", style="red"), False
@@ -313,6 +317,10 @@ def _plan_table() -> Table:
 
 
 def _plan(console: Console, workspace: Workspace, plan: MacroPlan, targets: list[str]) -> int:
+    from varve.cli import render
+    from varve.engine.service import probe_pipeline
+    from varve.workspace.refs import WorkspaceRefResolver
+
     console.print(Text("Plan", style="bold") + Text(f" · {len(plan.nodes)} node(s)", style="dim"))
     table = _plan_table()
     table.add_column("Probe")
@@ -385,6 +393,8 @@ def _run(
         console.print(table)
         return 0
 
+    from varve.workspace.macro import run_plan
+
     def before(node: Node) -> None:
         console.rule(Text(node.label, style="bold"))
 
@@ -396,7 +406,7 @@ def _run(
         tui=False if ns.no_tui else None,
         argv=["varve", *raw],
         before_node=before,
-        errors=ERRORS,
+        errors=user_errors(),
     )
     render_macro_summary(console, result)
     if result.failed is not None:
@@ -457,6 +467,9 @@ def _clean(
     root: Path | None,
     settings: WorkspaceSettings,
 ) -> int:
+    from varve.cli import render
+    from varve.engine.service import clean_pipeline, plan_clean
+
     def call(function):
         return function(
             pipeline,

@@ -15,9 +15,12 @@ FLUSH_SECONDS = 0.075
 class Writer:
     """Collects writes and commits them in one transaction every ``FLUSH_SECONDS``.
 
-    ``running`` marks must reach the store before their unit is promoted
-    (startup recovery finds interrupted promotions through them), so
-    :meth:`before_promote` flushes when the unit's mark is still pending.
+    ``running`` marks must reach the store before their unit replaces an
+    existing unit dir (startup recovery finds interrupted promotions through
+    them), so :meth:`before_promote` flushes when the unit's mark is still
+    pending. Marks put with ``sync=True`` (units that already have a row) are
+    also flushed by :meth:`flush_running` before their unit bodies start, so a
+    hard kill leaves those rows ``running`` rather than their previous state.
     """
 
     def __init__(self, repo: Repo, cache: StatCache, *, interval: float = FLUSH_SECONDS) -> None:
@@ -27,13 +30,17 @@ class Writer:
         self._units: dict[tuple[str, str], UnitRow] = {}
         self._file_sets: dict[str, FileSetRow] = {}
         self._pending_running: set[tuple[str, str]] = set()
+        self._sync_running = False
         self._last = time.monotonic()
 
-    def put(self, row: UnitRow, file_sets: Iterable[FileSetRow] = ()) -> None:
+    def put(
+        self, row: UnitRow, file_sets: Iterable[FileSetRow] = (), *, sync: bool = False
+    ) -> None:
         key = (row.stage_name, row.unit_key)
         self._units[key] = row
         if row.status == "running":
             self._pending_running.add(key)
+            self._sync_running = self._sync_running or sync
         for item in file_sets:
             self._file_sets[item.fileset_hash] = item
 
@@ -42,10 +49,9 @@ class Writer:
             self.flush()
 
     def flush_running(self) -> None:
-        """Flush pending ``running`` marks (before unit bodies start, so a hard kill
-        mid-unit leaves ``interrupted`` rather than ``new``)."""
+        """Flush pending ``sync`` running marks (called before unit bodies start)."""
 
-        if self._pending_running:
+        if self._sync_running:
             self.flush()
 
     def maybe_flush(self) -> None:
@@ -67,3 +73,4 @@ class Writer:
         self._units.clear()
         self._file_sets.clear()
         self._pending_running.clear()
+        self._sync_running = False

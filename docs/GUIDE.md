@@ -595,7 +595,7 @@ Logical stages execute in topological order behind a barrier: every unit of a st
 
 **Live display.** When stdout is a terminal, `run` shows a `rich.Live` view: pipeline, branch, and overall progress, one line per stage (`hit`, `linked`, `running 142/500`, `awaiting`, `failed`), the active units with rate and ETA, and the last failures. `--no-tui` (or a non-terminal stdout) prints timestamped log lines to stderr instead.
 
-**Output capture.** When the live display is active or `workers > 1`, each unit's stdout and stderr go to `<root>/.varve/logs/<run_id>/<stage>/<unit>.log` (a stage without axes uses `_.log`). For in-process backends, varve then installs routing proxies for `sys.stdout`/`sys.stderr` (including writes to `sys.stdout.buffer`) for the stage; otherwise the streams are left untouched. Process workers redirect file descriptors. While the live display is active, file-descriptor-level output of the main process (for example from subprocesses) goes to `.varve/logs/<run_id>/process.log`. With one worker and no live display, output goes straight to the terminal. Logs of the 20 most recent runs are kept, plus those of runs still in progress on other branches. `inspect STAGE@... --log` prints a unit's log.
+**Output capture.** When the live display is active or `workers > 1`, each unit's stdout and stderr go to `<root>/.varve/logs/<run_id>/<stage>/<unit>.log` (a stage without axes uses `_.log`); the file only exists for units that wrote something. For in-process backends, varve then installs routing proxies for `sys.stdout`/`sys.stderr` (including writes to `sys.stdout.buffer`) for the stage; otherwise the streams are left untouched. Process workers redirect file descriptors. While the live display is active, file-descriptor-level output of the main process (for example from subprocesses) goes to `.varve/logs/<run_id>/process.log`. With one worker and no live display, output goes straight to the terminal. Logs of the 20 most recent runs are kept, plus those of runs still in progress on other branches. `inspect STAGE@... --log` prints a unit's log.
 
 **Metrics.** `ctx.metric(**values)` merges values into the unit's metrics (`units.metrics_json`, shown by `inspect`). Numeric values of successful units are summed per stage into `stage_runs.metrics_summary_json`. By convention `ctx.metric(items=N)` reports the number of items processed, which the web UI turns into items/s throughput (falling back to units/s).
 
@@ -723,7 +723,9 @@ Prints what would be removed and asks for confirmation unless `--yes` (a closed 
 - No option: the whole store, that is every storage's `.internal/` and `.staging/`, the publish directories of known branches and `.tmp/`, `state.db` with its WAL files, and the run logs. This also works when the database is foreign or unreadable.
 - `--branch NAME`: that branch's managed directories in every storage, its publish directory, and its records.
 - `--storage NAME`: that storage's managed directories and the records stored there (combine with `--branch` to limit it to one branch).
-- `--orphans`: directories and records of orphaned units (combine with `--branch` to limit it).
+- `--orphans`: directories and records of orphaned units (combine with `--branch` to limit it), plus stat-cache entries of files that are gone or changed.
+
+Every `clean` that keeps the store also drops stored key summaries, source details, and file lists that no remaining unit references; `run` does the same after it executed or linked units.
 
 `clean` removes paths under the storage roots recorded in the store (computed from `main`'s Config only for storages the store does not record); `ls` computes the root from `main`'s Config.
 
@@ -847,13 +849,13 @@ The JSON endpoints are `GET /api/workspace`, `/api/pipelines/{id}/branches/{bran
 
 ## Crash recovery and clean safety
 
-- **Atomic units.** A unit's directory is renamed into place before its `ok` record is committed; a replaced directory is moved aside as `.old-<run_id>` first. The `running` record is committed before the unit body starts, so after a crash or `kill -9` the unit probes as `interrupted` and simply reruns.
+- **Atomic units.** A unit's directory is renamed into place before its `ok` record is committed; a replaced directory is moved aside as `.old-<run_id>` first, and only after the unit's `running` record is committed. A unit that already has a record gets its `running` record before the body starts, so after a crash or `kill -9` it probes as `interrupted` and simply reruns; a unit without one that dies before its batched `running` record is written still probes as `new` and reruns.
 - **Startup recovery.** Each `run` first restores or drops `.old-*` directories of units still recorded as `running`, removes staging directories of this branch's earlier runs, and marks this branch's earlier `running` runs `interrupted`.
 - **Store durability.** `state.db` uses SQLite WAL with `synchronous=NORMAL`, which survives process kills and power loss on local filesystems. Unit writes are batched in short time windows during a run.
 - **Locks.** `run`, `reuse`, and `clean --branch` hold `.varve/lock` shared and `.varve/locks/<branch>.lock` exclusively, so different branches can run concurrently. A whole-store, `--storage`, or `--orphans` clean holds `.varve/lock` exclusively. A conflicting command fails immediately with an error instead of waiting.
 - **Read-only artifacts.** Managed files are `0444`, which protects them, and inodes shared by cross-branch links, from accidental writes.
 - **Clean scope.** `clean` only removes varve-managed paths: `.internal/`, `.staging/`, publish directories of known branches, `.varve/state.db*`, and `.varve/logs/`. Lock files are kept.
-- **Schema.** A store written by an incompatible varve, or a foreign SQLite file, is rejected with a message to run `clean`. There is no migration.
+- **Schema.** A store written by an incompatible varve, or a foreign SQLite file, is rejected with a message to run `clean`.
 
 ## Limitations
 

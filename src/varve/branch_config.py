@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel, create_model
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from varve.branch import (
     BranchDefinition,
@@ -31,6 +30,8 @@ from varve.branch import (
 from varve.keying.keys import config_data
 
 if TYPE_CHECKING:
+    from pydantic_settings import BaseSettings
+
     from varve.pipeline import Pipeline
     from varve.store.repo import BranchRow
 
@@ -39,6 +40,8 @@ ConfigT = TypeVar("ConfigT", bound=BaseModel)
 
 @cache
 def _settings_type(config_type: type[BaseModel]) -> type[BaseSettings]:
+    from pydantic_settings import BaseSettings, SettingsConfigDict  # costly; only when used
+
     class VarveSettings(BaseSettings):
         model_config = SettingsConfigDict(
             env_nested_delimiter="__",
@@ -232,7 +235,8 @@ def resolve_branch(
                     f"axes: {sorted(axes_by_name)}"
                 )
             if known.is_static:
-                unknown = [item for item in ids if item not in known.ids]
+                known_ids = set(known.ids)
+                unknown = [item for item in ids if item not in known_ids]
                 if unknown:
                     raise ValueError(
                         f"varve.yaml branch {label!r}: axes: {axis} ids {unknown} are not "
@@ -241,7 +245,8 @@ def resolve_branch(
         for axis, ids in slices.items():
             allowed = active.get(axis)
             if allowed is not None:
-                outside = [item for item in ids if item not in allowed]
+                allowed_set = set(allowed)
+                outside = [item for item in ids if item not in allowed_set]
                 if outside:
                     raise ValueError(
                         f"--slice {axis}={','.join(outside)} is outside the branch's active ids"

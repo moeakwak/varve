@@ -18,7 +18,7 @@ import os
 import re
 import stat as stat_module
 import warnings
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -56,14 +56,15 @@ def normalize_json(value: Any) -> Any:
     return _normalize_for_json(value)
 
 
+# One shared encoder: ``json.dumps`` with non-default options builds a new one per call.
+CANONICAL_ENCODER = json.JSONEncoder(
+    sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+)
+"""Encoder of canonical key JSON (sorted keys, compact, UTF-8 text, no NaN)."""
+
+
 def canonical_json(obj: Any) -> bytes:
-    return json.dumps(
-        _normalize_for_json(obj),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
+    return CANONICAL_ENCODER.encode(_normalize_for_json(obj)).encode("utf-8")
 
 
 def json_hash(obj: Any) -> str:
@@ -72,8 +73,8 @@ def json_hash(obj: Any) -> str:
     return hashlib.sha256(canonical_json(obj)).hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
-    with path.open("rb") as handle:
+def _sha256_file(path: Path | str) -> str:
+    with open(path, "rb") as handle:
         file_digest = getattr(hashlib, "file_digest", None)  # Python >= 3.11
         if file_digest is not None:
             return file_digest(handle, "sha256").hexdigest()
@@ -133,15 +134,29 @@ class CachedStat:
 class StatCache:
     """In-memory view of the ``stat_cache`` table with pending writes.
 
-    The engine loads it from ``Repo.load_stat_cache()`` and periodically
-    persists ``drain()`` via ``Repo.put_stat_cache()``.
+    The engine passes ``Repo.load_stat_cache`` as ``loader``; the table is read
+    on the first lookup, so commands that hash no file never load it. Pending
+    writes are persisted with ``drain()`` via ``Repo.put_stat_cache()``.
     """
 
-    def __init__(self, rows: Mapping[str, CachedStat] | None = None) -> None:
+    def __init__(
+        self,
+        rows: Mapping[str, CachedStat] | None = None,
+        *,
+        loader: Callable[[], Mapping[str, CachedStat]] | None = None,
+    ) -> None:
         self._rows: dict[str, CachedStat] = dict(rows or {})
         self._dirty: dict[str, CachedStat] = {}
+        self._loader = loader
+
+    def _load(self) -> None:
+        loader, self._loader = self._loader, None
+        if loader is not None:
+            self._rows = {**loader(), **self._rows}
 
     def lookup(self, path: str, st: os.stat_result) -> CachedStat | None:
+        if self._loader is not None:
+            self._load()
         row = self._rows.get(path)
         return row if row is not None and row.matches(st) else None
 
@@ -235,25 +250,7 @@ def walk_files(root: Path) -> list[tuple[str, Path]]:
     resolved = _resolve_root(root)
     if resolved.is_file():
         return [(resolved.name, resolved)]
-    found: list[tuple[str, Path]] = []
-    pending: list[tuple[str, str]] = [("", str(resolved))]
-    while pending:
-        prefix, directory = pending.pop()
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                rel = f"{prefix}{entry.name}"
-                if entry.is_symlink():
-                    raise ValueError(
-                        f"Symlinks are not allowed inside declared trees: {entry.path}"
-                    )
-                if entry.is_dir(follow_symlinks=False):
-                    pending.append((f"{rel}/", entry.path))
-                elif entry.is_file(follow_symlinks=False):
-                    found.append((rel, Path(entry.path)))
-                else:
-                    raise ValueError(f"Unsupported file type inside declared tree: {entry.path}")
-    found.sort(key=lambda item: item[0])
-    return found
+    return [(rel, Path(path)) for rel, path in _scan_tree(str(resolved))]
 
 
 def _segment_could_descend(dir_parts: list[str], pattern_parts: list[str]) -> bool:
@@ -286,7 +283,7 @@ def _excludes_subtree(rel: str, exclude: tuple[str, ...]) -> bool:
 
 def walk_glob(
     root: Path, include: tuple[str, ...], exclude: tuple[str, ...]
-) -> list[tuple[str, Path]]:
+) -> list[tuple[str, str]]:
     """Sorted ``(relpath, path)`` of files under ``root`` matching ``include`` minus ``exclude``.
 
     Only the parts of the tree an include pattern can reach are walked.
@@ -305,7 +302,7 @@ def walk_glob(
         )
 
     if resolved.is_file():
-        return [(resolved.name, resolved)] if selected(resolved.name) else []
+        return [(resolved.name, str(resolved))] if selected(resolved.name) else []
     split_include = [pattern.split("/") for pattern in include]
 
     def reaches_below(rel: str) -> bool:
@@ -314,7 +311,7 @@ def walk_glob(
         parts = rel.split("/")
         return any(_segment_could_descend(parts, pattern) for pattern in split_include)
 
-    found: list[tuple[str, Path]] = []
+    found: list[tuple[str, str]] = []
     pending: list[tuple[str, str]] = [("", str(resolved))]
     while pending:
         prefix, directory = pending.pop()
@@ -338,63 +335,149 @@ def walk_glob(
                         raise ValueError(
                             f"Unsupported file type inside declared tree: {entry.path}"
                         )
-                    found.append((rel, Path(entry.path)))
+                    found.append((rel, entry.path))
     found.sort(key=lambda item: item[0])
     return found
+
+
+def _scan_tree(directory: str) -> list[tuple[str, str]]:
+    """Sorted ``(relpath, path)`` of regular files below a resolved directory (see ``walk_files``)."""
+
+    found: list[tuple[str, str]] = []
+    pending: list[tuple[str, str]] = [("", directory)]
+    while pending:
+        prefix, current = pending.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                rel = f"{prefix}{entry.name}"
+                if entry.is_symlink():
+                    raise ValueError(
+                        f"Symlinks are not allowed inside declared trees: {entry.path}"
+                    )
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append((f"{rel}/", entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    found.append((rel, entry.path))
+                else:
+                    raise ValueError(f"Unsupported file type inside declared tree: {entry.path}")
+    found.sort(key=lambda item: item[0])
+    return found
+
+
+def _material_text(entry: list[Any]) -> str:
+    """Canonical JSON of one plain material entry (``[mode, rows]``)."""
+
+    return CANONICAL_ENCODER.encode(entry)
+
+
+@dataclass(frozen=True, slots=True)
+class _Chunk:
+    """What one declared root contributes to an input: ``entry`` is ``[mode, rows]``."""
+
+    root: str
+    entry: list[Any]
+    files: int
+    bytes: int
+    text: str
+    """Canonical JSON of ``entry``; an input's digest hashes ``[text, ...]``."""
 
 
 class FingerprintSession:
     """Filesystem observations shared within one command (probe or run).
 
     Content hashes go through the optional :class:`StatCache` so unchanged
-    files are not re-read across commands; ``rehash=True`` ignores it.
+    files are not re-read across commands; ``rehash=True`` ignores it. Walks,
+    file hashes, per-root material and whole input digests are memoized for
+    the command: files are assumed not to change while it evaluates keys.
+    Paths are handled as strings in the hot loops.
     """
 
     def __init__(self, cache: StatCache | None = None, *, rehash: bool = False) -> None:
         self.cache = cache if cache is not None else StatCache()
         self.rehash = rehash
-        self._trees: dict[Path, list[tuple[str, Path]]] = {}
-        self._globs: dict[
-            tuple[Path, tuple[str, ...], tuple[str, ...]], list[tuple[str, Path]]
-        ] = {}
-        self._hashes: dict[Path, tuple[str, os.stat_result]] = {}
+        self._roots: dict[str, tuple[str, os.stat_result | None]] = {}
+        """Absolute declared root -> (resolved path, stat of a regular file root or None)."""
+        self._trees: dict[str, list[tuple[str, str]]] = {}
+        self._realdirs: dict[str, str] = {}
+        self._hashes: dict[str, tuple[str, os.stat_result]] = {}
+        self._chunks: dict[tuple[Any, ...], _Chunk] = {}
+        self._digests: dict[PathSet | Glob, InputDigest] = {}
 
-    def walk(self, root: Path) -> list[tuple[str, Path]]:
-        key = root.expanduser().absolute()
-        tree = self._trees.get(key)
+    # -- roots and walks ------------------------------------------------------
+
+    def _realdir(self, directory: str) -> str:
+        real = self._realdirs.get(directory)
+        if real is None:
+            real = self._realdirs[directory] = os.path.realpath(directory)
+        return real
+
+    def _root(self, absolute: str) -> tuple[str, os.stat_result | None]:
+        """Resolve a declared root like ``_resolve_root`` (same result, same errors).
+
+        A root whose last component is not a symlink is resolved through its
+        (memoized) parent directory, so a file costs one ``lstat``.
+        """
+
+        found = self._roots.get(absolute)
+        if found is not None:
+            return found
+        try:
+            st: os.stat_result | None = os.lstat(absolute)
+        except OSError:
+            st = None
+        result: tuple[str, os.stat_result | None] | None = None
+        if st is not None and not stat_module.S_ISLNK(st.st_mode):
+            head, name = os.path.split(absolute)
+            if stat_module.S_ISREG(st.st_mode) and name not in ("", ".", ".."):
+                result = (os.path.join(self._realdir(head), name), st)
+            elif stat_module.S_ISDIR(st.st_mode):
+                result = (self._realdir(absolute), None)
+        if result is None:
+            resolved = _resolve_root(Path(absolute))  # symlinks, special files, errors
+            result = (str(resolved), resolved.stat() if resolved.is_file() else None)
+        self._roots[absolute] = result
+        return result
+
+    def _tree(self, absolute: str) -> list[tuple[str, str]]:
+        tree = self._trees.get(absolute)
         if tree is None:
-            tree = walk_files(key)
-            self._trees[key] = tree
+            resolved, file_stat = self._root(absolute)
+            if file_stat is not None:
+                tree = [(os.path.basename(resolved), resolved)]
+            else:
+                tree = _scan_tree(resolved)
+            self._trees[absolute] = tree
         return tree
 
-    def walk_glob(self, spec: Glob) -> list[tuple[str, Path]]:
-        key = (spec.root.expanduser().absolute(), spec.include, spec.exclude)
-        files = self._globs.get(key)
-        if files is None:
-            files = walk_glob(key[0], spec.include, spec.exclude)
-            self._globs[key] = files
-        return files
+    def walk(self, root: Path) -> list[tuple[str, Path]]:
+        absolute = str(root.expanduser().absolute())
+        return [(rel, Path(path)) for rel, path in self._tree(absolute)]
 
-    def file_hash(self, path: Path) -> tuple[str, os.stat_result]:
-        """Content sha256 and stat of ``path`` (a resolved file path)."""
+    # -- hashes ---------------------------------------------------------------
 
+    def _file_hash(self, path: str, st: os.stat_result | None = None) -> tuple[str, os.stat_result]:
         memo = self._hashes.get(path)
         if memo is not None:
             return memo
-        st = path.stat()
-        cached = None if self.rehash else self.cache.lookup(str(path), st)
+        if st is None:
+            st = os.stat(path)
+        cached = None if self.rehash else self.cache.lookup(path, st)
         if cached is not None:
             result = (cached.content_hash, st)
         else:
-            digest, st = _stable(path, _sha256_file)
-            previous = self.cache.lookup(str(path), st)
+            digest, st = _stable(Path(path), _sha256_file)
+            previous = self.cache.lookup(path, st)
             self.cache.store(
-                str(path),
-                CachedStat(*_token(st), digest, previous.ast_hash if previous else None),
+                path, CachedStat(*_token(st), digest, previous.ast_hash if previous else None)
             )
             result = (digest, st)
         self._hashes[path] = result
         return result
+
+    def file_hash(self, path: Path) -> tuple[str, os.stat_result]:
+        """Content sha256 and stat of ``path`` (a resolved file path)."""
+
+        return self._file_hash(str(path))
 
     def ast_hash(self, path: Path) -> str:
         """Hash of the normalized AST of a Python file, through the stat cache."""
@@ -410,53 +493,133 @@ class FingerprintSession:
         self.cache.store(str(resolved), CachedStat(*_token(st), content, tree_hash))
         return tree_hash
 
-    def _set_files(self, spec: PathSet | Glob) -> Iterator[tuple[str, list[tuple[str, Path]]]]:
-        if isinstance(spec, PathSet):
-            for path in spec.paths:
-                yield str(path.expanduser().absolute()), self.walk(path)
-            return
-        files = self.walk_glob(spec)
-        if not files and not spec.allow_empty:
+    # -- inputs ---------------------------------------------------------------
+
+    def _chunk(
+        self, root: str, files: list[tuple[str, str]], mode: str, file_stat: os.stat_result | None
+    ) -> _Chunk:
+        rows: list[list[Any]] = []
+        total = 0
+        if mode == "stat":
+            for rel, path in files:
+                st = file_stat if file_stat is not None else os.stat(path)
+                rows.append([rel, st.st_size, st.st_mtime_ns])
+                total += st.st_size
+        else:
+            for rel, path in files:
+                digest, st = self._file_hash(path, file_stat)
+                rows.append([rel, digest])
+                total += st.st_size
+        entry = [mode, rows]
+        return _Chunk(root, entry, len(rows), total, _material_text(entry))
+
+    def _path_chunk(self, path: Path, mode: str) -> _Chunk:
+        key = (path, mode)
+        chunk = self._chunks.get(key)
+        if chunk is None:
+            absolute = str(path.expanduser().absolute())
+            files = self._tree(absolute)
+            resolved, file_stat = self._root(absolute)
+            chunk = self._chunk(absolute, files, mode, file_stat)
+            self._chunks[key] = chunk
+        return chunk
+
+    def _glob_chunk(self, spec: Glob) -> _Chunk:
+        key = (spec.root, spec.include, spec.exclude, spec.mode, "glob")
+        chunk = self._chunks.get(key)
+        if chunk is None:
+            absolute = spec.root.expanduser().absolute()
+            files = walk_glob(absolute, spec.include, spec.exclude)
+            chunk = self._chunk(str(absolute), files, spec.mode, None)
+            self._chunks[key] = chunk
+        if not chunk.files and not spec.allow_empty:
             raise FileNotFoundError(
                 f"Dependencies.glob matched no files under {spec.root} "
                 f"(include={list(spec.include)}, exclude={list(spec.exclude)})"
             )
-        yield str(spec.root.expanduser().absolute()), files
+        return chunk
 
     def input_digest(self, spec: InputSpec) -> InputDigest:
         normalized = as_input_set(spec)
-        material: list[Any] = []
-        roots: list[str] = []
-        count = 0
-        total = 0
-        for root, files in self._set_files(normalized):
-            rows: list[list[Any]] = []
-            for rel, path in files:
-                if normalized.mode == "stat":
-                    st = path.stat()
-                    rows.append([rel, st.st_size, st.st_mtime_ns])
-                else:
-                    digest, st = self.file_hash(path)
-                    rows.append([rel, digest])
-                total += st.st_size
-            count += len(rows)
-            material.append([normalized.mode, rows])
-            roots.append(root)
-        return InputDigest(json_hash(material), count, total, material, roots)
+        digest = self._digests.get(normalized)
+        if digest is not None:
+            return digest
+        if isinstance(normalized, PathSet):
+            chunks = [self._path_chunk(path, normalized.mode) for path in normalized.paths]
+        else:
+            chunks = [self._glob_chunk(normalized)]
+        # Equals json_hash(material): the canonical JSON of a list joins its items' JSON.
+        text = "[" + ",".join(chunk.text for chunk in chunks) + "]"
+        digest = InputDigest(
+            hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            sum(chunk.files for chunk in chunks),
+            sum(chunk.bytes for chunk in chunks),
+            [chunk.entry for chunk in chunks],
+            [chunk.root for chunk in chunks],
+        )
+        self._digests[normalized] = digest
+        return digest
 
     def inputs(self, specs: Mapping[str, InputSpec]) -> dict[str, InputDigest]:
         return {name: self.input_digest(specs[name]) for name in sorted(specs)}
 
 
-def artifact_fingerprint(unit_dir: Path) -> ArtifactFingerprint:
-    """Hash every managed file of a freshly written unit directory (never cached)."""
+def _hash_open_file(path: str, retries: int = 2) -> tuple[str, os.stat_result]:
+    """Content sha256 and ``fstat`` of a file whose stat token is unchanged across the read."""
+
+    for _ in range(retries + 1):
+        with open(path, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            file_digest = getattr(hashlib, "file_digest", None)  # Python >= 3.11
+            if file_digest is not None:
+                digest = file_digest(handle, "sha256").hexdigest()
+            else:
+                hasher = hashlib.sha256()
+                for chunk in iter(lambda: handle.read(_CHUNK), b""):
+                    hasher.update(chunk)
+                digest = hasher.hexdigest()
+            after = os.fstat(handle.fileno())
+        if _token(before) == _token(after):
+            return digest, after
+    raise OSError(f"File changed while hashing: {path}")
+
+
+def artifact_fingerprint(
+    unit_dir: Path, *, read_only: bool = False, file_mode: int = 0o444, dir_mode: int = 0o755
+) -> ArtifactFingerprint:
+    """Hash every managed file of a freshly written unit directory (never cached).
+
+    Entries must be regular files and directories (no symlinks). With
+    ``read_only``, each file is set to ``file_mode`` right after hashing and
+    every directory to ``dir_mode`` (``chmod`` does not change ``mtime``).
+    """
 
     manifest: list[list[Any]] = []
     total = 0
-    for rel, path in walk_files(unit_dir):
-        digest, st = _stable(path, _sha256_file)
-        manifest.append([rel, st.st_size, st.st_mtime_ns, digest])
-        total += st.st_size
+    root = os.fspath(unit_dir)
+    pending: list[tuple[str, str]] = [("", root)]
+    while pending:
+        prefix, directory = pending.pop()
+        if read_only:
+            os.chmod(directory, dir_mode)
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                rel = f"{prefix}{entry.name}"
+                if entry.is_symlink():
+                    raise ValueError(
+                        f"Symlinks are not allowed inside declared trees: {entry.path}"
+                    )
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append((f"{rel}/", entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    digest, st = _hash_open_file(entry.path)
+                    if read_only:
+                        os.chmod(entry.path, file_mode)
+                    manifest.append([rel, st.st_size, st.st_mtime_ns, digest])
+                    total += st.st_size
+                else:
+                    raise ValueError(f"Unsupported file type inside declared tree: {entry.path}")
+    manifest.sort(key=lambda row: row[0])
     fingerprint = json_hash([[rel, digest] for rel, _, _, digest in manifest])
     return ArtifactFingerprint(fingerprint, manifest, len(manifest), total)
 

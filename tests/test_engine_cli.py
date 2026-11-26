@@ -353,3 +353,30 @@ def test_process_backend_with_classes_in_main(ws, style: str) -> None:
     rows = repo.units("main", "work")
     assert {tuple(row.config_access or ["<all>"]) for row in rows.values()} == {("scale", "tint")}
     repo.conn.close()
+
+
+MANY = """
+from varve import Axis, Ctx, Pipeline, stage
+
+STATIC = Axis("static", [str(i) for i in range(3000)])
+DYNAMIC = Axis("dynamic", resolver=lambda ctx: [str(i) for i in range(3000)])
+
+class Demo(Pipeline):
+    @stage(foreach=STATIC)
+    def wide(self, ctx: Ctx, static: str) -> None:
+        pass
+
+    @stage(foreach=DYNAMIC)
+    def deep(self, ctx: Ctx, dynamic: str) -> None:
+        pass
+"""
+
+
+def test_large_axis_restrictions(ws) -> None:
+    ids = [str(i) for i in range(0, 3000, 2)]
+    branch = {"axes": {"static": ids, "dynamic": ids}}
+    (ws.src / "varve.yaml").write_text(json.dumps({"main": {}, "half": branch}))
+    Demo = ws.write(MANY)
+    view = probe_pipeline(Demo, root=ws.root, branch="half", expand=True)
+    assert [len(view.stage(name).units) for name in ("wide", "deep")] == [1500, 1500]
+    assert view.stage("deep").units[-1].unit_key == "dynamic=2998"

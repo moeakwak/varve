@@ -48,7 +48,7 @@ class Session:
     """Latest full domain per resolver request (orphan detection)."""
 
     def __post_init__(self) -> None:
-        cache = StatCache(self.repo.load_stat_cache() if self.repo is not None else None)
+        cache = StatCache(loader=self.repo.load_stat_cache if self.repo is not None else None)
         self.fingerprints = FingerprintSession(cache, rehash=self.rehash)
         self.sources = SourceAnalyzer(self.fingerprints)
         static_active = {

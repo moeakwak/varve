@@ -265,3 +265,41 @@ def test_status_lists_every_needs_run_reason(ws) -> None:
     stage = view.stage("a")
     assert stage.units[0].reason == "config-changed, source-changed"
     assert stage.reasons == {"config-changed": 1, "source-changed": 1}
+
+
+def test_single_branch_runs_skip_the_cross_branch_link_index(ws, monkeypatch) -> None:
+    def fail(*args, **kwargs):
+        raise AssertionError("link_index queried with a single branch")
+
+    monkeypatch.setattr(Repo, "link_index", fail)
+    Demo = ws.write(SOURCE)
+    assert ws.run(Demo).status == "ok"
+    Demo = ws.write(SOURCE.replace('return "B1"', 'return "B2"'))
+    assert ws.run(Demo).stages["b"].executed == 1
+
+
+COUNTED = """
+from pathlib import Path
+from varve import Axis, Ctx, Dependencies, Pipeline, stage
+
+ITEM = Axis("item", ["a", "b", "c"])
+CALLS = Path(__file__).with_suffix(".calls")
+
+def depends(ctx):
+    with CALLS.open("a") as handle:
+        handle.write(ctx.cell["item"] + "\\n")
+    return Dependencies(values={"item": ctx.cell["item"]})
+
+class Demo(Pipeline):
+    @stage(foreach=ITEM, depends=depends)
+    def work(self, ctx: Ctx, item: str) -> None:
+        pass
+"""
+
+
+def test_inspect_with_coordinates_evaluates_only_the_matching_cell(ws) -> None:
+    Demo = ws.write(COUNTED)
+    calls = ws.path.with_suffix(".calls")
+    result = inspect_pipeline(Demo, "work@item=b", root=ws.root)
+    assert [unit[0] for unit in result.units] == ["item=b"]
+    assert calls.read_text().split() == ["b"]

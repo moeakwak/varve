@@ -16,7 +16,7 @@ from varve.keying.config_access import merge_access
 from varve.keying.fingerprint import verify_manifest
 from varve.keying.keys import InputKey, combine_hashes, compute_input_key
 from varve.store import layout
-from varve.store.repo import UnitRow
+from varve.store.repo import LinkCandidate, UnitRow
 
 
 class Committer:
@@ -35,9 +35,14 @@ class Committer:
         self.writer = writer
         self.evaluator = evaluator
         self.bus = bus
+        self._links: tuple[str, dict[str, list[LinkCandidate]]] | None = None
 
     def input_key(self, node: StageNode, unit_plan: UnitPlan, access: list[str] | None) -> InputKey:
-        assert unit_plan.upstream_keys is not None
+        """The unit's key under ``access``, reusing the probe's other segment hashes."""
+
+        assert unit_plan.upstream_keys is not None and unit_plan.hashes is not None
+        access_json = None if access is None else json.dumps(access, separators=(",", ":"))
+        hashes = {**unit_plan.hashes, "config": self.evaluator.config_hash(access_json)}
         return compute_input_key(
             config=self.session.config_dump,
             config_access=access,
@@ -46,7 +51,22 @@ class Committer:
             values=unit_plan.values(),
             version=node.spec.version,
             produces=node.spec.produces_key,
+            hashes=hashes,
         )
+
+    def _link_index(self, node: StageNode) -> dict[str, list[LinkCandidate]]:
+        """Other branches' ``ok`` units of the stage (light columns), loaded once per stage."""
+
+        if self._links is None or self._links[0] != node.name:
+            repo = self.session.repo
+            assert repo is not None
+            index = (
+                repo.link_index(node.name, exclude_branch_id=self.session.branch_id)
+                if repo.branch_count() > 1
+                else {}
+            )
+            self._links = (node.name, index)
+        return self._links[1]
 
     def artifact_relpath(self, node: StageNode, relpath: str) -> str:
         base = layout.internal_relpath(self.session.branch.name, node.name, relpath)
@@ -126,20 +146,40 @@ class Committer:
         assert repo is not None
         if unit_plan.hashes is None:
             return False
+        candidates = self._link_index(node).get(unit_plan.unit_key)
+        if not candidates:
+            return False
         source_fp = unit_plan.cell.source.fingerprint
         storage_root = session.storage_roots[node.storage]
-        candidates = repo.link_candidates(
-            node.name, unit_plan.unit_key, exclude_branch_id=session.branch_id
-        )
-        for other, row in candidates:
-            if row.storage_name != node.storage or row.artifact_manifest is None:
+        for candidate in candidates:
+            if candidate.storage_name != node.storage or not candidate.has_manifest:
+                continue
+            if node.spec.version is None and source_fp not in (
+                candidate.source_fp,
+                candidate.reused_source_fp,
+            ):
+                continue
+            config_hash = self.evaluator.config_hash(candidate.config_access_json)
+            if combine_hashes({**unit_plan.hashes, "config": config_hash}) != candidate.input_key:
+                continue
+            # The index is a snapshot and other branches commit concurrently, so the
+            # full row is checked again by the same rules.
+            row = repo.get_unit(candidate.branch_id, node.name, unit_plan.unit_key)
+            if row is None or row.status != "ok" or row.storage_name != node.storage:
+                continue
+            if row.artifact_manifest is None:
                 continue
             if node.spec.version is None and source_fp not in (row.source_fp, row.reused_source_fp):
                 continue
-            access_json = None if row.config_access is None else json.dumps(row.config_access)
+            access_json = (
+                None
+                if row.config_access is None
+                else json.dumps(row.config_access, separators=(",", ":"))
+            )
             config_hash = self.evaluator.config_hash(access_json)
             if combine_hashes({**unit_plan.hashes, "config": config_hash}) != row.input_key:
                 continue
+            other = candidate.branch_name
             relpath = unit_plan.unit.relpath
             source_dir = layout.internal_dir(storage_root, other, node.name, relpath)
             if not verify_manifest(source_dir, row.artifact_manifest):

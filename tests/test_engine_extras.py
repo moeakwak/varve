@@ -330,3 +330,14 @@ def test_clean_uses_the_recorded_storage_roots(ws) -> None:
     (ws.src / "varve.yaml").write_text(json.dumps({"main": {"config": {"out": str(second)}}}))
     assert ws.cli(Demo, "clean", "--yes") == 0
     assert not (first / ".internal").exists()
+
+
+def test_silent_units_leave_no_log_files(ws) -> None:
+    # `env` runs in process workers (fd capture); a silent thread stage uses the lazy log.
+    Demo = ws.write(SOURCE.replace('print(f"thread {item}")', "pass"))
+    for stage in ("env", "threads"):
+        for tui in (False, True):
+            result = ws.run(Demo, options=RunOptions(only=stage, tui=tui, force=True))
+            assert result.stages[stage].executed == 2
+            logs = layout.logs_dir(ws.root, result.run_id)
+            assert not [p for p in logs.rglob("*.log") if p.parent.name == stage]

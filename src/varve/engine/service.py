@@ -24,6 +24,7 @@ from varve.engine.refs import RefInfo, RefResolver, bound_refs
 from varve.engine.run import Runner, RunOptions, RunResult
 from varve.engine.session import Session, WorkspaceSettings, identity_meta, open_session
 from varve.engine.tui import LiveDisplay, PlainReporter
+from varve.graph import Unit
 from varve.pipeline import Pipeline
 from varve.status import InspectView, PipelineView, inspect_unit, pipeline_view
 from varve.store import layout
@@ -123,11 +124,16 @@ def _probe_session(
     )
 
 
-def probe_plans(session: Session, stages: Sequence[str] | None = None) -> dict[str, StagePlan]:
+def probe_plans(
+    session: Session,
+    stages: Sequence[str] | None = None,
+    *,
+    select: Mapping[str, Callable[[Unit], bool]] | None = None,
+) -> dict[str, StagePlan]:
     for name in stages or ():
         if name not in session.graph.nodes:
             raise ValueError(f"Unknown stage {name!r}; stages: {list(session.graph.order)}")
-    return probe(session, stages)
+    return probe(session, stages, select=select)
 
 
 def probe_pipeline(
@@ -197,15 +203,21 @@ def inspect_pipeline(
         pipeline, branch=branch, args=args, root=root, refs=refs, workspace=workspace
     )
     try:
-        plan = probe_plans(session, [stage])[stage]
+        node = session.graph.nodes.get(stage)
+        if node is not None:
+            axes = {axis.name for axis in node.axes}
+            unknown = sorted(set(coords) - axes)
+            if unknown:
+                raise ValueError(f"Stage {stage!r} has no axes {unknown}; axes: {sorted(axes)}")
+
+        def selected(unit: Unit) -> bool:
+            return all(unit.coords.get(name) == item for name, item in coords.items())
+
+        plan = probe_plans(session, [stage], select={stage: selected} if coords else None)[stage]
         stage_refs = {*plan.node.refs, *plan.node.resolver_refs}
         ref_infos = tuple(info for info in bound_refs(session.refs) if info.attr in stage_refs)
         if plan.status == "awaiting":
             return InspectResult(stage, [], None, None, ref_infos)
-        axes = {axis.name for axis in plan.node.axes}
-        unknown = sorted(set(coords) - axes)
-        if unknown:
-            raise ValueError(f"Stage {stage!r} has no axes {unknown}; axes: {sorted(axes)}")
         matches = [
             unit
             for unit in plan.units

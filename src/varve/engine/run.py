@@ -12,13 +12,14 @@ import asyncio
 import shutil
 import signal
 import socket
+import sqlite3
 import sys
 import threading
 import time
 import traceback
 from collections.abc import Iterator, Sequence
 from concurrent.futures.process import BrokenProcessPool
-from contextlib import AsyncExitStack, contextmanager
+from contextlib import AsyncExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -182,6 +183,7 @@ class Runner:
         self.needed = [name for name in session.graph.order if name in needed]
         self.outcomes: dict[str, StageOutcome] = {}
         self.states: dict[str, StageState] = {}
+        self.publish_claims: dict[tuple[str, int], dict[str, str]] = {}
         self.evaluator = StageEvaluator(session)
         self.resources = ResourceManager()
         self.aborted = False
@@ -258,6 +260,11 @@ class Runner:
             status = self._status()
             wall_ms = int((time.monotonic() - started) * 1000)
             repo.finish_run(self.run_id, status=status, total_wall_ms=wall_ms)
+            if any(item.executed or item.linked for item in self.outcomes.values()):
+                # Rows this run replaced may have left key parts, source details,
+                # or file sets unreferenced.
+                with suppress(sqlite3.OperationalError):
+                    repo.collect_garbage()
         rotate_logs(session.root, active=repo.running_run_ids())
         self.bus.publish(RunFinished(status, wall_ms))
         return RunResult(self.run_id, session.branch.name, status, self.outcomes, wall_ms)
@@ -478,6 +485,7 @@ class Runner:
                         (session.graph.nodes[other], item.units)
                         for other, item in self.states.items()
                     ),
+                    self.publish_claims,
                 )
                 publish_stage(node, state.units, unit_dirs, storage_root, session.publish_dir)
             except (PublishError, GraphError, OSError) as error:
@@ -546,12 +554,18 @@ class Runner:
                 keys[unit_plan.unit_key] = cached
             return cached
 
-        jobs = {
-            unit_plan.unit_key: self._job(
-                node, unit_plan, capture, unit_resources[unit_plan.unit_key]
-            )
-            for unit_plan in to_run
-        }
+        jobs: dict[str, UnitJob] = {}
+        # Unit staging dirs are created by the units themselves, below this one.
+        (layout.staging_root(session.storage_roots[node.storage], self.run_id) / name).mkdir(
+            parents=True, exist_ok=True
+        )
+
+        def job_for(unit_plan: UnitPlan) -> UnitJob:
+            job = jobs.get(unit_plan.unit_key)
+            if job is None:
+                job = self._job(node, unit_plan, capture, unit_resources[unit_plan.unit_key])
+                jobs[unit_plan.unit_key] = job
+            return job
 
         def probe_access(unit_plan: UnitPlan) -> list[str] | None:
             return unit_plan.row.config_access if unit_plan.row is not None else None
@@ -559,7 +573,11 @@ class Runner:
         def on_start(unit_plan: UnitPlan) -> None:
             key = probe_key(unit_plan)
             row = self.commits.row(node, unit_plan, key, probe_access(unit_plan), "running")
-            self.writer.put(row, key.file_sets)
+            # A unit with a previous row is marked before its body starts (a hard
+            # kill then leaves it `running`); a new unit's mark is batched, since
+            # without a row it probes as `new` anyway. Either mark reaches the
+            # store before a promotion replaces an existing unit dir.
+            self.writer.put(row, key.file_sets, sync=unit_plan.row is not None)
             self.bus.publish(UnitStarted(name, unit_plan.unit_key))
 
         broken: list[str] = []
@@ -632,7 +650,7 @@ class Runner:
             try:
                 result = await run_window(
                     to_run,
-                    lambda unit_plan: backend.submit(jobs[unit_plan.unit_key]),
+                    lambda unit_plan: backend.submit(job_for(unit_plan)),
                     workers=workers,
                     is_exclusive=lambda unit_plan: node.is_exclusive(unit_plan.unit),
                     max_failures=node.max_failures,

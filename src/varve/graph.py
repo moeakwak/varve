@@ -826,17 +826,33 @@ def publish_claims(node: StageNode, units: Sequence[Unit]) -> dict[str, str]:
 
 
 def check_publish_collisions(
-    node: StageNode, units: Sequence[Unit], others: Iterable[tuple[StageNode, Sequence[Unit]]]
+    node: StageNode,
+    units: Sequence[Unit],
+    others: Iterable[tuple[StageNode, Sequence[Unit]]],
+    cache: dict[tuple[str, int], dict[str, str]] | None = None,
 ) -> None:
-    """Reject concrete publish destinations of ``node`` that another stage also claims."""
+    """Reject concrete publish destinations of ``node`` that another stage also claims.
+
+    ``cache`` (keyed by stage name and the identity of its unit list) lets a run
+    compute each stage's claims once instead of once per later publishing stage.
+    """
 
     if not node.spec.publish:
         return
-    mine = publish_claims(node, units)
+
+    def claims(stage: StageNode, stage_units: Sequence[Unit]) -> dict[str, str]:
+        if cache is None:
+            return publish_claims(stage, stage_units)
+        key = (stage.name, id(stage_units))
+        if key not in cache:
+            cache[key] = publish_claims(stage, stage_units)
+        return cache[key]
+
+    mine = claims(node, units)
     for other, other_units in others:
         if other.name == node.name or not other.spec.publish or not other_units:
             continue
-        theirs = publish_claims(other, other_units)
+        theirs = claims(other, other_units)
         clash = sorted(mine.keys() & theirs.keys())
         if clash:
             dst = clash[0]

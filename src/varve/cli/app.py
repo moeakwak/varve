@@ -9,21 +9,10 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from varve.branch_config import parse_sample, parse_slice
 from varve.cli import argmap, render
 from varve.engine.probe import ProbeError
 from varve.engine.refs import RefResolutionError
 from varve.engine.resources import ResourceError
-from varve.engine.run import RunOptions
-from varve.engine.service import (
-    clean_pipeline,
-    inspect_pipeline,
-    parse_unit_selector,
-    plan_clean,
-    probe_pipeline,
-    reuse_stage,
-    run_pipeline,
-)
 from varve.graph import GraphError
 from varve.log import configure_cli_logging
 from varve.pipeline import Pipeline
@@ -188,6 +177,14 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
 def _dispatch(
     pipeline: type[Pipeline], ns: argparse.Namespace, raw: list[str], root: Path | None, console
 ) -> int:
+    from varve.engine.service import (
+        inspect_pipeline,
+        parse_unit_selector,
+        probe_pipeline,
+        reuse_stage,
+        run_pipeline,
+    )
+
     command = ns.command
     if command == "ls":
         render.render_ls(console, pipeline, root)
@@ -225,6 +222,9 @@ def _dispatch(
         return 0
 
     assert command == "run"
+    from varve.branch_config import parse_sample, parse_slice
+    from varve.engine.run import RunOptions
+
     slices = dict(parse_slice(text, base=Path.cwd()) for text in ns.slice)
     samples = dict(parse_sample(text) for text in ns.sample)
     options = RunOptions(
@@ -254,6 +254,8 @@ def _dispatch(
 
 
 def _clean(pipeline: type[Pipeline], ns: argparse.Namespace, root: Path | None, console) -> int:
+    from varve.engine.service import clean_pipeline, plan_clean
+
     def call(function):
         return function(
             pipeline, root=root, branch=ns.branch, storage=ns.storage, orphans=ns.orphans

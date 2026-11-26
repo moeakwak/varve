@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -78,6 +78,17 @@ CREATE TABLE IF NOT EXISTS file_sets (
     created_at   TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS key_parts (
+    part_key  TEXT PRIMARY KEY,
+    part_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sources (
+    source_fp   TEXT PRIMARY KEY,
+    detail_json TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS units (
     branch_id              TEXT NOT NULL REFERENCES branches(branch_id),
     stage_name             TEXT NOT NULL,
@@ -87,7 +98,6 @@ CREATE TABLE IF NOT EXISTS units (
     key_components_json    TEXT NOT NULL,
     config_access_json     TEXT,
     source_fp              TEXT NOT NULL,
-    source_detail_json     TEXT NOT NULL,
     reused_source_fp       TEXT,
     status                 TEXT NOT NULL,
     artifact_relpath       TEXT,
@@ -106,7 +116,7 @@ CREATE TABLE IF NOT EXISTS units (
     updated_at             TEXT NOT NULL,
     PRIMARY KEY (branch_id, stage_name, unit_key)
 );
-CREATE INDEX IF NOT EXISTS units_by_input ON units(stage_name, unit_key, input_key);
+CREATE INDEX IF NOT EXISTS units_by_stage ON units(stage_name, status);
 
 CREATE TABLE IF NOT EXISTS stat_cache (
     norm_path    TEXT PRIMARY KEY,
@@ -114,9 +124,8 @@ CREATE TABLE IF NOT EXISTS stat_cache (
     size         INTEGER NOT NULL,
     mtime_ns     INTEGER NOT NULL,
     content_hash TEXT NOT NULL,
-    ast_hash     TEXT,
-    updated_at   TEXT NOT NULL
-);
+    ast_hash     TEXT
+) WITHOUT ROWID;
 """
 
 
@@ -240,21 +249,6 @@ def _check_schema(conn: sqlite3.Connection, path: Path, *, readonly: bool) -> No
             f"{path} has state schema {found!r}, this varve expects {SCHEMA_VERSION!r}; "
             "there is no migration: run `clean` to start over"
         )
-    if not readonly:
-        _add_missing_columns(conn)
-
-
-# Nullable columns added after the first schema-1 databases were written; they
-# are added in place so those databases keep working.
-_LATE_COLUMNS = {"units": {"linked_from": "TEXT"}}
-
-
-def _add_missing_columns(conn: sqlite3.Connection) -> None:
-    for table, columns in _LATE_COLUMNS.items():
-        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-        for name, kind in columns.items():
-            if name not in present:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
 
 
 @contextmanager

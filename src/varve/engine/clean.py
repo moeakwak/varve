@@ -4,9 +4,10 @@
   publish dirs of known branches, the state database and the run logs;
 * ``branch``: that branch's managed dirs, publish dir, and rows;
 * ``storage``: one storage's managed dirs and the rows stored there;
-* ``orphans``: unit dirs and rows of orphaned units.
+* ``orphans``: unit dirs and rows of orphaned units, then stale stat-cache rows.
 
-Storage roots are those recorded in the store's ``storages`` table (computed
+Branch, storage, and orphan cleans also drop key parts, source details, and
+file sets no remaining unit references. Storage roots are those recorded in the store's ``storages`` table (computed
 roots only for names it does not record). Lock files are kept.
 Whole/storage/orphan cleans hold the pipeline lock exclusively; a branch clean
 holds it shared plus the branch lock.
@@ -192,6 +193,7 @@ def _clean_branch(
             remove_tree(path)
         if repo is not None and row is not None:
             repo.delete_branch(row.branch_id)
+            repo.collect_garbage()
     return plan
 
 
@@ -218,6 +220,7 @@ def _clean_storage(
             remove_tree(path)
         if repo is not None:
             repo.delete_units_in_storage(storage, branch_id=branch_id)
+            repo.collect_garbage()
     return plan
 
 
@@ -227,21 +230,24 @@ def _clean_orphans(
     if repo is None:
         return CleanPlan(description="orphaned units")
     names = _branch_names(repo)
-    rows = repo.units_with_status("orphaned")
+    rows = repo.unit_keys_with_status("orphaned")
     if branch is not None:
-        rows = [row for row in rows if names.get(row.branch_id) == branch]
+        rows = [row for row in rows if names.get(row[0]) == branch]
     paths = []
-    for row in rows:
-        storage_root = roots.storage_roots.get(row.storage_name)
-        name = names.get(row.branch_id)
+    for branch_id, stage, unit_key, storage in rows:
+        storage_root = roots.storage_roots.get(storage)
+        name = names.get(branch_id)
         if storage_root is None or name is None:
             continue
-        relpath = layout.unit_relpath(unit_pairs(row.unit_key))
-        paths.append(layout.internal_dir(storage_root, name, row.stage_name, relpath))
+        relpath = layout.unit_relpath(unit_pairs(unit_key))
+        paths.append(layout.internal_dir(storage_root, name, stage, relpath))
     plan = CleanPlan(_existing(paths), len(rows), "orphaned units")
     if apply:
         for path in plan.paths:
             remove_tree(path)
-        for row in rows:
-            repo.delete_units(row.branch_id, row.stage_name, [row.unit_key])
+        with repo.transaction():
+            for branch_id, stage, unit_key, _ in rows:
+                repo.delete_units(branch_id, stage, [unit_key])
+        repo.collect_garbage()
+        repo.prune_stat_cache()
     return plan

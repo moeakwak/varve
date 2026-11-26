@@ -60,6 +60,8 @@ def test_schema_wal_and_meta(tmp_path: Path, repo: Repo) -> None:
         "runs",
         "stage_runs",
         "file_sets",
+        "key_parts",
+        "sources",
         "units",
         "stat_cache",
     }
@@ -77,6 +79,8 @@ def test_schema_mismatch_and_foreign_db_are_rejected(tmp_path: Path, repo: Repo)
     repo.conn.execute("UPDATE meta SET value = '0' WHERE key = 'schema_version'")
     with pytest.raises(db.SchemaError, match="no migration"):
         db.connect(layout.state_db_path(tmp_path))
+    with pytest.raises(db.SchemaError, match="no migration"):
+        db.connect(layout.state_db_path(tmp_path), readonly=True)
     other = tmp_path / "other.db"
     sqlite3.connect(other).execute("CREATE TABLE x (a)").connection.close()
     with pytest.raises(db.SchemaError, match="not a varve"):
@@ -138,9 +142,14 @@ def test_unit_round_trip_and_status_transitions(repo: Repo) -> None:
 
 def test_cross_branch_candidates_and_reuse(repo: Repo) -> None:
     repo.upsert_units([unit(), unit(branch="katex"), unit(branch="katex", key="dataset=b")])
-    candidates = repo.reuse_candidates("work", "dataset=mw", "ik-1", exclude_branch_id="main")
+    candidates = repo.link_candidates("work", "dataset=mw", exclude_branch_id="main")
     assert [(name, row.branch_id) for name, row in candidates] == [("katex", "katex")]
-    assert repo.reuse_candidates("work", "dataset=mw", "ik-2", exclude_branch_id="main") == []
+    assert candidates[0][1].source_detail == {"mode": "closure", "symbols": {"Demo.work": "x"}}
+    assert repo.branch_count() == 2
+    index = repo.link_index("work", exclude_branch_id="main")
+    assert sorted(index) == ["dataset=b", "dataset=mw"]
+    (light,) = index["dataset=mw"]
+    assert (light.branch_name, light.input_key, light.has_manifest) == ("katex", "ik-1", True)
 
     updated = repo.set_reused_source_fp(
         "main", "work", [("dataset=mw", "ik-1"), ("dataset=zz", "ik-1")], "s2"
@@ -280,3 +289,79 @@ def test_reader_waits_for_a_store_that_is_being_created(tmp_path: Path) -> None:
     blank.touch()
     with pytest.raises(db.SchemaError):
         db.connect(blank, readonly=True)
+
+
+def test_long_summaries_and_source_details_are_stored_once(repo: Repo) -> None:
+    big = {"files": [f"file-{i:04d}.txt" for i in range(100)]}
+    components = {
+        "config": {"hash": "h", "summary": {}, "access": None},
+        "values": {"hash": "v", "summary": big},
+    }
+    rows = [unit(key=f"dataset={i}", key_components=components) for i in range(5)]
+    repo.upsert_units(rows)
+    conn = repo.conn
+    assert conn.execute("SELECT COUNT(*) FROM key_parts").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 1
+    raw = conn.execute("SELECT key_components_json FROM units LIMIT 1").fetchone()[0]
+    assert '"values":{"hash":"v"}' in raw and "file-0000" not in raw
+    assert "source_detail_json" not in {r[1] for r in conn.execute("PRAGMA table_info(units)")}
+    row = Repo(conn).get_unit("main", "work", "dataset=3")
+    assert row is not None and row.key_components == components
+    assert row.source_detail == {"mode": "closure", "symbols": {"Demo.work": "x"}}
+    # The probe only needs segment hashes and reads the compact documents.
+    assert repo.key_components("main", "work")["dataset=1"]["values"]["hash"] == "v"
+
+
+def test_garbage_collection_drops_unreferenced_parts_sources_and_file_sets(repo: Repo) -> None:
+    big = {"files": [f"file-{i:04d}.txt" for i in range(100)]}
+    inputs = {
+        "corpus": {"digest": "f" * 64, "files": 40, "bytes": 1, "fileset": "f" * 64},
+        "other": {"digest": "e" * 64, "files": 40, "bytes": 1, "fileset": "e" * 64},
+    }
+    kept = {"inputs": {"hash": "i", "summary": {"corpus": inputs["corpus"]}}}
+    dropped = {"inputs": {"hash": "j", "summary": inputs}, "values": {"hash": "v", "summary": big}}
+    repo.put_file_sets([FileSetRow("f" * 64, 40, 1, [["a", "x"]] * 40)])
+    repo.put_file_sets([FileSetRow("e" * 64, 40, 1, [["b", "y"]] * 40)])
+    repo.upsert_units([unit(key_components=dropped, source_fp="old")])
+    repo.upsert_units([unit(key="dataset=b", key_components=kept)])
+    assert repo.collect_garbage() == {"key_parts": 0, "sources": 0, "file_sets": 0}
+    repo.upsert_units([unit(key_components=kept)])  # replaces the row that held `dropped`
+    # `dropped` held two parts: its inputs summary (with the `e` file set) and its values.
+    assert {r[0] for r in repo.conn.execute("SELECT part_key FROM key_parts")} == {
+        "inputs:j",
+        "values:v",
+        "inputs:i",
+    }
+    assert repo.collect_garbage() == {"key_parts": 2, "sources": 1, "file_sets": 1}
+    assert repo.get_file_set("f" * 64) is not None and repo.get_file_set("e" * 64) is None
+    row = repo.get_unit("main", "work", "dataset=mw")
+    assert row is not None and row.key_components == kept
+
+
+def test_stat_cache_prune_and_lazy_load(tmp_path: Path, repo: Repo) -> None:
+    from varve.keying.fingerprint import StatCache
+
+    live = tmp_path / "live.txt"
+    live.write_text("x")
+    st = live.stat()
+    repo.put_stat_cache(
+        {
+            str(live): CachedStat(st.st_ino, st.st_size, st.st_mtime_ns, "c"),
+            str(tmp_path / "gone.txt"): CachedStat(1, 2, 3, "c"),
+            str(tmp_path / "live.txt") + "-stale": CachedStat(1, 2, 3, "c"),
+        }
+    )
+    assert repo.prune_stat_cache() == 2
+    assert list(repo.load_stat_cache()) == [str(live)]
+    loads: list[int] = []
+
+    def loader() -> dict[str, CachedStat]:
+        loads.append(1)
+        return repo.load_stat_cache()
+
+    cache = StatCache(loader=loader)
+    cache.store("/new", CachedStat(1, 1, 1, "n"))
+    assert loads == []
+    assert cache.lookup(str(live), st) is not None and loads == [1]
+    assert cache.lookup(str(live), st) is not None and loads == [1]
+    assert cache.drain() == {"/new": CachedStat(1, 1, 1, "n")}

@@ -20,6 +20,7 @@ from typing import Any
 
 from varve.store.db import connect
 from varve.store.layout import unit_log_path
+from varve.store.repo import expand_components
 
 #: Source of state databases: a fixed list or a callable re-evaluated on refresh.
 DbSource = Iterable[Path] | Callable[[], Iterable[Path]]
@@ -641,7 +642,12 @@ def unit_detail(pipe: PipelineDb, branch_name: str, stage: str, unit_key: str) -
             raise NotFoundError(f"unknown unit {key!r} in stage {stage!r}")
         unit = _row(found)
         unit.setdefault("linked_from", None)
+        detail = conn.execute(
+            "SELECT detail_json FROM sources WHERE source_fp = ?", (unit["source_fp"],)
+        ).fetchone()
+        unit["source_detail"] = _loads(detail[0]) if detail is not None else None
         components = unit.get("key_components") or {}
+        expand_components(conn, [components])
         hashes = sorted(set(_fileset_refs(components)))
         file_sets = {
             row[0]: {"file_count": row[1], "total_bytes": row[2]}

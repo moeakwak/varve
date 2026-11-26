@@ -54,12 +54,16 @@ def _strs(value: str | Sequence[str]) -> tuple[str, ...]:
 def as_input_set(spec: InputSpec) -> PathSet | Glob:
     """Normalize any accepted ``inputs`` value into a ``PathSet`` or ``Glob``."""
 
+    # Path items are kept as they are: callers often reuse (cached) Path objects
+    # across cells, and copying them would discard their cached string form.
     if isinstance(spec, PathSet | Glob):
         return spec
-    if isinstance(spec, str | Path):
+    if isinstance(spec, Path):
+        return PathSet((spec,))
+    if isinstance(spec, str):
         return PathSet((Path(spec),))
     if isinstance(spec, Sequence):
-        return PathSet(tuple(Path(item) for item in spec))
+        return PathSet(tuple(item if isinstance(item, Path) else Path(item) for item in spec))
     raise TypeError(f"Unsupported Dependencies input: {spec!r}")
 
 

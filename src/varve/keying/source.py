@@ -280,9 +280,15 @@ class _StripScheduling(ast.NodeTransformer):
         return self._function(node)
 
 
+_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+
+
 @dataclass
 class _Module:
-    """Parsed symbol table of one file."""
+    """Parsed symbol table of one file, plus per-command analysis caches.
+
+    The caches are keyed by AST node identity; the tree is never mutated.
+    """
 
     tree: ast.Module
     symbols: dict[str, list[ast.stmt]]
@@ -291,6 +297,65 @@ class _Module:
     hashes: dict[int, str] = field(default_factory=dict)
     stage_names: frozenset[str] = frozenset()
     varve_packages: frozenset[str] = frozenset()
+    _functions: dict[str, list[tuple[_FunctionNode, ast.ClassDef | None]]] | None = None
+    _dynamic: dict[int, str | None] = field(default_factory=dict)
+    _members: dict[int, dict[str, list[ast.stmt]]] = field(default_factory=dict)
+    _bound: dict[int, frozenset[str]] = field(default_factory=dict)
+    _refs: dict[tuple[int, str | None], tuple[frozenset[str], frozenset[str]]] = field(
+        default_factory=dict
+    )
+
+    def functions(self, name: str) -> list[tuple[_FunctionNode, ast.ClassDef | None]]:
+        """Every ``def name`` found in a ``body`` list anywhere in the file, with its class."""
+
+        if self._functions is None:
+            index: dict[str, list[tuple[_FunctionNode, ast.ClassDef | None]]] = {}
+            for parent in ast.walk(self.tree):
+                body = getattr(parent, "body", ())
+                if not isinstance(body, list):  # a lambda's body is a single expression
+                    continue
+                owner = parent if isinstance(parent, ast.ClassDef) else None
+                for child in body:
+                    if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                        index.setdefault(child.name, []).append((child, owner))
+            self._functions = index
+        return self._functions.get(name, [])
+
+    def class_dynamic_lookup(self, node: ast.ClassDef) -> str | None:
+        key = id(node)
+        if key not in self._dynamic:
+            self._dynamic[key] = _class_dynamic_lookup(node)
+        return self._dynamic[key]
+
+    def class_members(self, node: ast.ClassDef) -> dict[str, list[ast.stmt]]:
+        members = self._members.get(id(node))
+        if members is None:
+            members = {}
+            for stmt in node.body:
+                for name in self.bound_names(stmt):
+                    members.setdefault(name, []).append(stmt)
+            self._members[id(node)] = members
+        return members
+
+    def bound_names(self, stmt: ast.AST) -> frozenset[str]:
+        """Names one statement binds in its scope (``_Binder``)."""
+
+        names = self._bound.get(id(stmt))
+        if names is None:
+            binder = _Binder()
+            binder.visit(stmt)
+            names = frozenset(binder.names)
+            self._bound[id(stmt)] = names
+        return names
+
+    def references(self, node: ast.AST, scope: str | None) -> tuple[frozenset[str], frozenset[str]]:
+        key = (id(node), scope)
+        found = self._refs.get(key)
+        if found is None:
+            names, members = _references(node, scope)
+            found = (frozenset(names), frozenset(members))
+            self._refs[key] = found
+        return found
 
     def stage_decorated(self, node: ast.AST) -> bool:
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -359,26 +424,19 @@ class _Module:
 
 
 def _locate_function(
-    tree: ast.Module, func: Callable[..., Any]
+    module: _Module, func: Callable[..., Any]
 ) -> tuple[ast.FunctionDef | ast.AsyncFunctionDef, ast.ClassDef | None]:
     code = getattr(func, "__code__", None)
     if code is None:
         raise ValueError(f"Cannot locate the source of {func!r}")
     first = code.co_firstlineno
-    matches: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, ast.ClassDef | None]] = []
-    for parent in ast.walk(tree):
-        body = getattr(parent, "body", ())
-        if not isinstance(body, list):  # a lambda's body is a single expression
-            continue
-        for child in body:
-            if (
-                isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
-                and child.name == func.__name__
-                and min((d.lineno for d in child.decorator_list), default=child.lineno)
-                <= first
-                <= (child.end_lineno or child.lineno)
-            ):
-                matches.append((child, parent if isinstance(parent, ast.ClassDef) else None))
+    matches = [
+        (child, owner)
+        for child, owner in module.functions(func.__name__)
+        if min((d.lineno for d in child.decorator_list), default=child.lineno)
+        <= first
+        <= (child.end_lineno or child.lineno)
+    ]
     if len(matches) != 1:
         raise ValueError(
             f"Cannot uniquely locate the AST of {func.__qualname__} at line {first} "
@@ -399,16 +457,6 @@ def _stage_classes(
                 classes.append(stmt)
                 break
     return classes
-
-
-def _class_members(node: ast.ClassDef) -> dict[str, list[ast.stmt]]:
-    members: dict[str, list[ast.stmt]] = {}
-    for stmt in node.body:
-        binder = _Binder()
-        binder.visit(stmt)
-        for name in binder.names:
-            members.setdefault(name, []).append(stmt)
-    return members
 
 
 def _excluded_names(pipeline: type[Any], path: Path) -> set[str]:
@@ -436,6 +484,7 @@ class SourceAnalyzer:
     def __init__(self, session: FingerprintSession | None = None) -> None:
         self.session = session or FingerprintSession()
         self._modules: dict[Path, tuple[tuple[int, int, int], _Module]] = {}
+        self._excluded: dict[tuple[type[Any], Path], set[str]] = {}
 
     def _module(self, path: Path) -> _Module:
         st = path.stat()
@@ -467,16 +516,19 @@ class SourceAnalyzer:
         module = self._module(path)
         fallback = module.fallback_reason
         if fallback is None:
-            node, owner = _locate_function(module.tree, func)
+            node, owner = _locate_function(module, func)
             classes = _stage_classes(module, owner, pipeline)
             fallback = next(
-                (reason for item in classes if (reason := _class_dynamic_lookup(item))), None
+                (reason for item in classes if (reason := module.class_dynamic_lookup(item))),
+                None,
             )
         if fallback is not None:
             symbols = {WHOLE_FILE: self.session.ast_hash(path)}
             mode = "whole-file"
         else:
-            excluded = _excluded_names(pipeline, path)
+            excluded = self._excluded.get((pipeline, path))
+            if excluded is None:
+                excluded = self._excluded[(pipeline, path)] = _excluded_names(pipeline, path)
             stage_funcs = {spec.func.__name__ for spec in pipeline.stages().values()}
             symbols = self._closure(module, node, owner, classes, excluded, stage_funcs)
             mode = "closure"
@@ -501,10 +553,11 @@ class SourceAnalyzer:
         stage_funcs: set[str],
     ) -> dict[str, str]:
         class_name = owner.name if owner is not None else None
-        members = _class_members(owner) if owner is not None else {}
+        members = module.class_members(owner) if owner is not None else {}
         prefix = f"{class_name}." if class_name else ""
         symbols: dict[str, str] = {f"{prefix}{node.name}": module.hash_of([node])}
-        pending_names, pending_members = _references(node, class_name)
+        first_names, first_members = module.references(node, class_name)
+        pending_names, pending_members = set(first_names), set(first_members)
         seen_members = {node.name, "Config", "Args"}
 
         def add(
@@ -512,7 +565,7 @@ class SourceAnalyzer:
         ) -> None:
             symbols[key] = module.hash_of(statements)
             for stmt in statements:
-                names, reached = _references(stmt, scope)
+                names, reached = module.references(stmt, scope)
                 pending_names.update(names)
                 if scope == class_name:
                     pending_members.update(reached - seen_members)
@@ -525,9 +578,8 @@ class SourceAnalyzer:
             for index, stmt in enumerate(item.body):
                 if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
                     continue  # docstrings
-                binder = _Binder()
-                binder.visit(stmt)
-                if binder.names and binder.names <= {"Config", "Args"}:
+                bound = module.bound_names(stmt)
+                if bound and bound <= {"Config", "Args"}:
                     continue
                 if isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef) and not (
                     stmt.name.startswith("__")
@@ -538,9 +590,9 @@ class SourceAnalyzer:
                     # Stage and helper methods are only reached through references;
                     # dunder methods (``__init__``, ...) run for every stage.
                     continue
-                label = ",".join(sorted(binder.names)) or f"<body:{index}>"
+                label = ",".join(sorted(bound)) or f"<body:{index}>"
                 if scope == class_name:
-                    seen_members.update(binder.names)
+                    seen_members.update(bound)
                 add(f"{scope}.{label}", [stmt], scope, body=True)
             mutations = [
                 stmt for stmt in module.symbols.get(scope, ()) if not isinstance(stmt, ast.ClassDef)
