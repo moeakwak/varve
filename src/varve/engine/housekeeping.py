@@ -7,7 +7,7 @@ import os
 import secrets
 import shutil
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -105,10 +105,17 @@ def recover(session: Session, current_run: str) -> list[str]:
     return notes
 
 
-def rotate_logs(root: Path, keep: int = KEEP_RUN_LOGS) -> None:
+def rotate_logs(root: Path, keep: int = KEEP_RUN_LOGS, active: Collection[str] = ()) -> None:
+    """Keep the logs of the ``keep`` newest runs, plus those of ``active`` runs.
+
+    Runs of other branches may still be writing their logs (branches run
+    concurrently), so the run ids still recorded as ``running`` are passed in
+    ``active`` and never removed.
+    """
+
     base = layout.logs_dir(root)
     if not base.is_dir():
         return
-    runs = sorted(entry for entry in base.iterdir() if entry.is_dir())
+    runs = sorted(entry for entry in base.iterdir() if entry.is_dir() and entry.name not in active)
     for entry in runs[:-keep] if len(runs) > keep else []:
         shutil.rmtree(entry, ignore_errors=True)

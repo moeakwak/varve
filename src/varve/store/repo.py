@@ -280,6 +280,12 @@ class Repo:
         )
         return [_decode(RunRow, row) for row in rows]
 
+    def running_run_ids(self) -> set[str]:
+        """Ids of runs of any branch still recorded as ``running``."""
+
+        rows = self.conn.execute("SELECT run_id FROM runs WHERE status = 'running'")
+        return {row[0] for row in rows}
+
     def put_stage_run(self, row: StageRunRow) -> None:
         self._upsert("stage_runs", [row], ["run_id", "stage_name"])
 

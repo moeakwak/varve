@@ -138,35 +138,76 @@ def connect(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
     if readonly:
         if not path.exists():
             raise FileNotFoundError(f"No varve state database at {path}")
-        conn = sqlite3.connect(
-            f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=5, isolation_level=None
-        )
+        conn = _open(path, readonly=True)
+        try:
+            if _is_blank(conn):
+                # A writer creates the file and its schema under the init lock;
+                # wait for it rather than reporting a half-created store as foreign.
+                conn.close()
+                _wait_for_init(path)
+                conn = _open(path, readonly=True)
+            _check_schema(conn, path, readonly=True)
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Switching to WAL needs an exclusive lock that SQLite does not wait for,
+    # and creating the schema must not race another process that sees the same
+    # empty file, so writable opens initialize one at a time. The lock is taken
+    # before the file can be created, so readers can wait for a blank store.
+    with _init_lock(path):
+        conn = _open(path, readonly=False)
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            _check_schema(conn, path, readonly=False)
+        except BaseException:
+            conn.close()
+            raise
+    return conn
+
+
+def _open(path: Path, *, readonly: bool) -> sqlite3.Connection:
+    if readonly:
+        target, uri = f"{path.absolute().as_uri()}?mode=ro", True
     else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path, timeout=5, isolation_level=None)
+        target, uri = str(path), False
+    conn = sqlite3.connect(target, uri=uri, timeout=5, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute("PRAGMA foreign_keys = ON")
-        if readonly:
-            _check_schema(conn, path, readonly=True)
-        else:
-            # Switching to WAL needs an exclusive lock that SQLite does not wait
-            # for, and creating the schema must not race another process that
-            # sees the same empty file, so writable opens initialize one at a time.
-            with _init_lock(path):
-                conn.execute("PRAGMA journal_mode = WAL")
-                conn.execute("PRAGMA synchronous = NORMAL")
-                _check_schema(conn, path, readonly=False)
     except BaseException:
         conn.close()
         raise
     return conn
 
 
+def _is_blank(conn: sqlite3.Connection) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
+
+
+def _init_lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".init-lock")
+
+
+def _wait_for_init(path: Path) -> None:
+    """Block until no writable open is initializing ``path`` (never creates files)."""
+
+    try:
+        fd = os.open(_init_lock_path(path), os.O_RDONLY)
+    except FileNotFoundError:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH)
+    finally:
+        os.close(fd)
+
+
 @contextmanager
 def _init_lock(path: Path) -> Iterator[None]:
-    fd = os.open(path.with_name(path.name + ".init-lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    fd = os.open(_init_lock_path(path), os.O_RDWR | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield

@@ -246,3 +246,37 @@ def test_concurrent_first_connects_do_not_race(tmp_path: Path) -> None:
         for process in processes:
             process.join(timeout=60)
         assert [process.exitcode for process in processes] == [0, 0, 0]
+
+
+def test_reader_waits_for_a_store_that_is_being_created(tmp_path: Path) -> None:
+    import threading
+    import time
+
+    path = layout.state_db_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    found: list[object] = []
+
+    def read() -> None:
+        try:
+            conn = db.connect(path, readonly=True)
+            found.append(db.read_meta(conn)["schema_version"])
+            conn.close()
+        except Exception as error:  # noqa: BLE001 - asserted below
+            found.append(error)
+
+    with db._init_lock(path):
+        path.touch()  # a writable open created the file and is still creating the schema
+        reader = threading.Thread(target=read)
+        reader.start()
+        time.sleep(0.2)
+        assert reader.is_alive() and not found
+        conn = sqlite3.connect(path, isolation_level=None)
+        db._check_schema(conn, path, readonly=False)
+        conn.close()
+    reader.join(timeout=10)
+    assert found == [db.SCHEMA_VERSION]
+    # A blank file nobody is initializing is still rejected.
+    blank = tmp_path / "blank.db"
+    blank.touch()
+    with pytest.raises(db.SchemaError):
+        db.connect(blank, readonly=True)

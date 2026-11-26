@@ -285,3 +285,98 @@ def test_workers_callable_reads_do_not_enter_the_key(ws) -> None:
     assert ws.run(Demo).status == "ok"
     (ws.src / "varve.yaml").write_text(json.dumps({"main": {"config": {"other": 5}}}))
     assert ws.run(Demo).stages["work"].executed == 0
+
+
+INTERRUPTED = """
+import os
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from pydantic import BaseModel
+from varve import Axis, Ctx, Pipeline, Resource, stage
+
+class Config(BaseModel):
+    trace: str = ""
+
+ITEM = Axis("item", tuple(f"i{n}" for n in range(6)))
+
+def mark(ctx, kind):
+    (Path(ctx.config.trace) / f"{kind}-{os.getpid()}-{uuid.uuid4().hex}").touch()
+
+def session(kind):
+    @contextmanager
+    def open_(ctx):
+        mark(ctx, f"open.{kind}")
+        try:
+            yield kind
+        finally:
+            mark(ctx, f"close.{kind}")
+    return open_
+
+SHARED = Resource("shared", open=session("stage"))
+WORKER = Resource("worker", open=session("worker"), scope="worker")
+PER_UNIT = Resource("per_unit", open=session("unit"), scope="unit")
+
+def body(ctx, item):
+    mark(ctx, "started")
+    time.sleep(0.4)
+    (ctx.out / "v.txt").write_text(item)
+
+class Demo(Pipeline):
+    Config = Config
+
+    @stage(foreach=ITEM, workers=2, backend="thread", resources=[SHARED, WORKER, PER_UNIT])
+    def threaded(self, ctx: Ctx[Config], item: str, shared, worker, per_unit) -> None:
+        body(ctx, item)
+
+    @stage(foreach=ITEM, workers=2, backend="process", resources=[SHARED, WORKER, PER_UNIT])
+    def pooled(self, ctx: Ctx[Config], item: str, shared, worker, per_unit) -> None:
+        body(ctx, item)
+
+if __name__ == "__main__":
+    raise SystemExit(Demo.cli())
+"""
+
+
+@pytest.mark.parametrize("stage", ["threaded", "pooled"])
+def test_first_sigint_closes_every_session_and_commits_active_units(ws, stage: str) -> None:
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    from varve.store import layout
+    from varve.store.db import connect
+    from varve.store.repo import Repo
+
+    trace = ws.base / "trace"
+    trace.mkdir()
+    (ws.src / "varve.yaml").write_text(json.dumps({"main": {"config": {"trace": str(trace)}}}))
+    ws.write(INTERRUPTED)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    proc = subprocess.Popen(
+        [sys.executable, str(ws.path), "run", "--no-tui", "--only", stage, "--root", str(ws.root)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 20
+    while _counts(trace).get("started", 0) < 2:
+        assert time.monotonic() < deadline and proc.poll() is None, proc.communicate()
+        time.sleep(0.02)
+    proc.send_signal(signal.SIGINT)
+    _, stderr = proc.communicate(timeout=30)
+    assert proc.returncode == 130, stderr
+    counts = _counts(trace)
+    started = counts["started"]
+    assert 2 <= started < 6
+    assert counts["open.stage"] == counts["close.stage"] == 1
+    assert counts["open.unit"] == counts["close.unit"] == started
+    assert counts["open.worker"] == counts["close.worker"] >= 1
+    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    rows = repo.units("main", stage)
+    assert len(rows) == started and {row.status for row in rows.values()} == {"ok"}
+    repo.conn.close()

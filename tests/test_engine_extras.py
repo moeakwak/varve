@@ -122,6 +122,26 @@ def test_rotate_logs_keeps_the_newest_runs(tmp_path: Path) -> None:
     assert len(remaining) == 20 and remaining[0] == "20260101T000005-abc"
 
 
+def test_log_rotation_keeps_the_logs_of_runs_still_running(ws) -> None:
+    from varve.store.db import connect, now_iso
+    from varve.store.repo import BranchRow, Repo, RunRow
+
+    Demo = ws.write(SOURCE)
+    assert ws.run(Demo, options=RunOptions(only="threads", tui=False)).status == "ok"
+    # A long run of another branch started before 25 newer runs and is still writing logs.
+    repo = Repo(connect(layout.state_db_path(ws.root)))
+    repo.upsert_branch(BranchRow("other", "other", {}, {}))
+    repo.insert_run(RunRow("20000101T000000-aaaaaa", "other", now_iso(), "running", [], "h"))
+    repo.conn.close()
+    base = layout.logs_dir(ws.root)
+    (base / "20000101T000000-aaaaaa" / "work").mkdir(parents=True)
+    for index in range(25):
+        (base / f"20000101T0001{index:02d}-bbbbbb").mkdir()
+    assert ws.run(Demo, options=RunOptions(only="threads", tui=False)).status == "ok"
+    assert (base / "20000101T000000-aaaaaa").is_dir()
+    assert not (base / "20000101T000100-bbbbbb").exists()
+
+
 def test_live_state_renders_stages_units_and_failures() -> None:
     state = LiveState()
     state.apply(RunStarted("demo", "main", "run1", ("prepare", "work", "later")))

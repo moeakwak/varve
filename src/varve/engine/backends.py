@@ -16,6 +16,8 @@ import os
 import pickle
 import signal
 import sys
+import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
@@ -214,12 +216,32 @@ class WorkerSetup:
 _STATE: WorkerState | None = None
 
 
+PARENT_POLL_SECONDS = 0.5
+
+
+def _exit_with_parent(parent: int) -> None:
+    """Exit this worker once the run process is gone.
+
+    Pool workers wait on a queue whose write end they hold themselves, so after
+    a ``kill -9`` of the run process they would idle forever (keeping
+    worker-scope sessions open). A daemon thread polls the parent pid instead.
+    """
+
+    def watch() -> None:
+        while os.getppid() == parent:
+            time.sleep(PARENT_POLL_SECONDS)
+        os._exit(1)
+
+    threading.Thread(target=watch, name="varve-parent-watch", daemon=True).start()
+
+
 def _init_worker(
     locator: PipelineLocator,
     main_module: str | None,
     env: dict[str, str],
     payload: bytes,
     queue: Any,
+    parent: int,
 ) -> None:
     """Locate the pipeline class first, then unpickle the setup against it.
 
@@ -228,6 +250,7 @@ def _init_worker(
     """
 
     global _STATE
+    _exit_with_parent(parent)
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the parent owns Ctrl-C handling
     if hasattr(signal, "pthread_sigmask"):
         # The parent blocks SIGINT while spawning workers; a Ctrl-C that arrived
@@ -335,7 +358,14 @@ class ProcessBackend:
                 workers,
                 mp_context=multiprocessing.get_context("spawn"),
                 initializer=_init_worker,
-                initargs=(setup.pipeline, _main_module_name(), self.env, payload, setup.queue),
+                initargs=(
+                    setup.pipeline,
+                    _main_module_name(),
+                    self.env,
+                    payload,
+                    setup.queue,
+                    os.getpid(),
+                ),
             )
 
     @contextmanager

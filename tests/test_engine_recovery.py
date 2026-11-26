@@ -293,3 +293,150 @@ def test_sigint_during_an_event_publish_does_not_deadlock(ws) -> None:
     notices = [e.text for e in events if type(e).__name__ == "Notice"]
     assert any("interrupt: finishing active units" in text for text in notices)
     assert result.stages["work"].executed == 1
+
+
+def test_cross_branch_link_rechecks_a_source_replaced_meanwhile(ws, monkeypatch) -> None:
+    from varve.engine import commit as commit_module
+    from varve.keying.fingerprint import verify_manifest
+
+    (ws.src / "varve.yaml").write_text(json.dumps({"main": {}, "other": {}}))
+    Demo = ws.write(SOURCE)
+    assert ws.run(Demo).status == "ok"
+    real_link_tree = commit_module.link_tree
+
+    def link_tree(source, staging) -> None:
+        # `main` replaces the unit dir right now (branches run concurrently).
+        fresh = source.with_name(source.name + ".fresh")
+        fresh.mkdir()
+        (fresh / "v.txt").write_text("replaced")
+        os.rename(source, source.with_name(source.name + ".gone"))
+        os.rename(fresh, source)
+        real_link_tree(source, staging)
+
+    monkeypatch.setattr(commit_module, "link_tree", link_tree)
+    result = ws.run(Demo, branch="other")
+    assert result.status == "ok"
+    assert (result.stages["work"].linked, result.stages["work"].executed) == (0, 3)
+    repo = _repo(ws)
+    for row in repo.units("other", "work").values():
+        assert row.linked_from is None and row.artifact_manifest is not None
+        unit_dir = (ws.root / "out" / (row.artifact_relpath or "")).parent
+        assert verify_manifest(unit_dir, row.artifact_manifest, rehash=True)
+    repo.conn.close()
+
+
+def _popen_cli(ws, *argv: str) -> subprocess.Popen[str]:
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    return subprocess.Popen(
+        [sys.executable, str(ws.path), "run", "--no-tui", "--root", str(ws.root), *argv],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+
+def _wait_for(path, proc) -> None:
+    deadline = time.monotonic() + 20
+    while not path.exists():
+        assert time.monotonic() < deadline and proc.poll() is None
+        time.sleep(0.02)
+
+
+def test_kill_9_mid_run_is_recovered_by_the_next_run(ws) -> None:
+    from varve.keying.fingerprint import verify_manifest
+
+    Demo = ws.write(SOURCE)
+    assert ws.run(Demo).status == "ok"
+    markers = ws.base / "markers"
+    markers.mkdir()
+    config = {"marker_dir": str(markers), "sleep": 0.3}
+    (ws.src / "varve.yaml").write_text(json.dumps({"main": {"config": config}}))
+    proc = _popen_cli(ws)  # a config change: every unit dir is replaced via `.old-*`
+    _wait_for(markers / "started-b", proc)
+    proc.kill()
+    proc.wait()
+
+    result = ws.run(Demo)
+    assert result.status == "ok"
+    assert result.stages["work"].executed >= 2  # b (killed mid-unit) and c rerun
+    repo = _repo(ws)
+    assert [run.status for run in repo.runs("main")] == ["ok", "interrupted", "ok"]
+    for stage in ("work", "merge"):
+        for row in repo.units("main", stage).values():
+            assert row.status == "ok" and row.artifact_manifest is not None
+            unit_dir = (ws.root / "out" / (row.artifact_relpath or "")).parent
+            assert verify_manifest(unit_dir, row.artifact_manifest, rehash=True)
+    repo.conn.close()
+    assert not list((ws.root / "out/.internal").rglob("*.old-*"))
+    assert not any((ws.root / "out/.staging").iterdir())
+    assert ws.run(Demo).stages["work"].executed == 0
+
+
+PROCESS_WORKERS = """
+import time
+from pathlib import Path
+from pydantic import BaseModel
+from varve import Axis, Ctx, Pipeline, stage
+
+class Config(BaseModel):
+    marker_dir: str = ""
+
+ITEM = Axis("item", tuple(f"i{n}" for n in range(8)))
+
+class Demo(Pipeline):
+    Config = Config
+
+    @stage(foreach=ITEM, workers=2)
+    def work(self, ctx: Ctx[Config], item: str) -> None:
+        (Path(ctx.config.marker_dir) / f"started-{item}").touch()
+        time.sleep(0.5)
+        (ctx.out / "v.txt").write_text(item)
+
+if __name__ == "__main__":
+    raise SystemExit(Demo.cli())
+"""
+
+
+def _children(pid: int) -> list[int]:
+    found = []
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                stat = open(f"/proc/{entry}/stat").read()
+            except OSError:
+                continue
+            if int(stat.rpartition(")")[2].split()[1]) == pid:
+                found.append(int(entry))
+    return found
+
+
+def _alive(pid: int) -> bool:
+    try:
+        stat = open(f"/proc/{pid}/stat").read()
+    except OSError:
+        return False
+    return stat.rpartition(")")[2].split()[0] != "Z"
+
+
+def test_process_workers_exit_when_the_run_process_is_killed(ws) -> None:
+    import pytest
+
+    if not os.path.exists("/proc/self/stat"):
+        pytest.skip("needs /proc")
+    markers = ws.base / "markers"
+    markers.mkdir()
+    (ws.src / "varve.yaml").write_text(
+        json.dumps({"main": {"config": {"marker_dir": str(markers)}}})
+    )
+    ws.write(PROCESS_WORKERS)
+    proc = _popen_cli(ws)
+    _wait_for(markers / "started-i1", proc)
+    children = _children(proc.pid)
+    assert children
+    proc.kill()
+    proc.wait()
+    deadline = time.monotonic() + 10
+    while any(_alive(pid) for pid in children):
+        assert time.monotonic() < deadline, "process-pool workers outlived the run"
+        time.sleep(0.05)

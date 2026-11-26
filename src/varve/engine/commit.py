@@ -152,6 +152,12 @@ class Committer:
             except OSError:
                 remove_tree(staging)
                 continue
+            # The other branch may replace or clean its unit dir while we link it
+            # (different branches run concurrently); hardlinks share inodes, so
+            # re-checking the copy by stat catches any file that changed meanwhile.
+            if not verify_manifest(staging, row.artifact_manifest):
+                remove_tree(staging)
+                continue
             linked = UnitRow(
                 branch_id=session.branch_id,
                 stage_name=node.name,

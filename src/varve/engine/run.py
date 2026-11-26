@@ -258,7 +258,7 @@ class Runner:
             status = self._status()
             wall_ms = int((time.monotonic() - started) * 1000)
             repo.finish_run(self.run_id, status=status, total_wall_ms=wall_ms)
-        rotate_logs(session.root)
+        rotate_logs(session.root, active=repo.running_run_ids())
         self.bus.publish(RunFinished(status, wall_ms))
         return RunResult(self.run_id, session.branch.name, status, self.outcomes, wall_ms)
 
