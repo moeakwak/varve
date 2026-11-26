@@ -45,6 +45,12 @@ def _parse_optional(raw: str) -> Any:
     return None if raw == _NONE_TOKEN else raw
 
 
+def is_null_token(annotation: Any, raw: str) -> bool:
+    """Whether ``raw`` is the CLI null sentinel for an ``Optional`` field (``None``)."""
+
+    return raw == _NONE_TOKEN and _is_optional(annotation)
+
+
 def _is_model_type(annotation: Any) -> bool:
     return isinstance(annotation, type) and issubclass(annotation, BaseModel)
 

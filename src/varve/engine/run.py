@@ -221,7 +221,8 @@ class Runner:
                     manual=branch.manual,
                 )
             )
-            commit, dirty = git_state(Path.cwd())
+            # The code's checkout, wherever the command was started (roots may be relocated).
+            commit, dirty = git_state(session.pipeline.module_file().parent)
             repo.insert_run(
                 RunRow(
                     run_id=self.run_id,
@@ -605,8 +606,10 @@ class Runner:
                     result.error_traceback = traceback.format_exc()
             if not result.ok:
                 remove_tree(job.staging)
-                key = probe_key(unit_plan)
-                row = self.commits.row(node, unit_plan, key, probe_access(unit_plan), "failed")
+                # A failed execution's reads are incomplete: key the failure on the whole
+                # Config, so a later Config fix shows as `config-changed`, not `failed`.
+                key = self.commits.input_key(node, unit_plan, None)
+                row = self.commits.row(node, unit_plan, key, None, "failed")
                 row.error_type = result.error_type
                 row.error_summary = result.error_summary
                 row.error_traceback = result.error_traceback

@@ -113,11 +113,16 @@ class ResolvedBranch:
 
     @property
     def active_axes_json(self) -> dict[str, Any]:
-        """Snapshot stored in ``branches.active_axes_json``."""
+        """Snapshot stored in ``branches.active_axes_json``: ``[ids]`` for an id
+        restriction, ``{"sample": n, "seed": s}`` for a sample, and both together
+        as ``{"ids": [ids], "sample": n, "seed": s}`` (the sample is drawn from the ids)."""
 
         snapshot: dict[str, Any] = {name: list(ids) for name, ids in self.active.items()}
         for name, sample in self.samples.items():
-            snapshot[name] = {"sample": sample.count, "seed": sample.seed}
+            entry: dict[str, Any] = {"sample": sample.count, "seed": sample.seed}
+            if name in self.active:
+                entry = {"ids": list(self.active[name]), **entry}
+            snapshot[name] = entry
         return snapshot
 
 
@@ -346,6 +351,8 @@ def _from_row(pipeline: type[Pipeline], row: BranchRow) -> ResolvedBranch:
     for axis, value in row.active_axes.items():
         if isinstance(value, Mapping):
             samples[axis] = Sample(int(value["sample"]), int(value.get("seed", 0)))
+            if isinstance(value.get("ids"), list):
+                active[axis] = [str(item) for item in value["ids"]]
         else:
             active[axis] = list(value)
     config = _restore_config(pipeline, row.config)

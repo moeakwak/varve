@@ -365,3 +365,18 @@ def test_stat_cache_prune_and_lazy_load(tmp_path: Path, repo: Repo) -> None:
     assert cache.lookup(str(live), st) is not None and loads == [1]
     assert cache.lookup(str(live), st) is not None and loads == [1]
     assert cache.drain() == {"/new": CachedStat(1, 1, 1, "n")}
+
+
+def test_writer_drops_a_running_mark_replaced_before_its_flush(repo: Repo) -> None:
+    from varve.engine.writer import Writer
+    from varve.keying.fingerprint import StatCache
+
+    writer = Writer(repo, StatCache(None), interval=3600)
+    row = UnitRow("main", "s", "", "default", "k", {}, "fp", {}, "running")
+    writer.put(row)
+    writer.put(UnitRow("main", "s", "", "default", "k", {}, "fp", {}, "failed"))
+    flushed: list[bool] = []
+    writer.flush = lambda: flushed.append(True)  # type: ignore[method-assign]
+    writer.flush_running()
+    writer.before_promote("s", "")
+    assert flushed == []

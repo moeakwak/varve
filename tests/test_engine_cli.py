@@ -380,3 +380,37 @@ def test_large_axis_restrictions(ws) -> None:
     view = probe_pipeline(Demo, root=ws.root, branch="half", expand=True)
     assert [len(view.stage(name).units) for name in ("wide", "deep")] == [1500, 1500]
     assert view.stage("deep").units[-1].unit_key == "dynamic=2998"
+
+
+def test_clean_storage_of_an_unknown_branch_deletes_no_rows(ws, capsys) -> None:
+    from varve.engine import clean_pipeline
+
+    Demo = ws.write(SOURCE)
+    ws.run(Demo)
+    ws.run(Demo, branch="tmpb", temp=True)
+    plan = clean_pipeline(Demo, root=ws.root, storage="default", branch="nosuch")
+    assert plan.rows == 0
+    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    try:
+        assert repo.unit_counts("main") and repo.unit_counts("tmpb")
+    finally:
+        repo.conn.close()
+    assert (ws.root / "out/.internal/main").exists()
+    capsys.readouterr()
+
+
+def test_slice_plus_sample_branch_restores_its_slice_from_the_row(ws, capsys) -> None:
+    Demo = ws.write(SOURCE)
+    argv = ("--slice", "dataset=a,b", "--sample", "dataset=1", "--seed", "3", "--branch", "pick")
+    assert ws.cli(Demo, "run", "--no-tui", *argv) == 0
+    pick = _branches(ws)["pick"]
+    assert pick.active_axes == {"dataset": {"ids": ["a", "b"], "sample": 1, "seed": 3}}
+    ran = sorted(p.name for p in (ws.root / "out/.internal/pick/per_dataset").iterdir())
+    assert len(ran) == 1 and ran[0] in {"dataset=a", "dataset=b"}
+    # Addressed by name alone, the branch samples from its slice, not the full domain.
+    view = probe_pipeline(Demo, root=ws.root, branch="pick", expand=True)
+    stage = view.stage("per_dataset")
+    assert stage.status == "hit" and [unit.unit_key for unit in stage.units] == ran
+    # Rerunning the same command matches the stored snapshot.
+    assert ws.cli(Demo, "run", "--no-tui", *argv) == 0
+    capsys.readouterr()

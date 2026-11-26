@@ -41,6 +41,8 @@ class Writer:
         if row.status == "running":
             self._pending_running.add(key)
             self._sync_running = self._sync_running or sync
+        else:  # the pending row is no longer a running mark
+            self._pending_running.discard(key)
         for item in file_sets:
             self._file_sets[item.fileset_hash] = item
 

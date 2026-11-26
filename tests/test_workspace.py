@@ -18,6 +18,8 @@ from varve.engine import RefResolutionError, RunOptions, probe_pipeline, run_pip
 from varve.engine.refs import bound_refs
 from varve.pipeline import Pipeline
 from varve.store import layout
+from varve.store.db import connect
+from varve.store.repo import Repo
 from varve.workspace import cli
 from varve.workspace.config import ROOT_BASE_ENV, WorkspaceConfigError, load_workspace
 from varve.workspace.discovery import discover
@@ -648,3 +650,57 @@ class Down(Pipeline):
     plan = build_plan(Workspace(load_workspace()), ["down"])
     m = space.module
     assert labels(plan) == [f"{m('up')}@alt", f"{m('down')}@main"]
+
+
+def test_ref_fan_in_follows_declared_axis_order_not_commit_order(space: Space) -> None:
+    up, down = setup_pair(space, f'Ref("{space.module("up")}", stage="export", align_by=())')
+    # Commit "b" and "c" first, then "a": store rows are in b, c, a order.
+    space.add("up", UP, "Up", "main:\n  axes: {dataset: [b, c]}\n")
+    assert space.run(space.load("up", "Up")).status == "ok"
+    space.add("up", UP, "Up", UP_YAML)
+    up = space.load("up", "Up")
+    assert space.run(up).status == "ok"
+    assert space.run(down).status == "ok"
+    value = outputs(down, space.pkg / "down")["dataset=a"]
+    assert list(value) == ["a", "b", "c"]
+    repo = Repo(connect(layout.state_db_path(space.pkg / "down"), readonly=True))
+    try:
+        components = repo.units("main", "use")["dataset=a"].key_components
+    finally:
+        repo.conn.close()
+    entry = components["upstream"]["summary"]["src"]
+    assert [unit_key for unit_key, _ in entry] == ["dataset=a", "dataset=b", "dataset=c"]
+
+
+def test_set_null_is_none_for_optional_fields_like_the_generated_cli() -> None:
+    from varve.workspace.macro import _coerce
+
+    assert _coerce(str | None, "null", "tag", "p@main") is None
+    assert _coerce(int | None, "null", "n", "p@main") is None
+    assert _coerce(str, "null", "tag", "p@main") == "null"
+    assert _coerce(str | None, "x", "tag", "p@main") == "x"
+
+
+def test_ls_table_fits_a_narrow_terminal() -> None:
+    import io
+
+    from rich.console import Console
+
+    from varve.workspace.config import WorkspaceSettings
+    from varve.workspace.discovery import BranchSummary, Entry
+
+    entry = Entry(
+        name="metric_eval.benchmark_misjudgment.threshold_sensitivity",
+        module="studies.exp.metric_eval.benchmark_misjudgment.threshold_sensitivity.run",
+        root=Path("/very/long/path/to/studies/exp/metric_eval/benchmark_misjudgment/threshold"),
+        db_path=Path("/x/.varve/state.db"),
+        branches=[
+            BranchSummary("main_tmp_0123456789abcdef", True, False, {"ok": 1234}, "ok", None, 5)
+        ],
+    )
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=100, force_terminal=False)
+    cli.render_workspace(console, WorkspaceSettings(), [entry])
+    out = buffer.getvalue()
+    assert all(len(line) <= 100 for line in out.splitlines())
+    assert "Units" in out and "Last run" in out and "Root" in out and "1234 ok" in out

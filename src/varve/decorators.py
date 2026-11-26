@@ -146,6 +146,12 @@ def _publish(
     return tuple(PublishEntry(item, item, False) for item in items)
 
 
+def is_positive_int(value: Any) -> bool:
+    """A positive ``int`` that is not a ``bool``."""
+
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
 def stage(
     *,
     foreach: Axis | tuple[Axis, ...] | None = None,
@@ -177,13 +183,9 @@ def stage(
             raise TypeError(f"foreach= accepts Axis objects, got {axis!r}")
     if len({id(axis) for axis in axes}) != len(axes):
         raise ValueError("foreach= must not repeat an axis")
-    if (
-        workers is not None
-        and not callable(workers)
-        and (not isinstance(workers, int) or workers < 1)
-    ):
+    if workers is not None and not callable(workers) and not is_positive_int(workers):
         raise ValueError(f"workers= must be a positive int or a callable, got {workers!r}")
-    if max_failures is not None and (not isinstance(max_failures, int) or max_failures < 1):
+    if max_failures is not None and not is_positive_int(max_failures):
         raise ValueError(f"max_failures= must be a positive int, got {max_failures!r}")
     if backend is not None and backend not in ("auto", "async", "process", "thread"):
         raise ValueError(f"backend= must be auto, async, process, or thread, got {backend!r}")

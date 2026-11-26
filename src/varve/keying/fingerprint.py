@@ -624,14 +624,27 @@ def artifact_fingerprint(
     return ArtifactFingerprint(fingerprint, manifest, len(manifest), total)
 
 
-def verify_manifest(unit_dir: Path, manifest: list[list[Any]], *, rehash: bool = False) -> bool:
-    """Whether every manifest file still exists with the same size and mtime (or hash)."""
+def is_real_dir(path: str) -> bool:
+    """Whether ``path`` exists as a directory that is not a symlink."""
 
+    try:
+        return stat_module.S_ISDIR(os.lstat(path).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
+def verify_manifest(unit_dir: Path, manifest: list[list[Any]], *, rehash: bool = False) -> bool:
+    """Whether the unit directory is a real directory and every manifest file still
+    exists with the same size and mtime (or hash). The directory check keeps a unit
+    with an empty manifest from verifying after its directory was removed."""
+
+    if not is_real_dir(str(unit_dir)):
+        return False
     for rel, size, mtime_ns, digest in manifest:
         path = unit_dir / rel
         try:
             st = path.lstat()
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             return False
         if not stat_module.S_ISREG(st.st_mode):
             return False

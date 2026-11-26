@@ -62,9 +62,9 @@ def recover(session: Session, current_run: str) -> list[str]:
 
     Restores ``.old-*`` unit dirs of units still marked ``running`` (when the
     final dir is missing; otherwise drops the backup), removes the staging
-    dirs of this branch's earlier runs, and marks their ``running`` runs
-    ``interrupted``. Units stay ``running`` in the store: probes report them
-    as ``needs-run · interrupted``.
+    dirs of this branch's earlier runs, and marks their ``running`` runs (and
+    the stages those runs left ``running``) ``interrupted``. Units stay
+    ``running`` in the store: probes report them as ``needs-run · interrupted``.
     """
 
     repo = session.repo

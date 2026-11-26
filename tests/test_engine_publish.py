@@ -110,3 +110,39 @@ def test_templated_publish_targets_colliding_across_stages_fail_at_expansion(ws)
         outcome.detail or ""
     )
     assert (ws.root / "out/main/a/out.txt").read_text() == "one"
+
+
+GLOB = """
+from pydantic import BaseModel
+from varve import Ctx, Pipeline, stage
+
+class Config(BaseModel):
+    names: list[str] = ["one", "two"]
+
+class Demo(Pipeline):
+    Config = Config
+
+    @stage(publish=["images/*.png"])
+    def plots(self, ctx: Ctx[Config]) -> None:
+        for name in ctx.config.names:
+            path = ctx.out / "images" / name / "plot.png"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(name.encode())
+"""
+
+
+def test_glob_publish_removes_files_no_longer_produced(ws) -> None:
+    import json
+
+    Demo = ws.write(GLOB.replace("images/*.png", "images/**/*.png"))
+    assert ws.run(Demo).status == "ok"
+    images = ws.root / "out/main/images"
+    (images / "mine.png").write_bytes(b"user file")  # not published by varve
+    (ws.src / "varve.yaml").write_text(json.dumps({"main": {"config": {"names": ["two"]}}}))
+    Demo = ws.write(GLOB.replace("images/*.png", "images/**/*.png"))
+    assert ws.run(Demo).status == "ok"
+    assert sorted(p.relative_to(images).as_posix() for p in images.rglob("*.png")) == [
+        "mine.png",
+        "two/plot.png",
+    ]
+    assert not (images / "one").exists()
