@@ -211,6 +211,32 @@ def test_cross_file_sources_enter_the_fingerprint(tmp_path: Path) -> None:
         SourceAnalyzer().stage_source(pipeline, "a", [shared / "notes.txt"])
 
 
+def test_glob_sources_equal_the_explicit_files_they_match(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from varve import Dependencies
+
+    pkg = tmp_path / "pkg"
+    (pkg / "sub").mkdir(parents=True)
+    for rel in ("a.py", "sub/b.py", "sub/test_b.py", "sub/data.json"):
+        (pkg / rel).write_text("X = 1\n" if rel.endswith(".py") else "{}")
+    explicit = [pkg / "a.py", pkg / "sub/b.py"]
+    glob = Dependencies.glob(pkg, include="**/*.py", exclude="**/test_*.py")
+    relative = Dependencies.glob("pkg", include="**/*.py", exclude="**/test_*.py")
+    assert fps(tmp_path, BASE, a=[glob]) == fps(tmp_path, BASE, a=explicit)
+    assert fps(tmp_path, BASE, a=[relative]) == fps(tmp_path, BASE, a=explicit)
+    pipeline = load(tmp_path, BASE)
+    detail = SourceAnalyzer().stage_source(pipeline, "a", [glob]).detail
+    assert list(detail["external"]) == ["pkg/a.py", "pkg/sub/b.py"]
+
+    with pytest.raises(ValueError, match="must end in .py"):
+        SourceAnalyzer().stage_source(pipeline, "a", [Dependencies.glob(pkg, "sub/*")])
+    with pytest.raises(FileNotFoundError, match="matched no files"):
+        SourceAnalyzer().stage_source(pipeline, "a", [Dependencies.glob(pkg, "*.pyx")])
+    with pytest.raises(ValueError, match="cannot declare sources"):
+        SourceAnalyzer().stage_source(pipeline, "a", [replace(glob, mode="stat")])
+
+
 def test_checkout_location_does_not_enter_the_fingerprint(tmp_path: Path) -> None:
     first, second = tmp_path / "one", tmp_path / "two"
     for directory in (first, second):

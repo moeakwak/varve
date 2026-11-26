@@ -146,3 +146,67 @@ def test_glob_publish_removes_files_no_longer_produced(ws) -> None:
         "two/plot.png",
     ]
     assert not (images / "one").exists()
+
+
+MERGED = """
+import json
+from pathlib import Path
+from pydantic import BaseModel
+from varve import Axis, Ctx, Pipeline, stage
+
+class Config(BaseModel):
+    suffix: str = ""
+
+DATASET = Axis("dataset", ("a", "b"))
+
+class Demo(Pipeline):
+    Config = Config
+
+    @stage(
+        foreach=DATASET,
+        produces=["parquets/manifest.json"],
+        publish={"parquets/**/*.parquet": "sources/"},
+    )
+    def export(self, ctx: Ctx[Config], dataset: str) -> None:
+        (ctx.out / "parquets").mkdir()
+        name = f"{dataset}{ctx.config.suffix}.parquet"
+        (ctx.out / "parquets" / name).write_text(dataset)
+        (ctx.out / "parquets" / "manifest.json").write_text(json.dumps([name]))
+
+    @stage(produces="sources/manifest.json", publish=["sources/manifest.json"])
+    def finalize(self, ctx: Ctx[Config], export: dict[str, Path]) -> None:
+        names = [json.loads((p / "parquets/manifest.json").read_text())[0] for p in export.values()]
+        (ctx.out / "sources").mkdir()
+        (ctx.out / "sources" / "manifest.json").write_text(json.dumps(names))
+"""
+
+
+def test_directory_targets_merge_units_into_one_directory(ws) -> None:
+    import json
+
+    Demo = ws.write(MERGED)
+    assert ws.run(Demo).status == "ok"
+    sources = ws.root / "out/main/sources"
+    assert sorted(p.name for p in sources.iterdir()) == ["a.parquet", "b.parquet", "manifest.json"]
+    assert json.loads((sources / "manifest.json").read_text()) == ["a.parquet", "b.parquet"]
+    managed = ws.root / "out/.internal/main/export/dataset=a/parquets/a.parquet"
+    assert (sources / "a.parquet").stat().st_ino == managed.stat().st_ino
+    # Renamed glob matches replace the files the same unit published before.
+    (ws.src / "varve.yaml").write_text(json.dumps({"main": {"config": {"suffix": ".v2"}}}))
+    Demo = ws.write(MERGED)
+    assert ws.run(Demo).status == "ok"
+    assert sorted(p.name for p in sources.iterdir()) == [
+        "a.v2.parquet",
+        "b.v2.parquet",
+        "manifest.json",
+    ]
+
+
+def test_directory_target_collisions_fail_the_stage(ws) -> None:
+    # A literal source below a directory target keeps its name, so both units
+    # claim manifests/manifest.json.
+    entry = '"parquets/**/*.parquet": "sources/"'
+    Demo = ws.write(MERGED.replace(entry, f'{entry}, "parquets/manifest.json": "manifests/"'))
+    result = ws.run(Demo)
+    assert result.stages["export"].status == "failed"
+    assert "manifests/manifest.json" in (result.stages["export"].detail or "")

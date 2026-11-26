@@ -95,8 +95,9 @@ def resolve(
             else:
                 upstream_node, upstream_units, to_path = up[param.name]
                 kwargs[param.name] = to_path(align_request(request, upstream_node, upstream_units))
-        assert request.axis.resolver is not None
-        domains[request.key] = request.axis.domain_from_resolved(request.axis.resolver(**kwargs))
+        resolver = request.axis.resolver
+        assert callable(resolver)
+        domains[request.key] = request.axis.domain_from_resolved(resolver(**kwargs))
     return domains
 
 

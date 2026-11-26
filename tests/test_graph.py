@@ -48,7 +48,7 @@ def test_stage_decorator_normalizes_bare_strings_and_publish() -> None:
         ({"publish": True}, "requires produces"),
         ({"produces": "../x"}, "relative path"),
         ({"produces": "/abs"}, "relative path"),
-        ({"publish": {"*.png": "x"}}, "must not be globs"),
+        ({"publish": {"*.png": "x"}}, "needs a directory target"),
         ({"workers": 0}, "positive"),
         ({"max_failures": 0}, "positive"),
         ({"workers": True}, "positive"),
@@ -269,6 +269,18 @@ def test_publish_templates_must_cover_all_axes() -> None:
 
     with pytest.raises(GraphError, match="two publish entries"):
         Duplicate.graph()
+
+    # Directory targets may be shared by units and stages; files are checked when published.
+    class Merged(Pipeline):
+        @stage(foreach=(DATASET, GROUP), publish={"parts/*.csv": "parts/{dataset}/"})
+        def a(self) -> None:
+            pass
+
+        @stage(publish={"parts/*.csv": "parts/a/"})
+        def b(self) -> None:
+            pass
+
+    assert Merged.graph().nodes["a"].spec.publish[0].into_dir
 
 
 def test_exclusive_selector_validation() -> None:

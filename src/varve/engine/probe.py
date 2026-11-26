@@ -18,7 +18,7 @@ from pathlib import Path
 from stat import S_ISREG
 from typing import Any, Literal
 
-from varve.axis import AxisDomain, Cell
+from varve.axis import AxisDomain, Cell, FileMatch
 from varve.dependencies import DepCtx, Dependencies
 from varve.engine.refs import RefBinding
 from varve.engine.session import Session
@@ -39,6 +39,7 @@ from varve.keying.fingerprint import (
     json_hash,
     normalize_json,
     verify_manifest,
+    walk_glob,
 )
 from varve.keying.keys import (
     SEGMENT_REASONS,
@@ -158,6 +159,35 @@ def _upstream_entry(binding: Upstream, state: StageState) -> tuple[Any, Any] | N
     return found[0], found[1]
 
 
+def match_files(files: FileMatch, artifact: Path, upstream: StageNode) -> dict[Any, Path]:
+    """``{key: path}`` of the files of one upstream unit matching an ``Axis.files`` pattern.
+
+    The glob runs in the unit directory, also when the upstream's single-file
+    ``produces`` makes ``artifact`` that file.
+    """
+
+    unit_dir = artifact
+    if upstream.spec.produces_file is not None:
+        for _ in Path(upstream.spec.produces_file).parts:
+            unit_dir = unit_dir.parent
+    found = [unit_dir / rel for rel, _ in walk_glob(unit_dir, (files.pattern,), ())]
+    if not found and not files.allow_empty:
+        raise FileNotFoundError(
+            f"no file of {files.upstream!r} matches {files.pattern!r} in {unit_dir} "
+            "(pass allow_empty=True to allow an empty domain)"
+        )
+    result: dict[Any, Path] = {}
+    for path in found:
+        item = files.key(path) if files.key is not None else path.stem
+        previous = result.setdefault(item, path)
+        if previous is not path:
+            raise ValueError(
+                f"files {previous.name!r} and {path.name!r} of {files.upstream!r} both have "
+                f"key {item!r}; pass key= to tell them apart"
+            )
+    return result
+
+
 def _plain_values(values: Mapping[str, Any]) -> dict[str, Any]:
     return {
         name: value
@@ -270,9 +300,14 @@ class StageEvaluator:
         memo = (request.axis, request.ids, plain_hash(fps))
         domain = session.resolved.get(memo)
         if domain is None:
-            assert request.axis.resolver is not None
+            resolver = request.axis.resolver
+            assert resolver is not None
             try:
-                result = request.axis.resolver(**kwargs)
+                if isinstance(resolver, FileMatch):
+                    up_node = session.graph.nodes[resolver.upstream]
+                    result = match_files(resolver, kwargs[resolver.upstream], up_node)
+                else:
+                    result = resolver(**kwargs)
                 domain = request.axis.domain_from_resolved(result)
             except Exception as error:
                 where = f" for {dict(request.cell)}" if request.ids else ""

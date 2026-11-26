@@ -7,11 +7,11 @@ This document describes how varve is built: package boundaries, the store, the e
 ```text
 src/varve/
 ├── __init__.py          # public surface: Axis, Ctx, Dependencies, Pipeline, Ref, Resource, stage
-├── axis.py              # Axis (static values | dynamic resolver), AxisDomain, canonical ids, Cell
+├── axis.py              # Axis (static values | dynamic resolver | Axis.files), AxisDomain, canonical ids, Cell
 ├── decorators.py        # @stage, StageSpec, PublishEntry, coordinate selector parsing
 ├── dependencies.py      # Dependencies (+ glob/stat), PathSet, Glob, DepCtx, merging
 ├── resource.py          # Resource, RunCtx
-├── ref.py               # Ref (declaration only)
+├── ref.py               # Ref (declaration; resolve() lazily uses workspace.refs)
 ├── pipeline.py          # Pipeline base class: declarations, roots, graph(), cli()
 ├── context.py           # Ctx and the CtxSink protocol
 ├── signature.py         # parameter-name binding of stage methods and resolvers
@@ -55,7 +55,7 @@ src/varve/
 
 ## Public surface
 
-`varve.__all__` is exactly `Axis, Ctx, Dependencies, Pipeline, Ref, Resource, stage`. `import varve` loads the declaration modules (`axis`, `decorators`, `dependencies`, `resource`, `ref`, `pipeline`, `context`, `selector`) and nothing from `engine`, `cli`, `workspace`, or `ui`; `Pipeline.cli()` and `Pipeline.graph()` import their modules lazily. Everything else, including `varve.engine` services, is internal and may change between minor releases.
+`varve.__all__` is exactly `Axis, Ctx, Dependencies, Pipeline, Ref, Resource, stage`. `import varve` loads the declaration modules (`axis`, `decorators`, `dependencies`, `resource`, `ref`, `pipeline`, `context`, `selector`) and nothing from `engine`, `cli`, `workspace`, or `ui`; `Pipeline.cli()`, `Pipeline.graph()`, and `Ref.resolve()` import their modules lazily. Everything else, including `varve.engine` services, is internal and may change between minor releases.
 
 ## Dependency direction
 
@@ -158,7 +158,7 @@ Invariants:
    - Marks orphaned rows, collects hits, and tries cross-branch links for the other units (`Committer.link`).
    - Resolves `workers` and the backend, writes a `stage_runs` row with status `running`, and builds a `ResourceTable` that indexes the distinct `Resource` objects of the units to run (sessions are keyed by object identity, not name; each job carries `name -> index`). Preflights pending resources (once per object per run) and opens stage-scope sessions, both with a recording `RunCtx.config` whose reads are kept per resource. Installs stdout/stderr routing proxies when capturing an in-process stage (TUI on or `workers > 1`). Starts the backend: process pools get a `WorkerSetup` with the pipeline locator, Config, Args, picklable shared sessions and their Config reads, the distinct cells with their resource indices, `worker_env`, and a progress queue; the pool spawns workers with `worker_env` set and SIGINT blocked, so both hold from interpreter start.
    - Feeds units through `scheduler.run_window`. `on_start` writes a `running` row keyed with the probe's key; each completed unit is committed (`Committer.commit_ok`: merge the unit's Config reads with those of its resources' `preflight`/`open` and the previous access set, compute the final key, promote, write the `ok` row) or recorded as `failed` with error details. Any exception while committing is recorded as a unit failure.
-   - Publishes when every unit is available (templated targets that collide after expansion fail the stage here), then updates the `stage_runs` row (status, counts, percentiles, peak RSS, metric sums).
+   - Publishes when every unit is available (templated targets that collide after expansion, and files of glob or directory targets that two units or entries of the stage place at the same path, fail the stage here), then updates the `stage_runs` row (status, counts, percentiles, peak RSS, metric sums).
 5. Flushes the writer, removes this run's staging directories, finishes the `runs` row (`ok`, `failed`, or `interrupted`; `failed` on an unexpected exception), collects unreferenced store rows when any unit executed or linked, releases the locks, and rotates logs (the 20 newest runs are kept, plus every run still recorded as `running`, since other branches may be writing theirs).
 
 Unit execution (`engine.unit.execute` / `execute_async`) runs wherever the backend runs it: create the staging directory, route output to the unit log if capturing (the file is created on the first write, and a process worker's empty log is removed), open unit-scope resources, build `Ctx` with a recording Config proxy, call the stage method with injected arguments, require `None`, check `produces`, hash every file and chmod it to `0444` in the same walk (`artifact_fingerprint`). It returns a picklable `UnitOutcome` (metrics, config access, artifact manifest, error fields, peak RSS for process workers). Promotion and the store commit always happen in the main process.
@@ -174,7 +174,7 @@ Events (`RunStarted`, `StagePlanned`, `UnitStarted`, `UnitProgress`, `UnitMetric
 `StageEvaluator.evaluate(node, states)`:
 
 1. **Awaiting.** If a dependency is awaiting, or a dependency read by one of the stage's resolvers is not complete, the stage is `awaiting` and is not expanded.
-2. **Domains.** For each dynamic-axis request (one per combination of the static axes its resolver names), bind the resolver's parameters (`DepCtx`, static values, aligned upstream artifacts, Ref bindings), call it, normalize the result to an `AxisDomain`, memoize it per command by `(axis, cell ids, upstream fingerprints)`, and remember the full domain for orphan detection. Then apply branch active ids and samples.
+2. **Domains.** For each dynamic-axis request (one per combination of the static axes its resolver names), bind the resolver's parameters (`DepCtx`, static values, aligned upstream artifacts, Ref bindings), call it (an `Axis.files` axis is bound by `graph` to its upstream stage's static axes and the upstream itself; `probe.match_files` globs the aligned upstream unit directory, stripping a single-file `produces` from the artifact path), normalize the result to an `AxisDomain`, memoize it per command by `(axis, cell ids, upstream fingerprints)`, and remember the full domain for orphan detection. Then apply branch active ids and samples.
 3. **Expansion and alignment.** `graph.expand_stage` produces units in `foreach` product order; `graph.align_units` matches them with each upstream's units through hash indexes on shared axis ids; the session's `RefResolver` returns one `RefBinding` per unit for each keyed Ref.
 4. **Cells.** For each distinct cell (or once per stage when no `resources`/`depends` declaration, and no `depends` of a static resource, is callable), resolve resources and merged dependencies, fingerprint inputs, hash values, and compute the source fingerprint (cached per stage and declared sources).
 5. **Keys.** For each unit, assemble segment hashes incrementally: the Config hash projected on the stored row's `config_access_json` (memoized per access set), upstream entries, cell input and value hashes extended by dynamic-axis paths and values, and the version hash (`version` plus the normalized `produces`). NaN or Infinity in values is an evaluation error of the stage. If some upstream unit is unavailable, the key is not computable (`upstream-pending`).
@@ -205,6 +205,8 @@ The engine resolves Refs only through `engine.refs.RefResolver.bind(name, ref, a
 4. Record a `RefInfo` per upstream read (root, ok unit count, last commit time, git state of the last run) for the Refs table.
 
 Errors are `RefResolutionError` with the upstream command to run. A resolution error aborts a probe and fails the stage during a run.
+
+`Ref.resolve()` reads the same records from outside a pipeline: it builds a `WorkspaceRefResolver` over `settings_for(class)` or `load_workspace()` (cwd) and binds the Ref for one empty coordinate, which is exactly what a stage without axes receives.
 
 ## Workspace and macro runs
 

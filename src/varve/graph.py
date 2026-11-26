@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from varve.axis import Axis, AxisDomain, Cell
+from varve.axis import Axis, AxisDomain, Cell, FileMatch
 from varve.decorators import (
     Backend,
     PublishEntry,
@@ -56,7 +56,11 @@ class AlignmentError(GraphError):
 
 @dataclass(frozen=True)
 class ResolverBinding:
-    """How a dynamic axis' resolver binds its parameters."""
+    """How a dynamic axis' resolver binds its parameters.
+
+    For an ``Axis.files`` axis, ``params`` are the upstream stage's (static)
+    axes followed by the upstream itself.
+    """
 
     axis: Axis
     params: tuple[Param, ...]
@@ -304,6 +308,8 @@ def _bind_resolver(
     refs: Mapping[str, Ref],
 ) -> ResolverBinding:
     assert axis.resolver is not None
+    if isinstance(axis.resolver, FileMatch):
+        return _bind_files(axis, axis.resolver, specs)
     static_names = [name for name, item in axes.items() if item.is_static]
     try:
         params = bind_params(
@@ -320,6 +326,30 @@ def _bind_resolver(
         static_axes=tuple(axes[p.name] for p in params if p.kind == "axis"),
         stages=tuple(p.name for p in params if p.kind == "upstream"),
         refs=tuple(p.name for p in params if p.kind == "ref"),
+    )
+
+
+def _bind_files(axis: Axis, files: FileMatch, specs: Mapping[str, StageSpec]) -> ResolverBinding:
+    owner = f"Axis {axis.name!r} (Axis.files)"
+    upstream = specs.get(files.upstream)
+    if upstream is None:
+        raise GraphError(
+            f"{owner}: upstream {files.upstream!r} is not a stage of this pipeline "
+            f"(stages: {', '.join(specs)})"
+        )
+    dynamic = [item.name for item in upstream.foreach if not item.is_static]
+    if dynamic:
+        raise GraphError(
+            f"{owner}: upstream stage {files.upstream!r} has dynamic axes {dynamic}; "
+            "Axis.files reads one unit directory per static cell"
+        )
+    params = tuple(Param(item.name, "axis") for item in upstream.foreach)
+    return ResolverBinding(
+        axis=axis,
+        params=(*params, Param(files.upstream, "upstream")),
+        static_axes=upstream.foreach,
+        stages=(files.upstream,),
+        refs=(),
     )
 
 
@@ -443,7 +473,7 @@ def _check_publish(spec: StageSpec) -> None:
                 raise GraphError(
                     f"{owner}: publish target {entry.dst!r} uses unknown axes {sorted(unknown)}"
                 )
-            if names and used != names:
+            if names and used != names and not entry.into_dir:
                 raise GraphError(
                     f"{owner}: publish target {entry.dst!r} must use every axis placeholder "
                     f"{sorted('{' + name + '}' for name in names)} so units cannot collide"
@@ -459,6 +489,8 @@ def _check_publish_literals(nodes: Mapping[str, StageNode]) -> None:
     owners: dict[str, str] = {}
     for node in nodes.values():
         for entry in node.spec.publish:
+            if entry.into_dir:
+                continue  # a shared directory; its files are checked when published
             if entry.templated:
                 literal = not entry.placeholders()
             else:
@@ -798,7 +830,8 @@ class PublishTarget:
     unit: Unit
     entry: PublishEntry
     dst: str
-    """Path under the branch publish dir; for glob entries a pattern prefix (``<dir>/<glob>``)."""
+    """Path under the branch publish dir; for glob entries a pattern prefix (``<dir>/<glob>``),
+    for directory targets the directory (ending in ``/``)."""
 
 
 def publish_targets(node: StageNode, units: Sequence[Unit]) -> list[PublishTarget]:
@@ -815,7 +848,7 @@ def publish_targets(node: StageNode, units: Sequence[Unit]) -> list[PublishTarge
             else:
                 dst = f"{prefix}/{entry.dst}" if prefix else entry.dst
             targets.append(PublishTarget(unit, entry, dst))
-            if is_glob(entry.src) and not entry.templated:
+            if entry.into_dir or (is_glob(entry.src) and not entry.templated):
                 continue
             owner = f"{unit.unit_key or node.name}:{entry.src}"
             previous = claimed.setdefault(dst, owner)
@@ -832,7 +865,8 @@ def publish_claims(node: StageNode, units: Sequence[Unit]) -> dict[str, str]:
 
     claims: dict[str, str] = {}
     for target in publish_targets(node, units):
-        if is_glob(target.entry.src) and not target.entry.templated:
+        entry = target.entry
+        if entry.into_dir or (is_glob(entry.src) and not entry.templated):
             continue
         claims[target.dst] = f"{node.name}:{target.unit.unit_key or '-'}:{target.entry.src}"
     return claims

@@ -1,8 +1,8 @@
 """Cross-pipeline and cross-branch references.
 
-This module only declares :class:`Ref`; the default resolver
-(:mod:`varve.workspace.refs`) reads the upstream ``state.db`` without
-importing the upstream module.
+This module declares :class:`Ref`; the default resolver
+(:mod:`varve.workspace.refs`, imported lazily by :meth:`Ref.resolve`) reads
+the upstream ``state.db`` without importing the upstream module.
 """
 
 from __future__ import annotations
@@ -26,7 +26,8 @@ class Ref:
     ``align_by=()`` fans in everything, ``align_by=("a",)`` aligns only on the
     listed names, a mapping renames ``{local_axis: upstream_axis}``. Several
     ``branch`` names add an outer ``dict`` keyed by branch. ``selector``
-    (``"axis=id,..."``) filters the upstream units first.
+    (``"axis=id,..."``) filters the upstream units first. :meth:`resolve`
+    reads the same artifacts from outside a pipeline.
     """
 
     target: type[Any] | str
@@ -48,6 +49,27 @@ class Ref:
     @property
     def multi_branch(self) -> bool:
         return not isinstance(self.branch, str)
+
+    def resolve(self) -> Any:
+        """The committed artifacts this Ref points to, read from outside a pipeline.
+
+        Returns what a stage without axes would receive: the artifact ``Path``
+        when the upstream stage has no axes, else an ordered ``dict`` of every
+        selected upstream unit keyed by id (a tuple of ids for several axes),
+        wrapped in an outer ``dict`` keyed by branch for several branches.
+        The upstream is located like a pipeline's Ref: a Pipeline class target
+        at its default root, a string target through the ``varve.toml`` found
+        from the cwd and the stores under the scan root; both honor
+        ``VARVE_ROOT_BASE``. Raises ``RefResolutionError`` (a
+        ``RuntimeError``) like a binding would.
+        """
+
+        from varve.workspace.config import load_workspace, settings_for
+        from varve.workspace.refs import WorkspaceRefResolver
+
+        settings = load_workspace() if isinstance(self.target, str) else settings_for(self.target)
+        (binding,) = WorkspaceRefResolver(settings).bind(self.describe(), self, (), [()])
+        return binding.value
 
     def describe(self) -> str:
         target = self.target if isinstance(self.target, str) else self.target.__qualname__

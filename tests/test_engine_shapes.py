@@ -6,7 +6,7 @@ import json
 import os
 import stat
 
-from varve.engine import clean_pipeline, probe_pipeline
+from varve.engine import clean_pipeline, probe_pipeline, reuse_stage
 from varve.store import layout
 from varve.store.db import connect
 from varve.store.repo import Repo
@@ -286,3 +286,167 @@ def test_undeclared_static_ids_and_old_foreach_rows_become_orphans(ws) -> None:
     assert clean_pipeline(Demo, root=ws.root, orphans=True).rows == 3
     assert set(statuses()) == {"name=a", "name=b", "name=c"}
     assert not (ws.root / "out/.internal/main/work/item=a").exists()
+
+
+# -- Axis.files ---------------------------------------------------------------------
+
+FILES = """
+import json
+from pathlib import Path
+from pydantic import BaseModel
+from varve import Axis, Ctx, Pipeline, stage
+
+class Config(BaseModel):
+    rows: dict[str, list[str]] = {"a": ["x", "y", "z"], "b": ["w"]}
+
+DATASET = Axis("dataset", ("a", "b"))
+
+def read_manifest(dataset: str, prepare: Path) -> dict[int, Path]:
+    manifest = json.loads((prepare / "parts" / "manifest.json").read_text())
+    return {item["index"]: prepare / "parts" / item["path"] for item in manifest}
+
+BATCH = Axis("batch", resolver=read_manifest)
+
+class Demo(Pipeline):
+    Config = Config
+
+    @stage(foreach=DATASET, produces=PRODUCES)
+    def prepare(self, ctx: Ctx[Config], dataset: str) -> None:
+        (ctx.out / "parts").mkdir()
+        manifest = []
+        for index, text in enumerate(ctx.config.rows[dataset], start=1):
+            name = f"batch-{index:06d}.txt"
+            (ctx.out / "parts" / name).write_text(text)
+            manifest.append({"index": index, "path": name})
+        (ctx.out / "parts" / "manifest.json").write_text(json.dumps(manifest))
+
+    @stage(foreach=(DATASET, BATCH), produces="out.txt")
+    def process(self, ctx: Ctx[Config], dataset: str, batch: Path) -> None:
+        (ctx.out / "out.txt").write_text(batch.read_text().upper() + ctx.coords["batch"])
+
+    @stage(produces="merged.json")
+    def merge(self, ctx: Ctx[Config], process: dict) -> None:
+        payload = [[list(k), v.read_text()] for k, v in process.items()]
+        (ctx.out / "merged.json").write_text(json.dumps(payload))
+"""
+
+FILES_AXIS = (
+    'Axis.files("batch", "prepare", "parts/batch-*.txt", '
+    'key=lambda path: int(path.stem.removeprefix("batch-")))'
+)
+
+
+def _files_source(axis: str | None = None, produces: str = '["parts/manifest.json"]') -> str:
+    source = FILES.replace("PRODUCES", produces)
+    if axis is not None:
+        source = source.replace('Axis("batch", resolver=read_manifest)', axis)
+    return source
+
+
+def _merged(ws) -> list:
+    return json.loads((ws.root / "out/.internal/main/merge/merged.json").read_text())
+
+
+def test_files_axis_expands_per_upstream_unit_and_keys_on_each_file(ws) -> None:
+    # A single-file upstream `produces` and process workers (the axis travels by import).
+    source = _files_source(FILES_AXIS, produces='"parts/manifest.json"').replace(
+        '@stage(foreach=(DATASET, BATCH), produces="out.txt")',
+        '@stage(foreach=(DATASET, BATCH), produces="out.txt", workers=2)',
+    )
+    Demo = ws.write(source)
+    result = ws.run(Demo)
+    assert result.status == "ok", result.stages
+    assert result.stages["process"].executed == 4
+    assert _merged(ws) == [[["a", 1], "X1"], [["a", 2], "Y2"], [["a", 3], "Z3"], [["b", 1], "W1"]]
+
+    _config(ws, rows={"a": ["x", "CHANGED", "z"], "b": ["w"]})
+    Demo = ws.write(source)
+    result = ws.run(Demo)
+    assert result.stages["prepare"].executed == 2
+    assert (result.stages["process"].executed, result.stages["process"].hit) == (1, 3)
+
+    _config(ws, rows={"a": ["x"], "b": ["w"]})
+    result = ws.run(Demo)
+    assert result.stages["process"].orphaned == 2
+    assert _merged(ws) == [[["a", 1], "X1"], [["b", 1], "W1"]]
+
+
+def test_files_axis_keys_equal_an_equivalent_manifest_resolver(ws) -> None:
+    Demo = ws.write(_files_source())
+    assert ws.run(Demo).status == "ok"
+    before = _merged(ws)
+
+    Demo = ws.write(_files_source(FILES_AXIS))
+    view = probe_pipeline(Demo, root=ws.root, expand=True)
+    assert view.stage("prepare").status == "hit"
+    # Only the stage whose closure holds the axis declaration changed source; its
+    # input keys are unchanged, so `reuse` makes it (and its dependents) hits.
+    assert {unit.reason for unit in view.stage("process").units} == {"source-changed"}
+    assert {unit.reason for unit in view.stage("merge").units} == {"upstream-pending"}
+    assert reuse_stage(Demo, "process", root=ws.root).reused == 4
+    result = ws.run(Demo)
+    assert {outcome.executed for outcome in result.stages.values()} == {0}
+    assert _merged(ws) == before
+
+
+def test_files_axis_default_keys_empty_matches_and_collisions(ws) -> None:
+    stem_axis = 'Axis.files("batch", "prepare", "parts/*.txt")'
+    Demo = ws.write(_files_source(stem_axis))
+    assert ws.run(Demo).status == "ok"
+    assert [key for key, _ in _merged(ws)] == [
+        ["a", "batch-000001"],
+        ["a", "batch-000002"],
+        ["a", "batch-000003"],
+        ["b", "batch-000001"],
+    ]
+
+    empty_axis = 'Axis.files("batch", "prepare", "parts/*.csv")'
+    Demo = ws.write(_files_source(empty_axis))
+    result = ws.run(Demo)
+    assert result.stages["process"].status == "failed"
+    assert "matches 'parts/*.csv'" in result.stages["process"].detail
+    Demo = ws.write(_files_source(empty_axis.replace(")", ", allow_empty=True)")))
+    result = ws.run(Demo)
+    assert result.status == "ok" and result.stages["process"].total == 0
+
+    Demo = ws.write(_files_source('Axis.files("batch", "prepare", "parts/*", key=lambda p: 1)'))
+    result = ws.run(Demo)
+    assert result.stages["process"].status == "failed"
+    assert "pass key=" in result.stages["process"].detail
+
+
+def test_files_axis_graph_errors() -> None:
+    import pytest
+
+    from varve import Axis, Ctx, Pipeline, stage
+    from varve.graph import GraphError
+
+    with pytest.raises(ValueError, match="relative glob"):
+        Axis.files("batch", "prepare", "/abs/*.txt")
+    with pytest.raises(ValueError, match="inside the unit"):
+        Axis.files("batch", "prepare", "../*.txt")
+
+    dataset = Axis("dataset", ("a", "b"))
+    shard = Axis("shard", resolver=lambda: ["s1"])
+
+    def build(upstream: str, up_axes: tuple[Axis, ...], down_axes) -> type[Pipeline]:
+        batch = Axis.files("batch", upstream, "*.txt")
+
+        class Demo(Pipeline):
+            @stage(foreach=up_axes)
+            def prepare(self, ctx: Ctx) -> None: ...
+
+            @stage(foreach=down_axes(batch))
+            def process(self, ctx: Ctx) -> None: ...
+
+        return Demo
+
+    with pytest.raises(GraphError, match="'missing' is not a stage"):
+        build("missing", (dataset,), lambda b: (dataset, b)).graph()
+    with pytest.raises(GraphError, match="has dynamic axes"):
+        build("prepare", (dataset, shard), lambda b: (dataset, b)).graph()
+    with pytest.raises(GraphError, match="static axes"):
+        build("prepare", (dataset,), lambda b: (b, dataset)).graph()
+    graph = build("prepare", (dataset,), lambda b: (dataset, b)).graph()
+    assert graph.nodes["process"].deps == ("prepare",)
+    assert graph.nodes["process"].upstream == ()

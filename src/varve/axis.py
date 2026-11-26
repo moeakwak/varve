@@ -69,7 +69,8 @@ class Axis:
     by name like a stage's (``ctx``, preceding static axes, upstream stages,
     Refs) and returns either ``Mapping[key, Path]`` (each unit receives the
     path, which enters its input key), ``Mapping[key, value]`` or
-    ``Sequence[key]``. Axes are matched across stages by object identity.
+    ``Sequence[key]``. :meth:`files` declares a dynamic axis over files an
+    upstream stage wrote. Axes are matched across stages by object identity.
     """
 
     __slots__ = ("name", "values", "resolver", "input_fingerprint", "_static")
@@ -79,7 +80,7 @@ class Axis:
         name: str,
         values: Sequence[AxisKey] | None = None,
         *,
-        resolver: Callable[..., Mapping[Any, Any] | Sequence[Any]] | None = None,
+        resolver: Callable[..., Mapping[Any, Any] | Sequence[Any]] | FileMatch | None = None,
         input_fingerprint: InputFingerprint = "content",
     ) -> None:
         check_identifier(name, "Axis")
@@ -101,6 +102,40 @@ class Axis:
                 raise ValueError(f"Axis {name!r} must declare at least one value")
             self.values = tuple(values)
             self._static = AxisDomain.build(self, self.values, self.values)
+
+    @classmethod
+    def files(
+        cls,
+        name: str,
+        upstream: str,
+        pattern: str,
+        *,
+        key: Callable[[Path], str | int] | None = None,
+        allow_empty: bool = False,
+        input_fingerprint: InputFingerprint = "content",
+    ) -> Axis:
+        """A dynamic axis with one item per file of ``upstream`` matching ``pattern``.
+
+        ``upstream`` names a stage of the same pipeline whose axes are all
+        static; the axis is resolved once per upstream unit, matching the
+        POSIX glob ``pattern`` (``**`` crosses directories) against the
+        files of that unit's directory, whatever its ``produces``. Matches
+        are ordered by relative path. Each unit receives its file's
+        ``Path``, which enters its ``inputs`` key segment like a resolver's
+        ``{key: Path}`` result. ``key(path)`` gives the item key (default:
+        ``path.stem``). No match is an error unless
+        ``allow_empty``.
+        """
+
+        check_identifier(upstream, "Axis.files upstream")
+        if not isinstance(pattern, str) or not pattern or pattern.startswith("/"):
+            raise ValueError(f"Axis {name!r}: pattern must be a relative glob, got {pattern!r}")
+        if ".." in pattern.split("/") or "\\" in pattern or "\0" in pattern:
+            raise ValueError(f"Axis {name!r}: pattern must stay inside the unit: {pattern!r}")
+        if key is not None and not callable(key):
+            raise TypeError(f"Axis {name!r}: key must be a callable, got {key!r}")
+        match = FileMatch(upstream, pattern, key, allow_empty)
+        return cls(name, resolver=match, input_fingerprint=input_fingerprint)
 
     @property
     def is_static(self) -> bool:
@@ -146,6 +181,20 @@ class Axis:
         if self.values is not None:
             return f"Axis({self.name!r}, {list(self.values)!r})"
         return f"Axis({self.name!r}, resolver=...)"
+
+
+@dataclass(frozen=True)
+class FileMatch:
+    """The resolver of an :meth:`Axis.files` axis: files of one upstream unit directory.
+
+    The graph binds it to the static axes of ``upstream``; the probe globs
+    each upstream unit's directory (``varve.engine.probe``).
+    """
+
+    upstream: str
+    pattern: str
+    key: Callable[[Path], str | int] | None = None
+    allow_empty: bool = False
 
 
 @dataclass(frozen=True, eq=False)

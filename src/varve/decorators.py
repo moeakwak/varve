@@ -57,12 +57,18 @@ class PublishEntry:
 
     ``templated`` entries come from the mapping form and may use ``{axis}``
     placeholders; other entries keep their name and, for multi-unit stages,
-    are placed under ``<unit_relpath>/``.
+    are placed under ``<unit_relpath>/``. A mapping target ending in ``/`` is
+    a directory (``into_dir``): the source, or every file a glob source
+    matches, is placed below it.
     """
 
     src: str
     dst: str
     templated: bool
+
+    @property
+    def into_dir(self) -> bool:
+        return self.templated and self.dst.endswith("/")
 
     def placeholders(self) -> set[str]:
         return {name for _, name, _, _ in string.Formatter().parse(self.dst) if name is not None}
@@ -134,9 +140,10 @@ def _publish(
         for src, dst in publish.items():
             check_relpath(src, f"Stage {stage_name!r} publish source")
             check_relpath(dst, f"Stage {stage_name!r} publish target")
-            if is_glob(src):
+            if is_glob(src) and not dst.endswith("/"):
                 raise ValueError(
-                    f"Stage {stage_name!r}: publish mapping sources must not be globs: {src!r}"
+                    f"Stage {stage_name!r}: a glob publish source needs a directory target "
+                    f"ending in '/': {src!r}"
                 )
             entries.append(PublishEntry(src, dst, True))
         return tuple(entries)

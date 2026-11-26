@@ -167,7 +167,7 @@ The decorated method must return `None` (any other value fails the unit with `St
 
 Parameters after `self` are bound by name when the graph is built:
 
-1. `ctx` receives the unit's `Ctx`. Annotate it as `Ctx`, `Ctx[Config]`, or `Ctx[Config, Args]` for type checking.
+1. `ctx` receives the unit's `Ctx`. Annotate it as `Ctx`, `Ctx[Config]`, or `Ctx[Config, Args]` for type checking. A pipeline with many stages usually defines one module-level alias, `StageCtx = Ctx[Config, Args]`, and annotates `ctx: StageCtx`; varve cannot derive the parameters from the class's `Config`/`Args` attributes, because type checkers never see them.
 2. A name of an axis in this stage's `foreach` receives that axis' value for the unit (see [Axes](#axes)).
 3. A name of another stage, or of a `Ref` class attribute, creates a dependency and receives the aligned upstream artifact: a `Path` for 1-to-1 alignment (the file when the upstream declares `produces="file"`, else the unit directory), or an ordered `dict` for fan-in.
 4. A name of a resource of the stage (from `resources=` or `defaults["resources"]`) receives the opened session (`None` for a resource without `open`).
@@ -202,9 +202,10 @@ In `Resource.preflight` and `Resource.open`, `RunCtx.config` is a recording prox
 
 ```python
 Axis(name, values=None, *, resolver=None, input_fingerprint="content")
+Axis.files(name, upstream, pattern, *, key=None, allow_empty=False, input_fingerprint="content")
 ```
 
-Exactly one of `values` and `resolver` is required. Axis names must be Python identifiers other than `self` and `ctx`, and unique within a pipeline: two different `Axis` objects with the same name are an error. Stages share an axis by using the same `Axis` object.
+Exactly one of `values` and `resolver` is required; `Axis.files` declares a dynamic axis over the files an upstream stage wrote (see [File axes](#file-axes-axisfiles)). Axis names must be Python identifiers other than `self` and `ctx`, and unique within a pipeline: two different `Axis` objects with the same name are an error. Stages share an axis by using the same `Axis` object.
 
 Every item of an axis has a canonical string **id** (used in unit keys, selectors, paths, and `ctx.coords`) and a **value** (what a parameter of the axis' name receives). Ids must be non-empty, must not be `.` or `..`, and must not contain `/`, `,`, `=`, or NUL. Unsafe path characters are percent-encoded in directory names only.
 
@@ -310,6 +311,20 @@ Before the first run, `status` shows `label` and `merge` as `awaiting (split)`: 
 
 If `label` also needed the whole `split` directory in its key, it would add `split` as a parameter or to `needs=`.
 
+### File axes: `Axis.files`
+
+The most common upstream-driven axis has one item per file that an upstream stage wrote. `Axis.files` declares it without writing a resolver. In the example above, if `split` names its files `batch-000.json`, `batch-001.json`, ..., this declaration replaces `read_batches`:
+
+```python
+BATCH = Axis.files("batch", "split", "batch-*.json", key=lambda path: int(path.stem[6:]))
+```
+
+- `upstream` names a stage of the same pipeline whose axes are all static. The axis is resolved once per upstream unit: it binds the upstream's static axes, which must precede it in the `foreach` of every stage that uses it, so each `dataset` above gets its own batches.
+- `pattern` is a POSIX glob (`**` crosses directories) matched against the files of that upstream unit's directory, also when the upstream declares a single-file `produces` (whose file is what stages receive). Matches are ordered by relative path, so zero-padded names keep numeric order.
+- Each unit receives its file's `Path`, which enters its `inputs` key segment under the axis name, exactly like a resolver returning `{key: Path}`. An `Axis.files` axis and a resolver that returns the same keys and files give the same input keys; switching from one to the other only changes the source fingerprint of the stages whose closure holds the declaration (`source-changed`, which `reuse` accepts).
+- `key(path)` returns the item key (`str` or `int`) from the file's `Path`; the default is `path.stem`, the file name without its last suffix. Two files with the same key are an evaluation error.
+- No match is an evaluation error of the consuming stage unless `allow_empty=True`, which allows an empty domain.
+
 ### Shrinking domains and orphans
 
 When a dynamic axis resolves to fewer ids than the store holds, the stored units whose static coordinates are still active but whose dynamic id disappeared are marked `orphaned` during `run` (never by a read-only probe, and never because of `axes:`, `--slice`, or `--sample`). The same happens to stored units of a static id that is no longer declared, and to units written under a different `foreach` (other axis names or order). Orphaned units leave the stage, so they no longer appear in downstream fan-ins; `status` reports `orphaned N`, and `clean --orphans` deletes their directories and rows. An orphaned unit whose id comes back is treated as `new`.
@@ -340,6 +355,8 @@ If the method raises, or any step of finalizing and committing the unit fails, t
 | `"part.json"` | the file exists and is regular | the file |
 | `["a.json", "b.json"]` | both exist | the unit directory |
 
+To check a single file but hand downstream stages the unit directory, use a one-item list: `produces=["parts/manifest.json"]`. A stage that only feeds an `Axis.files` axis does not need this, because the axis globs the unit directory whatever `produces` declares.
+
 Never keep references to `ctx.out` after the method returns; the directory is moved.
 
 ### `publish`
@@ -350,9 +367,10 @@ Managed directories are internal. `publish=` exposes chosen outputs under the br
 | --- | --- |
 | `publish=True` | Publish every `produces` path under its own name (requires `produces=`). |
 | `publish="summary.md"` or `publish=["summary.json", "plots/*.txt"]` | Publish these paths or globs under their own relative paths. In a stage with axes they go under `<unit_relpath>/`. |
-| `publish={"total.json": "{model}.json"}` | Map a source path to a target. Targets may use `{axis}` placeholders; in a stage with axes they must use every axis placeholder. Mapping sources may not be globs. |
+| `publish={"total.json": "{model}.json"}` | Map a source path to a target. Targets may use `{axis}` placeholders; in a stage with axes they must use every axis placeholder. |
+| `publish={"parts/**/*.parquet": "sources/"}` | A mapping target ending in `/` is a directory: each file a glob source matches is placed below it at its path relative to the glob's literal leading directories (`parts/a.parquet` becomes `sources/a.parquet`, `parts/x/b.parquet` becomes `sources/x/b.parquet`), and a literal source is placed below it under its own name. Directory targets may use placeholders but need not use every axis, so the units of a stage can merge their files into one directory. Glob sources require a directory target. |
 
-Two entries or stages claiming the same literal target are a `GraphError`; templated targets that collide once expanded fail the stage when it publishes. Publishing runs after every unit of the stage is `ok`, including when all were hits, so a deleted published file is restored by the next run. Each file is linked to a temporary name and moved into place with `os.replace`; a directory source is rebuilt as a hardlinked tree and swapped in. The publish directory must be on the same filesystem as the stage's storage: varve never copies, and a cross-filesystem publish fails the stage with a message to set `storage=` to a storage on the publish filesystem. Files a unit's glob entry published earlier but no longer produces are removed at the next publish; varve records what each stage's glob entries published in `.varve-published/<stage>.json` inside the publish directory and never removes anything else. Published files that no longer correspond to a unit or entry are not removed.
+Two entries or stages claiming the same literal target are a `GraphError`; templated targets that collide once expanded, and two units or entries of a stage placing a file at the same path through glob or directory targets, fail the stage when it publishes. Directory targets are not checked against other stages. Publishing runs after every unit of the stage is `ok`, including when all were hits, so a deleted published file is restored by the next run. Each file is linked to a temporary name and moved into place with `os.replace`; a directory source is rebuilt as a hardlinked tree and swapped in. The publish directory must be on the same filesystem as the stage's storage: varve never copies, and a cross-filesystem publish fails the stage with a message to set `storage=` to a storage on the publish filesystem. Files a unit's glob entry published earlier but no longer produces are removed at the next publish; varve records what each stage's glob entries published in `.varve-published/<stage>.json` inside the publish directory and never removes anything else. Published files that no longer correspond to a unit or entry are not removed.
 
 ## Roots and storage tiers
 
@@ -409,6 +427,8 @@ A resource bundles a session with what it depends on:
   - `"unit"`: around each unit, in whatever process runs it; `run_ctx.cell` holds the unit's static coordinates. Async context managers only for `async def` stages.
 
 Nothing is preflighted or opened for a stage whose units are all hits. Resources from `defaults["resources"]` come first; a stage resource with the same name replaces a default. `resources=lambda ctx: [...]` selects resources per cell; two different `Resource` objects with the same name in one cell's declaration are an error.
+
+`Resource` is a frozen dataclass, so `dataclasses.replace(LEXICON, preflight=other_check)` derives a variant with the same name and dependencies; the variant is a distinct object with its own preflight and sessions.
 
 Sessions are keyed by `Resource` object identity, not by name. When a `resources=` callable returns different objects for different cells (for example a new `Resource` built per cell), the stage opens one session per distinct object, and each unit receives the session of its own cell's resource; returning the same module-level object from every cell shares one session.
 
@@ -490,7 +510,7 @@ Dependencies.stat(paths_or_glob)
 
 - `inputs` maps names to a path, a list of paths, `Dependencies.glob(...)`, or `Dependencies.stat(...)`. Directories are walked recursively and contribute their regular files; empty directories are ignored. Files are content-hashed (SHA-256) by default; the hash is cached in the store by `(path, inode, size, mtime_ns)`, so unchanged files are not reread. Key material uses paths relative to each declared root (a file contributes its name), never absolute paths, so moving a checkout does not invalidate. An input with more than 32 files stores its file list once in the content-addressed `file_sets` table.
 - `values` maps names to JSON values. Pydantic models are dumped, tuples become lists, and `Path` values become POSIX strings; dict keys must be strings. NaN and Infinity are rejected (the stage fails to evaluate).
-- `sources` lists Python files or directories (only `*.py` files inside directories count) whose normalized AST enters the stage's `source_fp`. Relative paths resolve against the pipeline module's directory.
+- `sources` lists Python files, directories (only `*.py` files inside directories count), or `Dependencies.glob(...)` sets (every match must be a `*.py` file) whose normalized AST enters the stage's `source_fp`. Relative paths and glob roots resolve against the pipeline module's directory. Each file enters the fingerprint under its path relative to that directory, so a glob and an explicit list of the files it matches give the same `source_fp`; `Dependencies.stat` cannot declare sources.
 - `Dependencies.glob` selects files under `root` with POSIX globs (`**` crosses directories), evaluated whenever the dependency is fingerprinted. A missing root, or no match unless `allow_empty=True`, is an error.
 - Symlinks in globs: `root` itself may be or pass through a symlink. Below it, the walk only enters directories where some `include` pattern can still match (pattern segments are compared with directory segments; from a segment containing `**` on, everything below is reachable) and skips directories whose whole subtree an `exclude` pattern removes (`**` or `<dir pattern>/**`). A symlink below `root` is an error only if the glob would select it: it matches `include` and no `exclude`, or it points to a directory, its own path is not excluded, and some `include` pattern could match a non-excluded path below it. Special files follow the same rule. Every other symlink is ignored, so `Dependencies.glob(repo, include="src/**/*.rs")` works next to a symlinked `.venv` or `node_modules/`, while `include="**/*.rs"` needs `exclude=[".venv", "**/node_modules/**"]` (or similar) for them. Plain path inputs (not globs) still reject any symlink below the declared path.
 - `Dependencies.stat` fingerprints the given paths or glob by `(relpath, size, mtime_ns)` instead of content, for large read-only inputs. It mixes freely with content-hashed inputs.
@@ -765,6 +785,7 @@ class Report(Pipeline):
 - **Alignment by name.** Unlike in-pipeline stages, Refs align by axis name. Axes the consuming stage shares by name with the upstream stage align 1-to-1, and a requested coordinate without an `ok` upstream unit is an error (upstream domains may be supersets). Upstream-only axes fan in as an ordered `dict` keyed by the upstream id string (a tuple of id strings for several axes); ids stay strings because the upstream is not imported. The entries follow the upstream `foreach` product order, with static axes in their declared id order and dynamic axes in id string order (the upstream resolver's order is not stored), so the dict and the key never depend on the order in which upstream units were committed. Only units inside the upstream branch's active domain are aggregated (its declared static ids restricted by `axes:`, `--slice`, or `--sample`, and explicit dynamic `axes:` lists); orphaned and out-of-domain rows are ignored. If an in-domain unit that a coordinate reads is `failed` or `running`, binding fails with the upstream command rather than leaving it out. `align_by=()` fans in everything, `align_by=("a", "b")` aligns only on the listed names, and `align_by={"ds": "dataset"}` maps a local axis name to an upstream one.
 - **Filtering.** `selector="axis=id,..."` keeps only matching upstream units before alignment.
 - **Several branches.** `branch=("main", "katex")` wraps each value in an outer `dict` keyed by branch name.
+- **Reading outside a pipeline.** `ref.resolve()` returns what a stage without axes would receive: the artifact `Path` when the upstream stage has no axes, else an ordered `dict` of every selected upstream unit keyed by id string (a tuple of id strings for several axes, in upstream `foreach` order), wrapped in a `dict` keyed by branch for several branches. Location, active-domain filtering, and errors are those of a binding: a class target uses its default (or relocated) root, a string target the `varve.toml` found from the cwd and the stores under the scan root, and `VARVE_ROOT_BASE` applies to both. Scripts and notebooks should use it rather than read `.varve/state.db`, whose schema is internal: `Ref("corpus", stage="count").resolve()` gives `{"en": Path, "de": Path}`.
 
 ```python
 class Summary(Pipeline):

@@ -73,13 +73,13 @@ class Dependencies:
 
     ``inputs`` maps names to paths (content-hashed unless wrapped with
     :meth:`stat`) or :meth:`glob` sets; ``values`` maps names to JSON values;
-    ``sources`` lists Python files or directories whose normalized AST enters
-    the stage's ``source_fp``.
+    ``sources`` lists Python files, directories, or :meth:`glob` sets of
+    ``.py`` files whose normalized AST enters the stage's ``source_fp``.
     """
 
     inputs: Mapping[str, InputSpec] = field(default_factory=dict)
     values: Mapping[str, JSON] = field(default_factory=dict)
-    sources: Sequence[Path | str] = ()
+    sources: Sequence[Path | str | Glob] = ()
 
     @staticmethod
     def glob(
@@ -131,7 +131,7 @@ def merge_dependencies(*items: tuple[str, Dependencies]) -> Dependencies:
 
     inputs: dict[str, InputSpec] = {}
     values: dict[str, JSON] = {}
-    sources: dict[Path | str, None] = {}
+    sources: dict[Path | str | Glob, None] = {}
     for label, deps in items:
         for name, spec in deps.inputs.items():
             claim("inputs", name, label)

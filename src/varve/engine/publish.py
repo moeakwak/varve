@@ -66,12 +66,20 @@ def publish_stage(
     check_same_filesystem(node, storage_root, publish_dir)
     published: list[Path] = []
     globbed: dict[tuple[str, str], list[str]] = {}
+    owners: dict[str, str] = {}
     for target in publish_targets(node, units):
         source_dir = unit_dirs[target.unit.unit_key]
         expanded = _expand(target, source_dir)
         if is_glob(target.entry.src):
             globbed[(target.unit.unit_key, target.entry.src)] = [rel for _, rel in expanded]
+        owner = f"{target.unit.unit_key or node.name}:{target.entry.src}"
         for source, relpath in expanded:
+            previous = owners.setdefault(relpath, owner)
+            if previous != owner:
+                raise PublishError(
+                    f"Stage {node.name!r}: publish target {relpath!r} is claimed by both "
+                    f"{previous} and {owner}"
+                )
             destination = publish_dir / relpath
             _place(source, destination)
             published.append(destination)
@@ -122,15 +130,30 @@ def _prune_globbed(
 
 
 def _expand(target: PublishTarget, source_dir: Path) -> list[tuple[Path, str]]:
+    """(source, destination relpath) pairs of one target.
+
+    A glob keeps each match's path under the unit directory, or, for a
+    directory target, its path below the glob's literal leading directories.
+    A literal source goes to the target, or below a directory target by name.
+    """
+
     entry = target.entry
     if not is_glob(entry.src):
         source = source_dir / entry.src
         if not source.exists():
             raise PublishError(f"publish source {entry.src!r} does not exist in {source_dir}")
+        if entry.into_dir:
+            return [(source, f"{target.dst}{source.name}")]
         return [(source, target.dst)]
-    prefix = target.dst[: len(target.dst) - len(entry.src)]
+    if entry.into_dir:
+        parts = entry.src.split("/")
+        literal = next(i for i, part in enumerate(parts) if is_glob(part))
+        strip = sum(len(part) + 1 for part in parts[:literal])
+        prefix, keep = target.dst, slice(strip, None)
+    else:
+        prefix, keep = target.dst[: len(target.dst) - len(entry.src)], slice(None)
     matches = [
-        (path, f"{prefix}{relpath}")
+        (path, f"{prefix}{relpath[keep]}")
         for relpath, path in walk_files(source_dir)
         if glob_match(relpath, entry.src)
     ]

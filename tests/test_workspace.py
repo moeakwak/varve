@@ -288,6 +288,43 @@ def test_class_target_ref(space: Space) -> None:
     assert outputs(down, space.pkg / "down")["dataset=b"] == "b:v1"
 
 
+def test_ref_resolve_reads_committed_artifacts_outside_a_pipeline(
+    space: Space, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from varve import Ref
+
+    up, _ = setup_pair(space, f'Ref("{space.module("up")}", stage="export")')
+    name = space.module("up")
+    with pytest.raises(RefResolutionError, match="run it first"):
+        Ref(name, stage="export").resolve()
+    space.run(up)
+    space.run(up, branch="alt")
+
+    export = Ref(name, stage="export").resolve()
+    assert {key: path.read_text() for key, path in export.items()} == {
+        "a": "a:v1",
+        "b": "b:v1",
+        "c": "c:v1",
+    }
+    combined = Ref(name, stage="combined").resolve()
+    assert isinstance(combined, Path) and combined.read_text() == "all:v1"
+    assert list(Ref(name, stage="export", selector="dataset=b").resolve()) == ["b"]
+    both = Ref(up, stage="combined", branch=("main", "alt")).resolve()
+    assert {branch: path.read_text() for branch, path in both.items()} == {
+        "main": "all:v1",
+        "alt": "all:alt",
+    }
+
+    # VARVE_ROOT_BASE relocates the upstream for class and string targets alike.
+    base = tmp_path / "scratch"
+    monkeypatch.setenv(ROOT_BASE_ENV, str(base))
+    with pytest.raises(RefResolutionError, match="no store"):
+        Ref(up, stage="combined").resolve()
+    space.run(up)
+    assert Ref(up, stage="combined").resolve().is_relative_to(base)
+    assert Ref(name, stage="combined").resolve().is_relative_to(base)
+
+
 def test_root_base_relocates_whole_chains(
     space: Space, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:

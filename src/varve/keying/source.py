@@ -36,7 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from varve.keying.fingerprint import FingerprintSession, json_hash, parse_python
+from varve.dependencies import Glob
+from varve.keying.fingerprint import FingerprintSession, json_hash, parse_python, walk_glob
 
 PREAMBLE = "<preamble>"
 WHOLE_FILE = "<file>"
@@ -552,11 +553,11 @@ class SourceAnalyzer:
         self,
         pipeline: type[Any],
         stage: str,
-        sources: Sequence[Path | str] = (),
+        sources: Sequence[Path | str | Glob] = (),
     ) -> SourceFingerprint:
         """``source_fp`` of ``stage``: its closure in its file plus declared ``sources``.
 
-        Relative ``sources`` resolve against the pipeline module's directory.
+        Relative ``sources`` (and glob roots) resolve against the pipeline module's directory.
         """
 
         func = pipeline.stages()[stage].func
@@ -675,9 +676,19 @@ class SourceAnalyzer:
                 add(name, statements, class_name)
         return dict(sorted(symbols.items()))
 
-    def _external(self, sources: Sequence[Path | str], base: Path) -> dict[str, str]:
+    def _external(self, sources: Sequence[Path | str | Glob], base: Path) -> dict[str, str]:
+        """``{label: ast_hash}`` of every declared source file.
+
+        A file's label is its path relative to ``base``, however it was
+        declared (a file, a directory, or a ``Dependencies.glob``), so a glob
+        and an explicit list of the same files give the same material.
+        """
+
         external: dict[str, str] = {}
         for item in sources:
+            if isinstance(item, Glob):
+                external.update(self._glob_sources(item, base))
+                continue
             declared = Path(item).expanduser()
             declared = declared if declared.is_absolute() else base / declared
             label_root = os.path.relpath(declared, base)
@@ -692,3 +703,22 @@ class SourceAnalyzer:
                     label = Path(label_root, rel).as_posix()
                     external[label] = self.session.ast_hash(path)
         return dict(sorted(external.items()))
+
+    def _glob_sources(self, spec: Glob, base: Path) -> dict[str, str]:
+        if spec.mode != "content":
+            raise ValueError(f"Dependencies.stat cannot declare sources: {spec.root}")
+        root = spec.root.expanduser()
+        root = root if root.is_absolute() else base / root
+        matches = walk_glob(root, spec.include, spec.exclude)
+        if not matches and not spec.allow_empty:
+            raise FileNotFoundError(
+                f"Dependencies.glob source matched no files under {spec.root} "
+                f"(include={list(spec.include)}, exclude={list(spec.exclude)})"
+            )
+        external: dict[str, str] = {}
+        for rel, path in matches:
+            if not rel.endswith(".py"):
+                raise ValueError(f"Declared source file must end in .py: {root / rel}")
+            label = Path(os.path.relpath(root / rel, base)).as_posix()
+            external[label] = self.session.ast_hash(Path(path))
+        return external
