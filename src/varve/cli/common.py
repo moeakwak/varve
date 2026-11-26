@@ -57,6 +57,9 @@ def report_errors(
 
     try:
         return command()
+    except KeyboardInterrupt:  # outside a run's own handling (startup, shutdown)
+        make_console(stderr=True).print("[yellow]interrupted[/]")
+        return 130
     except ValidationError as error:
         make_console(stderr=True).print(
             f"[red]error:[/] invalid configuration or arguments\n{error}", soft_wrap=True

@@ -172,6 +172,7 @@ class Runner:
         self.resources = ResourceManager()
         self.aborted = False
         self._interrupt_notice = False
+        self._bookkeeping = False
         self._writer: Writer | None = None
         self.commits: Committer
 
@@ -227,28 +228,32 @@ class Runner:
                     session.pipeline.selector(), branch.name, self.run_id, tuple(self.selected)
                 )
             )
-            try:
-                with self._sigint():
+            with self._sigint():
+                try:
                     asyncio.run(self._drive())
-            except KeyboardInterrupt:
-                self.aborted = True
-                self.stop.request("interrupted")
-            except BaseException:
+                except KeyboardInterrupt:
+                    self.aborted = True
+                    self.stop.request("interrupted")
+                except BaseException:
+                    self._bookkeeping = True
+                    wall_ms = int((time.monotonic() - started) * 1000)
+                    repo.finish_run(self.run_id, status="failed", total_wall_ms=wall_ms)
+                    raise
+                finally:
+                    # From here on Ctrl-C only flags the run: the store and the staging
+                    # dirs are settled before the process exits.
+                    self._bookkeeping = True
+                    self.writer.flush()
+                    for root in session.storage_roots.values():
+                        shutil.rmtree(layout.staging_root(root, self.run_id), ignore_errors=True)
+                status = self._status()
                 wall_ms = int((time.monotonic() - started) * 1000)
-                repo.finish_run(self.run_id, status="failed", total_wall_ms=wall_ms)
-                raise
-            finally:
-                self.writer.flush()
-                for root in session.storage_roots.values():
-                    shutil.rmtree(layout.staging_root(root, self.run_id), ignore_errors=True)
-            status = self._status()
-            wall_ms = int((time.monotonic() - started) * 1000)
-            repo.finish_run(self.run_id, status=status, total_wall_ms=wall_ms)
-            if any(item.executed or item.linked for item in self.outcomes.values()):
-                # Rows this run replaced may have left key parts, source details,
-                # or file sets unreferenced.
-                with suppress(sqlite3.OperationalError):
-                    repo.collect_garbage()
+                repo.finish_run(self.run_id, status=status, total_wall_ms=wall_ms)
+                if any(item.executed or item.linked for item in self.outcomes.values()):
+                    # Rows this run replaced may have left key parts, source details,
+                    # or file sets unreferenced.
+                    with suppress(sqlite3.OperationalError):
+                        repo.collect_garbage()
         rotate_logs(session.root, active=repo.running_run_ids())
         self.bus.publish(RunFinished(status, wall_ms))
         return RunResult(self.run_id, session.branch.name, status, self.outcomes, wall_ms)
@@ -272,6 +277,8 @@ class Runner:
             # Only flags here: the handler may run inside any code holding a lock
             # (event bus, logging, sqlite); the main loop publishes the notice.
             nonlocal count
+            if self._bookkeeping:  # the run is over; let it settle the store and exit
+                return
             count += 1
             if count > 1:
                 raise KeyboardInterrupt
