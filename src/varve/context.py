@@ -16,9 +16,7 @@ T = TypeVar("T")
 
 
 class CtxSink(Protocol):
-    """Receives live unit events; the engine installs one per unit."""
-
-    def metric(self, ctx: Ctx[Any, Any], values: Mapping[str, Any]) -> None: ...
+    """Receives live unit progress; the engine installs one per unit."""
 
     def progress(
         self, ctx: Ctx[Any, Any], iterable: Iterable[T], total: int | None, desc: str | None
@@ -26,10 +24,7 @@ class CtxSink(Protocol):
 
 
 class NullSink:
-    """Default sink: metrics are only kept on the context, progress passes through."""
-
-    def metric(self, ctx: Ctx[Any, Any], values: Mapping[str, Any]) -> None:
-        return None
+    """Default sink: progress passes through."""
 
     def progress(
         self, ctx: Ctx[Any, Any], iterable: Iterable[T], total: int | None, desc: str | None
@@ -86,7 +81,6 @@ class Ctx(Generic[C, A]):
         """Record unit metrics (merged); ``items=N`` drives throughput views."""
 
         self.metrics.update(values)
-        self._sink.metric(self, values)
 
     def progress(
         self, iterable: Iterable[T], total: int | None = None, desc: str | None = None

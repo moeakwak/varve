@@ -3,34 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
 from pathlib import Path
 
-from pydantic import ValidationError
-
-from varve.cli import argmap, render
-from varve.engine.probe import ProbeError
-from varve.engine.refs import RefResolutionError
-from varve.engine.resources import ResourceError
-from varve.graph import GraphError
+from varve.cli import argmap, common, render
 from varve.log import configure_cli_logging
 from varve.pipeline import Pipeline
-from varve.store.db import SchemaError
-from varve.store.lock import LockBusyError
 from varve.style import make_console
-
-USER_ERRORS = (
-    ValueError,
-    GraphError,
-    ProbeError,
-    RefResolutionError,
-    ResourceError,
-    SchemaError,
-    LockBusyError,
-    FileNotFoundError,
-    sqlite3.OperationalError,
-)
 
 
 def _common() -> argparse.ArgumentParser:
@@ -54,10 +33,6 @@ def _common() -> argparse.ArgumentParser:
     return common
 
 
-def _add_branch(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--branch", default="main", metavar="NAME", help="Branch (default: main).")
-
-
 def _add_selection(parser: argparse.ArgumentParser, verb: str) -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--only", metavar="STAGE", help=f"{verb} only this stage.")
@@ -68,16 +43,16 @@ def _add_selection(parser: argparse.ArgumentParser, verb: str) -> None:
 
 
 def build_parser(pipeline: type[Pipeline]) -> argparse.ArgumentParser:
-    common = _common()
+    shared = _common()
     parser = argparse.ArgumentParser(
         prog=_prog(pipeline),
-        parents=[common],
+        parents=[shared],
         description=(pipeline.__doc__ or "").strip().splitlines()[0] if pipeline.__doc__ else None,
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    run = commands.add_parser("run", parents=[common], help="Run stages whose units are not hits.")
-    _add_branch(run)
+    run = commands.add_parser("run", parents=[shared], help="Run stages whose units are not hits.")
+    common.add_branch(run)
     run.add_argument(
         "--override", metavar="JSON", help="Merge JSON over main's Config (temporary branch)."
     )
@@ -114,36 +89,29 @@ def build_parser(pipeline: type[Pipeline]) -> argparse.ArgumentParser:
     )
     argmap.register_args(run, pipeline.Args)
 
-    status = commands.add_parser("status", parents=[common], help="Show stage and unit decisions.")
+    status = commands.add_parser("status", parents=[shared], help="Show stage and unit decisions.")
     status.add_argument("selector", nargs="?", metavar="STAGE[@AXIS=ID,...]")
-    _add_branch(status)
-    status.add_argument("--expand", action="store_true", help="List every unit.")
-    status.add_argument("--rehash", action="store_true", help="Verify artifacts by content hash.")
+    common.add_status_args(status)
     argmap.register_args(status, pipeline.Args)
 
-    plan = commands.add_parser("plan", parents=[common], help="Show the stage DAG with decisions.")
+    plan = commands.add_parser("plan", parents=[shared], help="Show the stage DAG with decisions.")
     _add_selection(plan, "Show")
-    _add_branch(plan)
+    common.add_branch(plan)
     plan.add_argument("--rehash", action="store_true", help="Verify artifacts by content hash.")
     argmap.register_args(plan, pipeline.Args)
 
-    commands.add_parser("ls", parents=[common], help="List stages and branches.")
+    commands.add_parser("ls", parents=[shared], help="List stages and branches.")
 
-    clean = commands.add_parser("clean", parents=[common], help="Remove managed outputs.")
-    clean.add_argument("--branch", metavar="NAME", help="Only this branch.")
-    clean.add_argument("--storage", metavar="NAME", help="Only this storage.")
-    clean.add_argument("--orphans", action="store_true", help="Only orphaned units.")
-    clean.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation.")
+    clean = commands.add_parser("clean", parents=[shared], help="Remove managed outputs.")
+    common.add_clean_args(clean)
 
-    inspect = commands.add_parser("inspect", parents=[common], help="Explain one unit.")
+    inspect = commands.add_parser("inspect", parents=[shared], help="Explain one unit.")
     inspect.add_argument("selector", metavar="STAGE[@AXIS=ID,...]")
-    _add_branch(inspect)
-    inspect.add_argument("--sources", action="store_true", help="List the stage's source closure.")
-    inspect.add_argument("--log", action="store_true", help="Print the unit's captured log.")
+    common.add_inspect_args(inspect)
 
-    reuse = commands.add_parser("reuse", parents=[common], help="Accept a stage's source change.")
+    reuse = commands.add_parser("reuse", parents=[shared], help="Accept a stage's source change.")
     reuse.add_argument("stage", metavar="STAGE")
-    _add_branch(reuse)
+    common.add_branch(reuse)
     return parser
 
 
@@ -160,60 +128,29 @@ def main(pipeline: type[Pipeline], argv: list[str] | None = None) -> int:
     ns = parser.parse_args(raw)
     verbose = getattr(ns, "verbose", False)
     configure_cli_logging(verbose, quiet=ns.command != "run")
-    console = make_console()
-    errors = make_console(stderr=True)
     root: Path | None = getattr(ns, "root", None)
-    try:
-        return _dispatch(pipeline, ns, raw, root, console)
-    except ValidationError as error:
-        errors.print(f"[red]error:[/] invalid configuration or arguments\n{error}", soft_wrap=True)
-        return 1
-    except USER_ERRORS as error:
-        errors.print("[red]error:[/] ", end="")
-        errors.print(str(error), markup=False, highlight=False, soft_wrap=True)
-        return 1
+    return common.report_errors(lambda: _dispatch(pipeline, ns, raw, root, make_console()))
 
 
 def _dispatch(
     pipeline: type[Pipeline], ns: argparse.Namespace, raw: list[str], root: Path | None, console
 ) -> int:
-    from varve.engine.service import (
-        inspect_pipeline,
-        parse_unit_selector,
-        probe_pipeline,
-        reuse_stage,
-        run_pipeline,
-    )
+    from varve.engine.service import probe_pipeline, run_pipeline
 
     command = ns.command
     if command == "ls":
         render.render_ls(console, pipeline, root)
         return 0
     if command == "clean":
-        return _clean(pipeline, ns, root, console)
+        return common.clean_command(console, pipeline, ns, root=root)
     if command == "reuse":
-        result = reuse_stage(pipeline, ns.stage, branch=ns.branch, root=root)
-        render.render_reuse(console, result)
-        return 0
+        return common.reuse_command(console, pipeline, ns.stage, ns, root=root)
     if command == "inspect":
-        result = inspect_pipeline(pipeline, ns.selector, branch=ns.branch, root=root)
-        render.render_inspect(console, result, sources=ns.sources, log=ns.log)
-        return 0
+        return common.inspect_command(console, pipeline, ns.selector, ns, root=root)
 
     args = argmap.model_from_namespace(ns, pipeline.Args)
     if command == "status":
-        stage, coords = parse_unit_selector(ns.selector) if ns.selector else (None, {})
-        view = probe_pipeline(
-            pipeline,
-            branch=ns.branch,
-            stages=[stage] if stage else None,
-            args=args,
-            root=root,
-            rehash=ns.rehash,
-            expand=bool(ns.expand or stage),
-        )
-        render.render_status(console, view, coords=coords, expand=ns.expand or bool(stage))
-        return 0
+        return common.status_command(console, pipeline, ns.selector, ns, args=args, root=root)
     if command == "plan":
         view = probe_pipeline(pipeline, branch=ns.branch, args=args, root=root, rehash=ns.rehash)
         render.render_plan(
@@ -251,32 +188,3 @@ def _dispatch(
     )
     render.render_run_summary(console, result)
     return result.exit_code
-
-
-def _clean(pipeline: type[Pipeline], ns: argparse.Namespace, root: Path | None, console) -> int:
-    from varve.engine.service import clean_pipeline, plan_clean
-
-    def call(function):
-        return function(
-            pipeline, root=root, branch=ns.branch, storage=ns.storage, orphans=ns.orphans
-        )
-
-    plan = call(plan_clean)
-    if not plan.paths and not plan.rows:
-        console.print(f"Nothing to clean for {plan.description}.")
-        return 0
-    render.render_clean_plan(console, plan)
-    if not ns.yes and not _confirm("Remove these?"):
-        console.print("Aborted.")
-        return 1
-    done = call(clean_pipeline)
-    console.print(f"Removed {len(done.paths)} path(s) and {done.rows} unit row(s).")
-    return 0
-
-
-def _confirm(message: str) -> bool:
-    try:
-        answer = input(f"{message} [y/N] ").strip().lower()
-    except EOFError:
-        return False
-    return answer in ("y", "yes")

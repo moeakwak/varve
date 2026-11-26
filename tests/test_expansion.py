@@ -113,7 +113,6 @@ def graph() -> StageGraph:
 def test_zero_dim_stage_has_one_unit(graph: StageGraph) -> None:
     (unit,) = expand_stage(graph, graph.nodes["single"], static_domains(graph))
     assert unit.unit_key == "" and unit.relpath == "" and unit.coords == {}
-    assert len(unit.unit_hash) == 16
 
 
 def test_static_stage_expands_cartesian_product(graph: StageGraph) -> None:

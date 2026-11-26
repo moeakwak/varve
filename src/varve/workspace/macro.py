@@ -35,7 +35,6 @@ from varve.workspace.discovery import (
     resolve_entry,
 )
 from varve.workspace.modules import ensure_on_path, load_pipeline, locate_module
-from varve.workspace.refs import WorkspaceRefResolver
 
 
 class MacroError(ValueError):
@@ -135,7 +134,6 @@ class Node:
     entry: Entry
     pipeline: type[Pipeline]
     branch: str
-    manual: bool
     branch_index: int
 
     @property
@@ -189,7 +187,7 @@ def build_plan(
         label = f"{entry.name}@{name}"
         if label not in nodes:
             index = list(branches).index(name) if name in branches else len(branches)
-            nodes[label] = Node(entry, pipeline, name, branches.get(name, False), index)
+            nodes[label] = Node(entry, pipeline, name, index)
             why[label] = reason
         return nodes[label]
 
@@ -426,7 +424,6 @@ def run_plan(
                 args=plan.sets.get(label) or None,
                 options=RunOptions(force=force, rehash=rehash, tui=tui, argv=list(argv or ())),
                 root=workspace.root_for(node.entry, node.pipeline),
-                refs=WorkspaceRefResolver(workspace.settings),
                 workspace=workspace.settings,
             )
         except errors as error:

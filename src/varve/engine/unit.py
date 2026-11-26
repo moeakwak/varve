@@ -14,7 +14,7 @@ import shutil
 import sys
 import time
 import traceback
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import AsyncExitStack, ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +24,7 @@ from varve.axis import Cell
 from varve.context import Ctx, CtxSink
 from varve.dependencies import DepCtx
 from varve.engine.capture import fd_output, unit_output
-from varve.engine.resources import recording_ctx
+from varve.engine.resources import enter_any, enter_sync, open_manager
 from varve.graph import StageNode
 from varve.keying.config_access import ConfigAccess, merge_access, record_config
 from varve.keying.fingerprint import ArtifactFingerprint, artifact_fingerprint, walk_files
@@ -89,9 +89,14 @@ class WorkerState:
             self.config, self.args, self.branch, self.node.name, self.root, cell or Cell()
         )
 
-    def unit_resources(self, cell: Cell) -> list[Resource[Any]]:
-        resources = self.node.resources_for(DepCtx(self.config, cell))
-        return [resource for resource in resources if resource.scope == "unit"]
+    def unit_managers(
+        self, cell: Cell, access: ConfigAccess
+    ) -> Iterator[tuple[Resource[Any], Any]]:
+        """Open each unit-scope resource of ``cell`` in turn (Config reads go to ``access``)."""
+
+        for resource in self.node.resources_for(DepCtx(self.config, cell)):
+            if resource.scope == "unit" and resource.open is not None:
+                yield resource, open_manager(resource, self.run_ctx(cell), access)
 
     def unit_access(self, job: UnitJob, access: ConfigAccess) -> list[str] | None:
         """The unit's own Config reads plus those of the shared resources it uses."""
@@ -165,6 +170,25 @@ def _failure(job: UnitJob, error: BaseException, started: float, ctx: Ctx[Any, A
     )
 
 
+def _success(
+    state: WorkerState,
+    job: UnitJob,
+    started: float,
+    ctx: Ctx[Any, Any],
+    access: ConfigAccess,
+    artifact: ArtifactFingerprint,
+) -> UnitOutcome:
+    return UnitOutcome(
+        job.unit_key,
+        ok=True,
+        duration_ms=_elapsed_ms(started),
+        metrics=dict(ctx.metrics),
+        config_access=state.unit_access(job, access),
+        artifact=artifact,
+        peak_rss_mb=peak_rss_mb() if state.process_worker else None,
+    )
+
+
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
@@ -187,17 +211,17 @@ def execute(state: WorkerState, job: UnitJob) -> UnitOutcome:
         job.staging.mkdir(parents=True, exist_ok=False)
         with capture(job.log_path), ExitStack() as stack:
             ctx = _ctx(state, job, access)
-            sessions: dict[str, Any] = {}
-            for resource in state.unit_resources(job.cell):
-                if resource.open is None:
-                    continue
-                manager = resource.open(recording_ctx(state.run_ctx(job.cell), access))
-                if not hasattr(manager, "__enter__"):
-                    raise TypeError(
+            sessions = {
+                resource.name: enter_sync(
+                    stack,
+                    manager,
+                    TypeError(
                         f"Resource {resource.name!r} (scope='unit') returned an async context "
                         f"manager; stage {job.stage!r} is not async"
-                    )
-                sessions[resource.name] = stack.enter_context(manager)  # type: ignore[arg-type]
+                    ),
+                )
+                for resource, manager in state.unit_managers(job.cell, access)
+            }
             method = getattr(state.instance, job.stage)
             _check_return(job.stage, method(**_kwargs(state, job, ctx, sessions)))
         artifact = finalize_staging(job.staging, state.node)
@@ -206,15 +230,7 @@ def execute(state: WorkerState, job: UnitJob) -> UnitOutcome:
             shutil.rmtree(job.staging, ignore_errors=True)
             raise
         return _failure(job, error, started, ctx)
-    return UnitOutcome(
-        job.unit_key,
-        ok=True,
-        duration_ms=_elapsed_ms(started),
-        metrics=dict(ctx.metrics),
-        config_access=state.unit_access(job, access),
-        artifact=artifact,
-        peak_rss_mb=peak_rss_mb() if state.process_worker else None,
-    )
+    return _success(state, job, started, ctx, access, artifact)
 
 
 async def execute_async(state: WorkerState, job: UnitJob) -> UnitOutcome:
@@ -230,16 +246,10 @@ async def execute_async(state: WorkerState, job: UnitJob) -> UnitOutcome:
         with unit_output(job.log_path):
             async with AsyncExitStack() as stack:
                 ctx = _ctx(state, job, access)
-                sessions: dict[str, Any] = {}
-                for resource in state.unit_resources(job.cell):
-                    if resource.open is None:
-                        continue
-                    manager = resource.open(recording_ctx(state.run_ctx(job.cell), access))
-                    if hasattr(manager, "__aenter__"):
-                        session = await stack.enter_async_context(manager)  # type: ignore[arg-type]
-                    else:
-                        session = stack.enter_context(manager)  # type: ignore[arg-type]
-                    sessions[resource.name] = session
+                sessions = {
+                    resource.name: await enter_any(stack, manager)
+                    for resource, manager in state.unit_managers(job.cell, access)
+                }
                 method = getattr(state.instance, job.stage)
                 _check_return(job.stage, await method(**_kwargs(state, job, ctx, sessions)))
         artifact = await asyncio.to_thread(finalize_staging, job.staging, state.node)
@@ -248,14 +258,7 @@ async def execute_async(state: WorkerState, job: UnitJob) -> UnitOutcome:
         raise
     except Exception as error:
         return _failure(job, error, started, ctx)
-    return UnitOutcome(
-        job.unit_key,
-        ok=True,
-        duration_ms=_elapsed_ms(started),
-        metrics=dict(ctx.metrics),
-        config_access=state.unit_access(job, access),
-        artifact=artifact,
-    )
+    return _success(state, job, started, ctx, access, artifact)
 
 
 def finalize_staging(staging: Path, node: StageNode) -> ArtifactFingerprint:

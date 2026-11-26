@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -26,7 +28,6 @@ CREATE TABLE IF NOT EXISTS storages (
 
 CREATE TABLE IF NOT EXISTS branches (
     branch_id        TEXT PRIMARY KEY,
-    name             TEXT NOT NULL UNIQUE,
     is_temp          INTEGER NOT NULL DEFAULT 0,
     manual           INTEGER NOT NULL DEFAULT 0,
     config_json      TEXT NOT NULL,
@@ -269,6 +270,21 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
 
 def read_meta(conn: sqlite3.Connection) -> dict[str, str]:
     return {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM meta")}
+
+
+def load_graph(meta: Mapping[str, str]) -> dict[str, Any] | None:
+    """The logical graph recorded in ``meta.graph_json`` (``None`` when absent or unreadable)."""
+
+    raw = meta.get("graph_json")
+    if not raw:
+        return None
+    try:
+        graph = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(graph, dict) or not isinstance(graph.get("stages"), list):
+        return None
+    return graph
 
 
 def write_meta(conn: sqlite3.Connection, values: Mapping[str, str]) -> None:

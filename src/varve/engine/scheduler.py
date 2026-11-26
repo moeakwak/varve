@@ -13,8 +13,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 J = TypeVar("J")
 R = TypeVar("R")
@@ -45,13 +44,6 @@ class StopFlag:
         return self._requested
 
 
-@dataclass
-class WindowResult(Generic[J]):
-    halted: HaltReason | None
-    not_started: list[J]
-    failures: int
-
-
 async def run_window(
     jobs: Sequence[J],
     submit: Callable[[J], Awaitable[R]],
@@ -65,8 +57,10 @@ async def run_window(
     on_started: Callable[[], None] | None = None,
     on_tick: Callable[[], None] | None = None,
     should_halt: Callable[[], HaltReason | None] | None = None,
-) -> WindowResult[J]:
+) -> HaltReason | None:
     """Run ``jobs`` through ``submit``; ``on_done`` returns whether the job failed.
+
+    Returns why submissions stopped early (``None`` when every job ran).
 
     ``on_started`` runs after a batch of jobs was started and before any of
     them gets to run (the submitted coroutines only start at the next await).
@@ -120,7 +114,7 @@ async def run_window(
             halted = should_halt()
         if on_tick is not None:
             on_tick()
-    return WindowResult(halted, list(pending), failures)
+    return halted
 
 
 def _abandon(active: dict[asyncio.Task[Any], Any]) -> None:

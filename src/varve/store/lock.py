@@ -21,10 +21,9 @@ class LockBusyError(RuntimeError):
 
 
 class FileLock:
-    def __init__(self, path: Path, *, exclusive: bool, blocking: bool = False) -> None:
+    def __init__(self, path: Path, *, exclusive: bool) -> None:
         self.path = path
         self.exclusive = exclusive
-        self.blocking = blocking
         self._fd: int | None = None
 
     def acquire(self) -> FileLock:
@@ -32,9 +31,7 @@ class FileLock:
             raise RuntimeError(f"Lock already held: {self.path}")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
-        flags = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
-        if not self.blocking:
-            flags |= fcntl.LOCK_NB
+        flags = (fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
         try:
             fcntl.flock(fd, flags)
         except OSError as error:
@@ -56,10 +53,6 @@ class FileLock:
         finally:
             os.close(self._fd)
             self._fd = None
-
-    @property
-    def held(self) -> bool:
-        return self._fd is not None
 
     def __enter__(self) -> FileLock:
         return self.acquire()

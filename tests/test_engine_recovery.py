@@ -15,7 +15,7 @@ from varve.engine.housekeeping import recover
 from varve.engine.session import open_session
 from varve.store import layout
 from varve.store.db import connect, read_meta
-from varve.store.repo import Repo, RunRow, StageRunRow
+from varve.store.repo import RunRow, StageRunRow
 
 SOURCE = """
 import time
@@ -49,10 +49,6 @@ if __name__ == "__main__":
 """
 
 
-def _repo(ws, readonly: bool = True) -> Repo:
-    return Repo(connect(layout.state_db_path(ws.root), readonly=readonly))
-
-
 def test_recovery_restores_old_dirs_and_removes_staging(ws) -> None:
     Demo = ws.write(SOURCE)
     first = ws.run(Demo)
@@ -62,8 +58,8 @@ def test_recovery_restores_old_dirs_and_removes_staging(ws) -> None:
     staging = ws.root / "out/.staging/crashed/work/0123456789abcdef"
     staging.mkdir(parents=True)
     (staging / "partial").write_text("x")
-    repo = _repo(ws, readonly=False)
-    repo.set_status("main", "work", ["item=a"], "running")
+    repo = ws.repo(readonly=False)
+    repo.conn.execute("UPDATE units SET status = 'running' WHERE unit_key = 'item=a'")
     repo.insert_run(RunRow("crashed", "main", "2026-01-01T00:00:00", "running", [], "host"))
     repo.put_stage_run(StageRunRow("crashed", "main", "work", "running", 0, 0, 0, 3, 1, 0, "x"))
     repo.conn.close()
@@ -77,10 +73,10 @@ def test_recovery_restores_old_dirs_and_removes_staging(ws) -> None:
     assert (final / "v.txt").read_text() == "a"
     assert not (ws.root / "out/.staging/crashed").exists()
     assert any("restored work@item=a" in note for note in notes)
-    repo = _repo(ws)
-    run = repo.get_run("crashed")
-    assert run is not None and run.status == "interrupted"
-    crashed = [row for row in repo.stage_runs("main") if row.run_id == "crashed"]
+    repo = ws.repo()
+    run = next(run for run in repo.runs("main") if run.run_id == "crashed")
+    assert run.status == "interrupted"
+    crashed = [row for row in ws.stage_runs(repo) if row.run_id == "crashed"]
     assert [row.status for row in crashed] == ["interrupted"]
     repo.conn.close()
 
@@ -92,8 +88,8 @@ def test_recovery_restores_old_dirs_and_removes_staging(ws) -> None:
 def test_running_row_reads_as_interrupted(ws, capsys) -> None:
     Demo = ws.write(SOURCE)
     ws.run(Demo)
-    repo = _repo(ws, readonly=False)
-    repo.set_status("main", "work", ["item=b"], "running")
+    repo = ws.repo(readonly=False)
+    repo.conn.execute("UPDATE units SET status = 'running' WHERE unit_key = 'item=b'")
     repo.conn.close()
     assert ws.cli(Demo, "status", "work", "--expand") == 0
     assert "interrupted" in capsys.readouterr().out
@@ -103,7 +99,7 @@ def test_bookkeeping_rows_and_graph_meta(ws) -> None:
     Demo = ws.write(SOURCE)
     events = []
     result = ws.run(Demo, on_event=events.append)
-    repo = _repo(ws)
+    repo = ws.repo()
     meta = read_meta(repo.conn)
     graph = json.loads(meta["graph_json"])
     assert [stage["name"] for stage in graph["stages"]] == ["work", "merge"]
@@ -115,7 +111,7 @@ def test_bookkeeping_rows_and_graph_meta(ws) -> None:
     assert meta["module"] == ws.module and meta["qualname"] == "Demo"
     runs = repo.runs("main")
     assert [run.status for run in runs] == ["ok"]
-    stage_runs = {row.stage_name: row for row in repo.stage_runs("main")}
+    stage_runs = {row.stage_name: row for row in ws.stage_runs(repo)}
     assert stage_runs["work"].total_units == 3 and stage_runs["work"].status == "ok"
     assert stage_runs["work"].metrics_summary == {"items": 9}
     assert stage_runs["merge"].hit_units == 0 and stage_runs["merge"].executed_units == 1
@@ -153,22 +149,12 @@ def test_first_sigint_finishes_active_unit_and_stops(ws) -> None:
         json.dumps({"main": {"config": {"marker_dir": str(markers), "sleep": 0.6}}})
     )
     ws.write(SOURCE)
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
-    proc = subprocess.Popen(
-        [sys.executable, str(ws.path), "run", "--no-tui", "--root", str(ws.root)],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    deadline = time.monotonic() + 20
-    while not (markers / "started-a").exists():
-        assert time.monotonic() < deadline and proc.poll() is None, proc.communicate()
-        time.sleep(0.02)
+    proc = ws.spawn_run(capture=True)
+    ws.wait_for(markers / "started-a", proc)
     proc.send_signal(signal.SIGINT)
     _, stderr = proc.communicate(timeout=20)
     assert proc.returncode == 130, stderr
-    repo = _repo(ws)
+    repo = ws.repo()
     units = repo.units("main", "work")
     assert {key: row.status for key, row in units.items()} == {"item=a": "ok"}
     [run] = repo.runs("main")
@@ -237,7 +223,7 @@ def test_unexpected_commit_errors_fail_the_unit_not_the_run(ws, monkeypatch) -> 
     result = ws.run(Demo)
     assert result.status == "failed"
     assert result.stages["work"].failed == 3
-    repo = _repo(ws)
+    repo = ws.repo()
     rows = repo.units("main", "work")
     assert {row.status for row in rows.values()} == {"failed"}
     assert all(
@@ -325,30 +311,12 @@ def test_cross_branch_link_rechecks_a_source_replaced_meanwhile(ws, monkeypatch)
     result = ws.run(Demo, branch="other")
     assert result.status == "ok"
     assert (result.stages["work"].linked, result.stages["work"].executed) == (0, 3)
-    repo = _repo(ws)
+    repo = ws.repo()
     for row in repo.units("other", "work").values():
         assert row.linked_from is None and row.artifact_manifest is not None
         unit_dir = (ws.root / "out" / (row.artifact_relpath or "")).parent
         assert verify_manifest(unit_dir, row.artifact_manifest, rehash=True)
     repo.conn.close()
-
-
-def _popen_cli(ws, *argv: str) -> subprocess.Popen[str]:
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
-    return subprocess.Popen(
-        [sys.executable, str(ws.path), "run", "--no-tui", "--root", str(ws.root), *argv],
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-
-
-def _wait_for(path, proc) -> None:
-    deadline = time.monotonic() + 20
-    while not path.exists():
-        assert time.monotonic() < deadline and proc.poll() is None
-        time.sleep(0.02)
 
 
 def test_kill_9_mid_run_is_recovered_by_the_next_run(ws) -> None:
@@ -360,15 +328,15 @@ def test_kill_9_mid_run_is_recovered_by_the_next_run(ws) -> None:
     markers.mkdir()
     config = {"marker_dir": str(markers), "sleep": 0.3}
     (ws.src / "varve.yaml").write_text(json.dumps({"main": {"config": config}}))
-    proc = _popen_cli(ws)  # a config change: every unit dir is replaced via `.old-*`
-    _wait_for(markers / "started-b", proc)
+    proc = ws.spawn_run()  # a config change: every unit dir is replaced via `.old-*`
+    ws.wait_for(markers / "started-b", proc)
     proc.kill()
     proc.wait()
 
     result = ws.run(Demo)
     assert result.status == "ok"
     assert result.stages["work"].executed >= 2  # b (killed mid-unit) and c rerun
-    repo = _repo(ws)
+    repo = ws.repo()
     assert [run.status for run in repo.runs("main")] == ["ok", "interrupted", "ok"]
     for stage in ("work", "merge"):
         for row in repo.units("main", stage).values():
@@ -438,8 +406,8 @@ def test_process_workers_exit_when_the_run_process_is_killed(ws) -> None:
         json.dumps({"main": {"config": {"marker_dir": str(markers)}}})
     )
     ws.write(PROCESS_WORKERS)
-    proc = _popen_cli(ws)
-    _wait_for(markers / "started-i1", proc)
+    proc = ws.spawn_run()
+    ws.wait_for(markers / "started-i1", proc)
     children = _children(proc.pid)
     assert children
     proc.kill()
@@ -463,7 +431,7 @@ def test_run_records_the_git_commit_of_the_pipeline_checkout(ws, tmp_path, monke
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)  # not a git checkout
     result = ws.run(Demo)
-    repo = _repo(ws)
-    run = repo.get_run(result.run_id)
+    repo = ws.repo()
+    (run,) = repo.runs("main")
     repo.conn.close()
-    assert run is not None and run.git_commit == head and run.git_dirty is False
+    assert run.run_id == result.run_id and run.git_commit == head and run.git_dirty is False

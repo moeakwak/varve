@@ -19,7 +19,7 @@ from varve.ref import Ref
 from varve.store import layout
 from varve.store.db import connect
 from varve.store.repo import Repo
-from varve.style import STATUS_STYLES, format_ms, format_timestamp, status_text
+from varve.style import STATUS_STYLES, branch_cells, format_ms, format_timestamp, status_text
 
 if TYPE_CHECKING:  # the engine is imported by the commands that produce these views
     from varve.engine.clean import CleanPlan
@@ -164,16 +164,7 @@ def render_plan(
     upto: str | None = None,
     downstream: str | None = None,
 ) -> None:
-    selected = list(graph.order)
-    for name in (only, upto, downstream):
-        if name is not None and name not in graph.nodes:
-            raise ValueError(f"Unknown stage {name!r}; stages: {selected}")
-    if only:
-        selected = [only]
-    elif upto:
-        selected = [*graph.ancestors(upto), upto]
-    elif downstream:
-        selected = [downstream, *graph.descendants(downstream)]
+    selected = graph.select(only=only, upto=upto, downstream=downstream)
     stages = [view.stage(name) for name in selected]
     console.print(_header("Plan", view))
     console.print()
@@ -310,28 +301,16 @@ def render_ls(console: Console, pipeline: type[Pipeline], root: Path | None) -> 
         return
     repo = Repo(connect(db_path, readonly=True))
     try:
-        branches = Table(title="Branches", title_justify="left", box=rich_box.SIMPLE_HEAD)
-        for column in ("Branch", "Kind", "Units", "Last run"):
-            branches.add_column(column)
-        for row in repo.list_branches():
-            counts: dict[str, int] = {}
-            for by_status in repo.unit_counts(row.branch_id).values():
-                for status, count in by_status.items():
-                    counts[status] = counts.get(status, 0) + count
-            units = Text(", ".join(f"{count} {status}" for status, count in sorted(counts.items())))
-            runs = repo.runs(row.branch_id, limit=1)
-            last = Text("-")
-            if runs:
-                run = runs[0]
-                last = status_text(run.status) + Text(
-                    f" {format_timestamp(run.started_at)} · {format_ms(run.total_wall_ms)}",
-                    style="dim",
-                )
-            kind = "temporary" if row.is_temp else "manual" if row.manual else "persistent"
-            branches.add_row(row.name, kind, units, last)
-        console.print(branches)
+        summaries = repo.branch_summaries()
     finally:
         repo.conn.close()
+    branches = Table(title="Branches", title_justify="left", box=rich_box.SIMPLE_HEAD)
+    for column in ("Branch", "Kind", "Units", "Last run"):
+        branches.add_column(column)
+    for branch in summaries:
+        kind = "temporary" if branch.is_temp else "manual" if branch.manual else "persistent"
+        branches.add_row(branch.name, kind, *branch_cells(branch))
+    console.print(branches)
 
 
 # -- inspect -------------------------------------------------------------------

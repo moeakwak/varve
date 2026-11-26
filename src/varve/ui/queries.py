@@ -18,14 +18,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from varve.store.db import connect
+from varve.keying.keys import SEGMENTS
+from varve.store.db import connect, load_graph, read_meta
 from varve.store.layout import unit_log_path
 from varve.store.repo import expand_components
 
 #: Source of state databases: a fixed list or a callable re-evaluated on refresh.
 DbSource = Iterable[Path] | Callable[[], Iterable[Path]]
 
-SEGMENTS = ("config", "upstream", "inputs", "values", "version")
 UNIT_STATUSES = ("running", "ok", "failed", "orphaned")
 EMPTY_UNIT_KEY = "_"  # URL token for the unit of a stage without axes
 LOG_TAIL_BYTES = 64 * 1024
@@ -35,7 +35,7 @@ MAX_PAGE_SIZE = 500
 _UNIT_LIST_COLUMNS = (
     "unit_key, status, duration_ms, peak_rss_mb, artifact_files, artifact_bytes, "
     "error_type, error_summary, last_run_id, updated_at, "
-    "reused_source_fp IS NOT NULL AS reused, {linked} AS linked_from"
+    "reused_source_fp IS NOT NULL AS reused, linked_from"
 )
 _SORTS = {
     "key": "rowid",
@@ -201,48 +201,12 @@ def _row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _branch(conn: sqlite3.Connection, name: str) -> dict[str, Any]:
-    found = conn.execute("SELECT * FROM branches WHERE name = ?", (name,)).fetchone()
+    found = conn.execute(
+        "SELECT *, branch_id AS name FROM branches WHERE branch_id = ?", (name,)
+    ).fetchone()
     if found is None:
         raise NotFoundError(f"unknown branch {name!r}")
     return _row(found)
-
-
-def _linked(conn: sqlite3.Connection) -> str:
-    """``units.linked_from`` (hardlink reuse source branch), ``NULL`` on older databases."""
-
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(units)")}
-    return "linked_from" if "linked_from" in columns else "NULL"
-
-
-def load_graph(meta: dict[str, str]) -> dict[str, Any] | None:
-    """The logical stage graph recorded by the engine in ``meta.graph_json``."""
-
-    raw = meta.get("graph_json")
-    if not raw:
-        return None
-    try:
-        graph = json.loads(raw)
-    except ValueError:
-        return None
-    if not isinstance(graph, dict) or not isinstance(graph.get("stages"), list):
-        return None
-    return graph
-
-
-def _deps(stage: dict[str, Any]) -> list[dict[str, str]]:
-    """Normalize ``deps`` given as names or ``{stage, kind}`` objects."""
-
-    out: list[dict[str, str]] = []
-    for dep in stage.get("deps") or []:
-        if isinstance(dep, str):
-            out.append({"stage": dep, "kind": "data"})
-        elif isinstance(dep, dict) and isinstance(dep.get("stage"), str):
-            out.append({"stage": dep["stage"], "kind": str(dep.get("kind") or "data")})
-    return out
-
-
-def _run_summary(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    return None if row is None else _row(row)
 
 
 def _tail(path: Path, limit: int) -> tuple[str, bool, int]:
@@ -286,7 +250,8 @@ def workspace(registry: Registry) -> dict[str, Any]:
 def _workspace_branches(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     branches: dict[str, dict[str, Any]] = {}
     for row in conn.execute(
-        "SELECT branch_id, name, is_temp, manual, updated_at FROM branches ORDER BY name"
+        "SELECT branch_id, branch_id AS name, is_temp, manual, updated_at FROM branches "
+        "ORDER BY branch_id"
     ):
         branches[row["branch_id"]] = {
             **_row(row),
@@ -387,7 +352,7 @@ def _ref_edges(
 
 def branch_detail(pipe: PipelineDb, branch_name: str) -> dict[str, Any]:
     with open_ro(pipe.path) as conn:
-        meta = {row[0]: row[1] for row in conn.execute("SELECT key, value FROM meta")}
+        meta = read_meta(conn)
         branch = _branch(conn, branch_name)
         bid = branch["branch_id"]
         counts: dict[str, dict[str, int]] = {}
@@ -397,7 +362,6 @@ def branch_detail(pipe: PipelineDb, branch_name: str) -> dict[str, Any]:
             (bid,),
         ):
             counts.setdefault(row[0], {})[row[1]] = row[2]
-        linked = _linked(conn)
         sums = {
             row["stage_name"]: _row(row)
             for row in conn.execute(
@@ -405,9 +369,9 @@ def branch_detail(pipe: PipelineDb, branch_name: str) -> dict[str, Any]:
                 "COALESCE(SUM(CASE WHEN status != 'orphaned' THEN artifact_bytes END), 0) "
                 "  AS artifact_bytes, "
                 "SUM(reused_source_fp IS NOT NULL) AS reused_units, "
-                f"SUM({linked} IS NOT NULL) AS linked_units, "
-                f"GROUP_CONCAT(DISTINCT {linked}) AS linked_from, "
-                "MAX(updated_at) AS updated_at, MIN(rowid) AS first_rowid "
+                "SUM(linked_from IS NOT NULL) AS linked_units, "
+                "GROUP_CONCAT(DISTINCT linked_from) AS linked_from, "
+                "MAX(updated_at) AS updated_at "
                 "FROM units WHERE branch_id = ? GROUP BY stage_name",
                 (bid,),
             )
@@ -421,16 +385,6 @@ def branch_detail(pipe: PipelineDb, branch_name: str) -> dict[str, Any]:
                 (bid,),
             )
         }
-        backbone = [
-            row[0]
-            for row in conn.execute(
-                "SELECT stage_name FROM stage_runs WHERE run_id = ("
-                "  SELECT run_id FROM stage_runs WHERE branch_id = ? GROUP BY run_id "
-                "  ORDER BY COUNT(*) DESC, MAX(finished_at) DESC LIMIT 1) "
-                "ORDER BY finished_at",
-                (bid,),
-            )
-        ]
         active = _active_runs(conn, bid)
         last_run = conn.execute(
             "SELECT * FROM runs WHERE branch_id = ? ORDER BY started_at DESC LIMIT 1", (bid,)
@@ -439,27 +393,17 @@ def branch_detail(pipe: PipelineDb, branch_name: str) -> dict[str, Any]:
             row[0]: row[1] for row in conn.execute("SELECT storage_name, root_path FROM storages")
         }
 
-    graph = load_graph(meta)
-    known = set(counts) | set(last_stage_runs)
-    stages: list[dict[str, Any]] = []
-    edges: list[dict[str, str]] = []
-    if graph is not None:
-        for spec in graph["stages"]:
-            if isinstance(spec, dict) and isinstance(spec.get("name"), str):
-                stages.append({**spec, "deps": _deps(spec), "declared": True})
-        declared = {stage["name"] for stage in stages}
-        for name in sorted(known - declared):  # stages removed from the code
-            stages.append({"name": name, "deps": [], "declared": False})
-        names = {stage["name"] for stage in stages}
-        for stage in stages:
-            for dep in stage["deps"]:
-                if dep["stage"] in names:
-                    edges.append({"from": dep["stage"], "to": stage["name"], "kind": dep["kind"]})
-    else:
-        # Within one run stages finish in topological order (stage barrier).
-        order = list(dict.fromkeys(backbone))
-        rest = sorted(known - set(order), key=lambda s: sums.get(s, {}).get("first_rowid") or 0)
-        stages = [{"name": name, "deps": [], "declared": None} for name in order + rest]
+    graph = load_graph(meta) or {"stages": []}  # the engine records it at every run
+    stages: list[dict[str, Any]] = [{**spec, "declared": True} for spec in graph["stages"]]
+    declared = {stage["name"] for stage in stages}
+    for name in sorted((set(counts) | set(last_stage_runs)) - declared):  # removed from the code
+        stages.append({"name": name, "deps": [], "declared": False})
+    edges = [
+        {"from": dep["stage"], "to": stage["name"], "kind": dep["kind"]}
+        for stage in stages
+        for dep in stage["deps"]
+        if dep["stage"] in declared
+    ]
 
     running_units = 0
     for stage in stages:
@@ -482,19 +426,17 @@ def branch_detail(pipe: PipelineDb, branch_name: str) -> dict[str, Any]:
             last=last_stage_runs.get(name),
             state=_stage_state(stage_counts, total),
         )
-        stage.pop("first_rowid", None)
         running_units += stage["running"]
 
     return {
         "pipeline": pipe.describe(),
         "branch": branch,
-        "graph_source": "meta" if graph is not None else "inferred",
         "stages": stages,
         "edges": edges,
-        "refs": (graph or {}).get("refs") or [],
+        "refs": graph.get("refs") or [],
         "running_units": running_units,
         "active_run": _row(active[0]) if active else None,
-        "last_run": _run_summary(last_run),
+        "last_run": _row(last_run) if last_run is not None else None,
         "storages": storages,
     }
 
@@ -564,7 +506,7 @@ def stage_units(
         units = [
             _row(row)
             for row in conn.execute(
-                f"SELECT {_UNIT_LIST_COLUMNS.format(linked=_linked(conn))} FROM units "
+                f"SELECT {_UNIT_LIST_COLUMNS} FROM units "
                 f"WHERE {where} ORDER BY {order} "
                 "LIMIT ? OFFSET ?",
                 [*params, page_size, (page - 1) * page_size],
@@ -620,10 +562,8 @@ def stage_units(
 
 
 def _graph_stage_names(conn: sqlite3.Connection) -> set[str]:
-    found = conn.execute("SELECT value FROM meta WHERE key = 'graph_json'").fetchone()
-    graph = load_graph({"graph_json": found[0]}) if found else None
-    stages = (graph or {}).get("stages", [])
-    return {s["name"] for s in stages if isinstance(s, dict) and isinstance(s.get("name"), str)}
+    graph = load_graph(read_meta(conn)) or {"stages": []}
+    return {spec["name"] for spec in graph["stages"]}
 
 
 # -- /api/.../units/{unit_key} --------------------------------------------------
@@ -641,7 +581,6 @@ def unit_detail(pipe: PipelineDb, branch_name: str, stage: str, unit_key: str) -
         if found is None:
             raise NotFoundError(f"unknown unit {key!r} in stage {stage!r}")
         unit = _row(found)
-        unit.setdefault("linked_from", None)
         detail = conn.execute(
             "SELECT detail_json FROM sources WHERE source_fp = ?", (unit["source_fp"],)
         ).fetchone()
@@ -662,13 +601,12 @@ def unit_detail(pipe: PipelineDb, branch_name: str, stage: str, unit_key: str) -
         ).fetchone()
         run = None
         if unit.get("last_run_id"):
-            run = _run_summary(
-                conn.execute(
-                    "SELECT run_id, started_at, ended_at, status, git_commit, git_dirty "
-                    "FROM runs WHERE run_id = ?",
-                    (unit["last_run_id"],),
-                ).fetchone()
-            )
+            found = conn.execute(
+                "SELECT run_id, started_at, ended_at, status, git_commit, git_dirty "
+                "FROM runs WHERE run_id = ?",
+                (unit["last_run_id"],),
+            ).fetchone()
+            run = _row(found) if found is not None else None
 
     segments = []
     if isinstance(components, dict):
@@ -707,7 +645,7 @@ def unit_detail(pipe: PipelineDb, branch_name: str, stage: str, unit_key: str) -
 def _fileset_refs(value: Any) -> Iterator[str]:
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in ("fileset", "fileset_hash") and isinstance(item, str):
+            if key == "fileset" and isinstance(item, str):
                 yield item
             else:
                 yield from _fileset_refs(item)
@@ -816,8 +754,7 @@ def run_detail(registry: Registry, run_id: str, pipeline: str | None = None) -> 
         try:
             with open_ro(pipe.path) as conn:
                 run = conn.execute(
-                    "SELECT r.*, b.name AS branch FROM runs r "
-                    "LEFT JOIN branches b ON b.branch_id = r.branch_id WHERE r.run_id = ?",
+                    "SELECT *, branch_id AS branch FROM runs WHERE run_id = ?",
                     (run_id,),
                 ).fetchone()
                 if run is None:

@@ -14,7 +14,6 @@ from varve.keying.keys import (
     changed_segments,
     compute_input_key,
     source_match,
-    upstream_entry,
 )
 
 
@@ -92,18 +91,6 @@ def test_small_inputs_inline_large_inputs_go_to_file_sets(tmp_path: Path) -> Non
     assert changed_segments(first.components, third.components) == ["inputs"]
 
 
-def test_upstream_entry_for_one_to_one_and_fan_in() -> None:
-    axis = Axis("dataset", ("a", "b"))
-    units = [Unit("prep", (axis,), (item,), (item,), (item,), f"dataset={item}") for item in "ab"]
-    fps = {"dataset=a": "fa", "dataset=b": "fb"}
-    assert upstream_entry(units[0], lambda u: fps[u.unit_key]) == "fa"
-    fan_in = {u.keys[0]: u for u in units}
-    assert upstream_entry(fan_in, lambda u: fps[u.unit_key]) == [
-        ["dataset=a", "fa"],
-        ["dataset=b", "fb"],
-    ]
-
-
 def test_source_match_rule() -> None:
     assert source_match(version=None, current="s1", recorded="s1", reused=None) == "match"
     assert source_match(version=None, current="s2", recorded="s1", reused=None) == "changed"
@@ -111,19 +98,14 @@ def test_source_match_rule() -> None:
     assert source_match(version="2", current="s2", recorded="s1", reused=None) == "code-modified"
 
 
-def test_key_material_merges_axis_inputs_and_values(tmp_path: Path) -> None:
-    from varve import Dependencies
+def test_dynamic_axis_paths_are_inputs_and_other_values_are_values(tmp_path: Path) -> None:
     from varve.dependencies import PathSet
-    from varve.graph import GraphError, key_material
 
     batch = Axis("batch", resolver=lambda ctx: {})
     shard = Axis("shard", resolver=lambda ctx: [])
     unit = Unit("s", (batch, shard), ("1", "2"), (1, 2), (tmp_path / "b1", 2), "batch=1,shard=2")
-    inputs, values = key_material(Dependencies(inputs={"x": tmp_path}, values={"v": 1}), unit)
-    assert inputs == {"x": tmp_path, "batch": PathSet((tmp_path / "b1",))}
-    assert values == {"v": 1, "shard": 2}
-    with pytest.raises(GraphError, match="clash with axis names"):
-        key_material(Dependencies(values={"shard": 0}), unit)
+    assert unit.axis_inputs() == {"batch": PathSet((tmp_path / "b1",))}
+    assert unit.axis_values() == {"shard": 2}
 
 
 def test_fast_hash_helpers_match_canonical_json_hash() -> None:

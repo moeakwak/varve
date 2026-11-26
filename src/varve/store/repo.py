@@ -25,7 +25,7 @@ from typing import Any
 
 from varve.keying.fingerprint import CachedStat
 from varve.keying.keys import FileSetRow
-from varve.store.db import now_iso, read_meta, transaction, write_meta
+from varve.store.db import now_iso, transaction, write_meta
 
 
 def _dumps(value: Any) -> str | None:
@@ -72,7 +72,9 @@ def collapse_components(components: Mapping[str, Any], parts: dict[str, str]) ->
     return collapsed
 
 
-def _missing_summaries(doc: Any) -> Iterator[str]:
+def _missing_summaries(doc: Any) -> Iterator[tuple[str, str]]:
+    """``(segment, part key)`` of the segments whose summary lives in ``key_parts``."""
+
     if isinstance(doc, dict):
         for segment, part in doc.items():
             if (
@@ -80,7 +82,7 @@ def _missing_summaries(doc: Any) -> Iterator[str]:
                 and "summary" not in part
                 and isinstance(part.get("hash"), str)
             ):
-                yield part_key(segment, part["hash"])
+                yield segment, part_key(segment, part["hash"])
 
 
 def load_parts(conn: sqlite3.Connection, keys: Iterable[str]) -> dict[str, Any]:
@@ -109,27 +111,17 @@ def expand_components(
     """
 
     cache = {} if cache is None else cache
-    keys = {key for doc in docs for key in _missing_summaries(doc)}
+    keys = {key for doc in docs for _, key in _missing_summaries(doc)}
     if not keys:
         return
     missing = keys - cache.keys()
     if missing:
         cache.update(load_parts(conn, missing))
     for doc in docs:
-        if not isinstance(doc, dict):
-            continue
-        for segment, part in doc.items():
-            if (
-                isinstance(part, dict)
-                and "summary" not in part
-                and isinstance(part.get("hash"), str)
-            ):
-                expanded = {
-                    "hash": part["hash"],
-                    "summary": cache.get(part_key(segment, part["hash"])),
-                }
-                expanded.update((key, value) for key, value in part.items() if key != "hash")
-                doc[segment] = expanded
+        for segment, key in list(_missing_summaries(doc)):
+            part = doc[segment]
+            doc[segment] = {"hash": part["hash"], "summary": cache.get(key)}
+            doc[segment].update((name, value) for name, value in part.items() if name != "hash")
 
 
 @dataclass
@@ -138,13 +130,24 @@ class BranchRow:
     ``{"ids": [...], "sample": n, "seed": s}`` (see ``ResolvedBranch.active_axes_json``)."""
 
     branch_id: str
-    name: str
+    """The branch name."""
     config: dict[str, Any]
     active_axes: dict[str, Any]
     is_temp: bool = False
     manual: bool = False
     created_at: str = ""
     updated_at: str = ""
+
+
+@dataclass(frozen=True)
+class BranchSummary:
+    """One branch with its unit counts by status and its last run (``ls`` listings)."""
+
+    name: str
+    is_temp: bool
+    manual: bool
+    counts: dict[str, int]
+    last_run: RunRow | None = None
 
 
 @dataclass
@@ -214,7 +217,6 @@ class UnitRow:
 class LinkCandidate:
     """Light columns of another branch's ``ok`` unit (cross-branch link lookup)."""
 
-    branch_name: str
     branch_id: str
     storage_name: str
     input_key: str
@@ -366,27 +368,40 @@ class Repo:
     # -- branches -----------------------------------------------------------
 
     def upsert_branch(self, row: BranchRow) -> BranchRow:
-        """Insert or update by name; ``created_at`` and ``branch_id`` of an existing row are kept."""
+        """Insert or update; ``created_at`` of an existing row is kept."""
 
         now = now_iso()
-        existing = self.get_branch(row.name)
+        existing = self.get_branch(row.branch_id)
         row.created_at = existing.created_at if existing else (row.created_at or now)
-        row.branch_id = existing.branch_id if existing else row.branch_id
         row.updated_at = now
         self._upsert("branches", [row], ["branch_id"])
         return row
 
     def get_branch(self, name: str) -> BranchRow | None:
         found = self.conn.execute(
-            f"SELECT {', '.join(_columns(BranchRow))} FROM branches WHERE name = ?", (name,)
+            f"SELECT {', '.join(_columns(BranchRow))} FROM branches WHERE branch_id = ?", (name,)
         ).fetchone()
         return None if found is None else _decode(BranchRow, found)
 
     def list_branches(self) -> list[BranchRow]:
         rows = self.conn.execute(
-            f"SELECT {', '.join(_columns(BranchRow))} FROM branches ORDER BY name"
+            f"SELECT {', '.join(_columns(BranchRow))} FROM branches ORDER BY branch_id"
         )
         return [_decode(BranchRow, row) for row in rows]
+
+    def branch_summaries(self) -> list[BranchSummary]:
+        summaries = []
+        for row in self.list_branches():
+            counts = dict(
+                self.conn.execute(
+                    "SELECT status, COUNT(*) FROM units WHERE branch_id = ? GROUP BY status",
+                    (row.branch_id,),
+                ).fetchall()
+            )
+            runs = self.runs(row.branch_id, limit=1)
+            last = runs[0] if runs else None
+            summaries.append(BranchSummary(row.branch_id, row.is_temp, row.manual, counts, last))
+        return summaries
 
     def delete_branch(self, branch_id: str) -> None:
         """Delete a branch with its units, stage runs, and runs."""
@@ -433,12 +448,6 @@ class Repo:
                 (stage_status, run_id),
             )
 
-    def get_run(self, run_id: str) -> RunRow | None:
-        found = self.conn.execute(
-            f"SELECT {', '.join(_columns(RunRow))} FROM runs WHERE run_id = ?", (run_id,)
-        ).fetchone()
-        return None if found is None else _decode(RunRow, found)
-
     def runs(self, branch_id: str, *, limit: int = 50) -> list[RunRow]:
         rows = self.conn.execute(
             f"SELECT {', '.join(_columns(RunRow))} FROM runs WHERE branch_id = ? "
@@ -455,19 +464,6 @@ class Repo:
 
     def put_stage_run(self, row: StageRunRow) -> None:
         self._upsert("stage_runs", [row], ["run_id", "stage_name"])
-
-    def stage_runs(
-        self, branch_id: str, *, stage: str | None = None, limit: int = 50
-    ) -> list[StageRunRow]:
-        where, params = "branch_id = ?", [branch_id]
-        if stage is not None:
-            where, params = f"{where} AND stage_name = ?", [*params, stage]
-        rows = self.conn.execute(
-            f"SELECT {', '.join(_columns(StageRunRow))} FROM stage_runs WHERE {where} "
-            "ORDER BY finished_at DESC LIMIT ?",
-            (*params, limit),
-        )
-        return [_decode(StageRunRow, row) for row in rows]
 
     # -- units --------------------------------------------------------------
 
@@ -520,34 +516,22 @@ class Repo:
             self.conn.executemany(_UNIT_UPSERT, values)
         return len(values)
 
-    def set_status(self, branch_id: str, stage: str, unit_keys: Iterable[str], status: str) -> int:
+    def mark_orphaned(self, branch_id: str, stage: str, unit_keys: Iterable[str]) -> int:
         now = now_iso()
         with transaction(self.conn):
             cursor = self.conn.executemany(
-                "UPDATE units SET status = ?, updated_at = ? "
+                "UPDATE units SET status = 'orphaned', updated_at = ? "
                 "WHERE branch_id = ? AND stage_name = ? AND unit_key = ?",
-                [(status, now, branch_id, stage, key) for key in unit_keys],
+                [(now, branch_id, stage, key) for key in unit_keys],
             )
         return cursor.rowcount
 
-    def mark_orphaned(self, branch_id: str, stage: str, unit_keys: Iterable[str]) -> int:
-        return self.set_status(branch_id, stage, unit_keys, "orphaned")
-
-    def delete_units(
-        self, branch_id: str, stage: str | None = None, unit_keys: Iterable[str] | None = None
-    ) -> int:
+    def delete_units(self, branch_id: str, stage: str, unit_keys: Iterable[str]) -> int:
         with transaction(self.conn):
-            if stage is None:
-                cursor = self.conn.execute("DELETE FROM units WHERE branch_id = ?", (branch_id,))
-            elif unit_keys is None:
-                cursor = self.conn.execute(
-                    "DELETE FROM units WHERE branch_id = ? AND stage_name = ?", (branch_id, stage)
-                )
-            else:
-                cursor = self.conn.executemany(
-                    "DELETE FROM units WHERE branch_id = ? AND stage_name = ? AND unit_key = ?",
-                    [(branch_id, stage, key) for key in unit_keys],
-                )
+            cursor = self.conn.executemany(
+                "DELETE FROM units WHERE branch_id = ? AND stage_name = ? AND unit_key = ?",
+                [(branch_id, stage, key) for key in unit_keys],
+            )
         return cursor.rowcount
 
     def count_units_in_storage(self, storage: str, *, branch_id: str | None = None) -> int:
@@ -616,25 +600,6 @@ class Repo:
     def branch_count(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM branches").fetchone()[0]
 
-    def link_candidates(
-        self, stage: str, unit_key: str, *, exclude_branch_id: str
-    ) -> list[tuple[str, UnitRow]]:
-        """``ok`` units of other branches with the same (stage, unit_key), newest first.
-
-        The caller recomputes its key under each candidate's ``config_access``
-        before comparing ``input_key`` (cross-branch hardlink reuse).
-        """
-
-        rows = self.conn.execute(
-            f"SELECT b.name AS branch_name, {_UNIT_SELECT} FROM {_UNIT_FROM} "
-            "JOIN branches b ON b.branch_id = u.branch_id "
-            "WHERE u.stage_name = ? AND u.unit_key = ? AND u.status = 'ok' "
-            "AND u.branch_id != ? ORDER BY u.updated_at DESC",
-            (stage, unit_key, exclude_branch_id),
-        ).fetchall()
-        units = self._unit_rows(rows)
-        return [(row["branch_name"], unit) for row, unit in zip(rows, units, strict=True)]
-
     def link_index(self, stage: str, *, exclude_branch_id: str) -> dict[str, list[LinkCandidate]]:
         """Light columns of every ``ok`` unit of ``stage`` in other branches, by unit_key.
 
@@ -643,18 +608,16 @@ class Repo:
         """
 
         rows = self.conn.execute(
-            "SELECT u.unit_key, b.name, u.branch_id, u.storage_name, u.input_key, "
-            "u.config_access_json, u.source_fp, u.reused_source_fp, "
-            "u.artifact_manifest_json IS NOT NULL "
-            "FROM units u JOIN branches b ON b.branch_id = u.branch_id "
-            "WHERE u.stage_name = ? AND u.status = 'ok' AND u.branch_id != ? "
-            "ORDER BY u.updated_at DESC",
+            "SELECT unit_key, branch_id, storage_name, input_key, config_access_json, "
+            "source_fp, reused_source_fp, artifact_manifest_json IS NOT NULL FROM units "
+            "WHERE stage_name = ? AND status = 'ok' AND branch_id != ? "
+            "ORDER BY updated_at DESC",
             (stage, exclude_branch_id),
         )
         index: dict[str, list[LinkCandidate]] = {}
         for row in rows:
             index.setdefault(row[0], []).append(
-                LinkCandidate(row[1], row[2], row[3], row[4], row[5], row[6], row[7], bool(row[8]))
+                LinkCandidate(row[1], row[2], row[3], row[4], row[5], row[6], bool(row[7]))
             )
         return index
 
@@ -683,9 +646,6 @@ class Repo:
     def set_meta(self, values: Mapping[str, str]) -> None:
         write_meta(self.conn, values)
 
-    def meta(self) -> dict[str, str]:
-        return read_meta(self.conn)
-
     # -- file sets ----------------------------------------------------------
 
     def put_file_sets(self, rows: Iterable[FileSetRow]) -> None:
@@ -700,29 +660,6 @@ class Repo:
                     for row in rows
                 ],
             )
-
-    def get_file_set(self, fileset_hash: str) -> FileSetRow | None:
-        found = self.conn.execute(
-            "SELECT fileset_hash, file_count, total_bytes, entries_json FROM file_sets "
-            "WHERE fileset_hash = ?",
-            (fileset_hash,),
-        ).fetchone()
-        if found is None:
-            return None
-        return FileSetRow(found[0], found[1], found[2], json.loads(found[3]))
-
-    def source_details(self, fingerprints: Iterable[str]) -> dict[str, dict[str, Any]]:
-        wanted = sorted(set(fingerprints))
-        found: dict[str, dict[str, Any]] = {}
-        for start in range(0, len(wanted), _SQL_VARIABLES):
-            chunk = wanted[start : start + _SQL_VARIABLES]
-            rows = self.conn.execute(
-                "SELECT source_fp, detail_json FROM sources "
-                f"WHERE source_fp IN ({', '.join('?' for _ in chunk)})",
-                chunk,
-            )
-            found.update((row[0], json.loads(row[1])) for row in rows)
-        return found
 
     # -- garbage collection -------------------------------------------------
 

@@ -197,6 +197,28 @@ def unit_output(log_path: Path | None) -> Iterator[None]:
 
 
 @contextmanager
+def _fds_to(path: Path) -> Iterator[int]:
+    """Point fds 1 and 2 at ``path`` (appending); yields a duplicate of the original fd 1."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for stream in (sys.stdout, sys.stderr):
+        _flush(stream)
+    saved = os.dup(1), os.dup(2)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        yield saved[0]
+    finally:
+        for stream in (sys.stdout, sys.stderr):
+            _flush(stream)
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        for item in (*saved, fd):
+            os.close(item)
+
+
+@contextmanager
 def fd_output(log_path: Path | None) -> Iterator[None]:
     """Redirect fds 1 and 2 (and Python's std streams) to ``log_path`` (process workers).
 
@@ -206,51 +228,25 @@ def fd_output(log_path: Path | None) -> Iterator[None]:
     if log_path is None:
         yield
         return
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    for stream in (sys.stdout, sys.stderr):
-        _flush(stream)
-    saved = os.dup(1), os.dup(2)
-    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
-        os.dup2(fd, 1)
-        os.dup2(fd, 2)
-        yield
+        with _fds_to(log_path):
+            yield
     finally:
-        for stream in (sys.stdout, sys.stderr):
-            _flush(stream)
-        os.dup2(saved[0], 1)
-        os.dup2(saved[1], 2)
-        empty = os.fstat(fd).st_size == 0
-        for item in (*saved, fd):
-            os.close(item)
-        if empty:
-            with contextlib.suppress(OSError):
-                os.unlink(log_path)
+        with contextlib.suppress(OSError):
+            if log_path.stat().st_size == 0:
+                log_path.unlink()
 
 
 @contextmanager
 def terminal_to_process_log(process_log: Path) -> Iterator[IO[str]]:
     """Point fds 1/2 at ``process_log``; yield a text stream on the original terminal."""
 
-    process_log.parent.mkdir(parents=True, exist_ok=True)
-    for stream in (sys.stdout, sys.stderr):
-        _flush(stream)
-    terminal_fd = os.dup(1)
-    saved_err = os.dup(2)
-    fd = os.open(process_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    terminal = os.fdopen(terminal_fd, "w", buffering=1, encoding="utf-8", closefd=False)
-    try:
-        os.dup2(fd, 1)
-        os.dup2(fd, 2)
-        yield terminal
-    finally:
-        for stream in (sys.stdout, sys.stderr):
-            _flush(stream)
-        terminal.flush()
-        os.dup2(terminal_fd, 1)
-        os.dup2(saved_err, 2)
-        for item in (terminal_fd, saved_err, fd):
-            os.close(item)
+    with _fds_to(process_log) as terminal_fd:
+        terminal = os.fdopen(terminal_fd, "w", buffering=1, encoding="utf-8", closefd=False)
+        try:
+            yield terminal
+        finally:
+            terminal.flush()
 
 
 def _flush(stream: Any) -> None:

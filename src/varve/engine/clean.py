@@ -15,11 +15,11 @@ holds it shared plus the branch lock.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 from varve.branch import load_branches, validate_branch_name
-from varve.engine.housekeeping import unit_pairs
 from varve.engine.session import WorkspaceSettings, main_config, resolve_roots
 from varve.engine.unit import remove_tree
 from varve.pipeline import Pipeline
@@ -37,8 +37,7 @@ class CleanPlan:
     description: str = ""
 
 
-@dataclass(frozen=True)
-class PipelineRoots:
+class PipelineRoots(NamedTuple):
     root: Path
     storage_roots: dict[str, Path]
     publish_root: Path
@@ -50,10 +49,7 @@ def pipeline_roots(
     """Roots under the ``main`` Config (what ``clean`` and ``ls`` address)."""
 
     workspace = workspace if workspace is not None else settings_for(pipeline)
-    resolved, storage_roots, publish_root = resolve_roots(
-        pipeline, main_config(pipeline), root, workspace
-    )
-    return PipelineRoots(resolved, storage_roots, publish_root)
+    return PipelineRoots(*resolve_roots(pipeline, main_config(pipeline), root, workspace))
 
 
 def _existing(paths: list[Path]) -> list[Path]:
@@ -67,7 +63,7 @@ def _known_branches(pipeline: type[Pipeline], repo: Repo | None) -> dict[str, bo
     }
     branches.setdefault("main", False)
     if repo is not None:
-        branches.update({row.name: row.is_temp for row in repo.list_branches()})
+        branches.update({row.branch_id: row.is_temp for row in repo.list_branches()})
     return branches
 
 
@@ -85,7 +81,7 @@ def _recorded(roots: PipelineRoots, repo: Repo | None) -> PipelineRoots:
     recorded = repo.storages()
     if not recorded:
         return roots
-    return replace(roots, storage_roots={**roots.storage_roots, **recorded})
+    return roots._replace(storage_roots={**roots.storage_roots, **recorded})
 
 
 def plan_clean(
@@ -183,22 +179,19 @@ def _clean_branch(
     temporary = _known_branches(pipeline, repo).get(branch, False)
     paths = [layout.internal_root(root, branch) for root in roots.storage_roots.values()]
     paths.append(layout.publish_dir(roots.publish_root, branch, temporary=temporary))
-    row = repo.get_branch(branch) if repo is not None else None
+    if repo is not None and repo.get_branch(branch) is None:
+        repo = None  # an unknown branch has no rows
     count = 0
-    if repo is not None and row is not None:
-        count = sum(sum(by.values()) for by in repo.unit_counts(row.branch_id).values())
+    if repo is not None:
+        count = sum(sum(by.values()) for by in repo.unit_counts(branch).values())
     plan = CleanPlan(_existing(paths), count, f"branch {branch!r}")
     if apply:
         for path in plan.paths:
             remove_tree(path)
-        if repo is not None and row is not None:
-            repo.delete_branch(row.branch_id)
+        if repo is not None:
+            repo.delete_branch(branch)
             repo.collect_garbage()
     return plan
-
-
-def _branch_names(repo: Repo | None) -> dict[str, str]:
-    return {row.branch_id: row.name for row in repo.list_branches()} if repo is not None else {}
 
 
 def _clean_storage(
@@ -209,20 +202,15 @@ def _clean_storage(
         paths = [storage_root / ".internal", storage_root / ".staging"]
     else:
         paths = [layout.internal_root(storage_root, branch)]
-    branch_id = None
-    if repo is not None and branch is not None:
-        row = repo.get_branch(branch)
-        if row is None:  # unknown branch: no rows to count or delete (never every branch's)
-            repo = None
-        else:
-            branch_id = row.branch_id
-    rows = repo.count_units_in_storage(storage, branch_id=branch_id) if repo is not None else 0
+    if repo is not None and branch is not None and repo.get_branch(branch) is None:
+        repo = None  # unknown branch: no rows to count or delete (never every branch's)
+    rows = repo.count_units_in_storage(storage, branch_id=branch) if repo is not None else 0
     plan = CleanPlan(_existing(paths), rows, f"storage {storage!r}")
     if apply:
         for path in plan.paths:
             remove_tree(path)
         if repo is not None:
-            repo.delete_units_in_storage(storage, branch_id=branch_id)
+            repo.delete_units_in_storage(storage, branch_id=branch)
             repo.collect_garbage()
     return plan
 
@@ -232,18 +220,14 @@ def _clean_orphans(
 ) -> CleanPlan:
     if repo is None:
         return CleanPlan(description="orphaned units")
-    names = _branch_names(repo)
-    rows = repo.unit_keys_with_status("orphaned")
-    if branch is not None:
-        rows = [row for row in rows if names.get(row[0]) == branch]
+    rows = repo.unit_keys_with_status("orphaned", branch_id=branch)
     paths = []
     for branch_id, stage, unit_key, storage in rows:
         storage_root = roots.storage_roots.get(storage)
-        name = names.get(branch_id)
-        if storage_root is None or name is None:
+        if storage_root is None:
             continue
-        relpath = layout.unit_relpath(unit_pairs(unit_key))
-        paths.append(layout.internal_dir(storage_root, name, stage, relpath))
+        relpath = layout.unit_relpath(layout.parse_unit_key(unit_key))
+        paths.append(layout.internal_dir(storage_root, branch_id, stage, relpath))
     plan = CleanPlan(_existing(paths), len(rows), "orphaned units")
     if apply:
         for path in plan.paths:

@@ -179,7 +179,7 @@ class Committer:
             config_hash = self.evaluator.config_hash(access_json)
             if combine_hashes({**unit_plan.hashes, "config": config_hash}) != row.input_key:
                 continue
-            other = candidate.branch_name
+            other = candidate.branch_id
             relpath = unit_plan.unit.relpath
             source_dir = layout.internal_dir(storage_root, other, node.name, relpath)
             if not verify_manifest(source_dir, row.artifact_manifest):
@@ -198,19 +198,8 @@ class Committer:
             if not verify_manifest(staging, row.artifact_manifest):
                 remove_tree(staging)
                 continue
-            linked = UnitRow(
-                branch_id=session.branch_id,
-                stage_name=node.name,
-                unit_key=unit_plan.unit_key,
-                storage_name=node.storage,
-                input_key=row.input_key,
-                key_components=row.key_components,
-                source_fp=source_fp,
-                source_detail=unit_plan.cell.source.detail,
-                status="running",
-                config_access=row.config_access,
-                last_run_id=self.run_id,
-            )
+            key = InputKey(row.input_key, row.key_components, [])
+            linked = self.row(node, unit_plan, key, row.config_access, "running")
             final = session.unit_dir(node.name, node.storage, relpath)
             self.writer.put(linked)
             try:

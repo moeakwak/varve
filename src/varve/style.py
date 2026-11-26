@@ -11,14 +11,16 @@ from __future__ import annotations
 import os
 import re
 import sys
-from contextlib import nullcontext
 from datetime import datetime, timezone
-from typing import IO, Any, cast
+from typing import IO, TYPE_CHECKING, Any, cast
 
 from rich.console import Console
 from rich.highlighter import RegexHighlighter
 from rich.text import Text
 from rich.theme import Theme
+
+if TYPE_CHECKING:
+    from varve.store.repo import BranchSummary
 
 # Status token -> Rich style. Covers unit decisions (hit/needs-run/failed),
 # stage-level probe states (awaiting/blocked), stored unit statuses
@@ -83,12 +85,6 @@ class VarveStatusHighlighter(RegexHighlighter):
             for status in STATUS_STYLES
         ),
     ]
-
-
-def format_elapsed(value: float | None, *, missing: str = "") -> str:
-    """Format a duration in seconds for CLI tables."""
-
-    return f"{value:.2f}s" if value is not None else missing
 
 
 def format_timestamp(value: str | None, *, missing: str = "-") -> str:
@@ -190,11 +186,19 @@ def make_console(*, stderr: bool = False) -> Console:
     return Console(file=stream, theme=_THEME, highlight=False)
 
 
-def loading(console: Console, message: str):
-    return console.status(message, spinner="dots") if console.is_terminal else nullcontext(None)
-
-
 def status_text(status: str) -> Text:
     """Return the status token styled for its semantic color."""
 
     return Text(status, style=STATUS_STYLES.get(status.split("@", 1)[0], ""))
+
+
+def branch_cells(branch: BranchSummary) -> tuple[Text, Text]:
+    """The units-by-status and last-run cells of a branch row in ``ls`` tables."""
+
+    units = Text(", ".join(f"{n} {s}" for s, n in sorted(branch.counts.items())) or "-")
+    run = branch.last_run
+    if run is None:
+        return units, Text("-")
+    return units, status_text(run.status) + Text(
+        f" {format_timestamp(run.started_at)} · {format_ms(run.total_wall_ms)}", style="dim"
+    )

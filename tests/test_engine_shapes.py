@@ -7,9 +7,6 @@ import os
 import stat
 
 from varve.engine import clean_pipeline, probe_pipeline
-from varve.store import layout
-from varve.store.db import connect
-from varve.store.repo import Repo
 
 SHAPES = """
 import json
@@ -137,7 +134,7 @@ def test_upstream_driven_axis_reruns_only_changed_batches(ws) -> None:
     result = ws.run(Demo)
     assert result.stages["prepare"].executed == 1
     assert result.stages["process"].executed == 1
-    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    repo = ws.repo()
     cached = repo.load_stat_cache()
     repo.conn.close()
     assert any(path.endswith("/b1.txt") for path in cached)  # batch inputs are content-hashed
@@ -155,14 +152,14 @@ def test_shrink_marks_orphans_and_clean_orphans_removes_them(ws) -> None:
     merged = json.loads((ws.root / "out/.internal/main/merge/merged.json").read_text())
     assert list(merged) == ["0", "1"]
 
-    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    repo = ws.repo()
     assert [row.unit_key for row in repo.units_with_status("orphaned")] == ["batch=2"]
     repo.conn.close()
     orphan_dir = ws.root / "out/.internal/main/process/batch=2"
     assert orphan_dir.is_dir()
     assert ws.cli(Demo, "clean", "--orphans", "--yes") == 0
     assert not orphan_dir.exists()
-    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    repo = ws.repo()
     assert repo.units_with_status("orphaned") == []
     repo.conn.close()
     assert clean_pipeline(Demo, root=ws.root, orphans=True).rows == 0
@@ -172,7 +169,7 @@ def test_produces_single_file_vs_dir_and_read_only_files(ws) -> None:
     _config(ws, source_dir=str(ws.base))
     Demo = ws.write(SHAPES)
     ws.run(Demo, options=None)
-    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    repo = ws.repo()
     items = repo.get_unit("main", "items", "")
     per_dataset = repo.get_unit("main", "per_dataset", "dataset=a")
     repo.conn.close()
@@ -257,7 +254,7 @@ class Demo(Pipeline):
 
 def test_undeclared_static_ids_and_old_foreach_rows_become_orphans(ws) -> None:
     def statuses() -> dict[str, str]:
-        repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+        repo = ws.repo()
         try:
             return {row.unit_key: row.status for row in repo.units("main", "work").values()}
         finally:

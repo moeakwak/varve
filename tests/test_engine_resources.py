@@ -341,28 +341,14 @@ if __name__ == "__main__":
 
 @pytest.mark.parametrize("stage", ["threaded", "pooled"])
 def test_first_sigint_closes_every_session_and_commits_active_units(ws, stage: str) -> None:
-    import os
     import signal
-    import subprocess
-    import sys
     import time
-
-    from varve.store import layout
-    from varve.store.db import connect
-    from varve.store.repo import Repo
 
     trace = ws.base / "trace"
     trace.mkdir()
     (ws.src / "varve.yaml").write_text(json.dumps({"main": {"config": {"trace": str(trace)}}}))
     ws.write(INTERRUPTED)
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
-    proc = subprocess.Popen(
-        [sys.executable, str(ws.path), "run", "--no-tui", "--only", stage, "--root", str(ws.root)],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    proc = ws.spawn_run("--only", stage, capture=True)
     deadline = time.monotonic() + 20
     while _counts(trace).get("started", 0) < 2:
         assert time.monotonic() < deadline and proc.poll() is None, proc.communicate()
@@ -376,7 +362,7 @@ def test_first_sigint_closes_every_session_and_commits_active_units(ws, stage: s
     assert counts["open.stage"] == counts["close.stage"] == 1
     assert counts["open.unit"] == counts["close.unit"] == started
     assert counts["open.worker"] == counts["close.worker"] >= 1
-    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    repo = ws.repo()
     rows = repo.units("main", stage)
     assert len(rows) == started and {row.status for row in rows.values()} == {"ok"}
     repo.conn.close()

@@ -11,8 +11,10 @@ from __future__ import annotations
 import importlib
 import itertools
 import os
+import subprocess
 import sys
 import textwrap
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,9 @@ import pytest
 
 from varve.engine import RunOptions, RunResult, run_pipeline
 from varve.pipeline import Pipeline
+from varve.store import layout
+from varve.store.db import connect
+from varve.store.repo import Repo, StageRunRow, _columns, _decode
 
 _counter = itertools.count()
 
@@ -58,6 +63,38 @@ class Workspace:
 
     def cli(self, pipeline: type[Pipeline], *argv: str) -> int:
         return pipeline.cli([*argv, "--root", str(self.root)])
+
+    def repo(self, *, readonly: bool = True) -> Repo:
+        return Repo(connect(layout.state_db_path(self.root), readonly=readonly))
+
+    def stage_runs(self, repo: Repo) -> list[StageRunRow]:
+        """Every ``stage_runs`` row, oldest first."""
+
+        rows = repo.conn.execute(
+            f"SELECT {', '.join(_columns(StageRunRow))} FROM stage_runs ORDER BY finished_at"
+        )
+        return [_decode(StageRunRow, row) for row in rows]
+
+    def spawn_run(self, *argv: str, capture: bool = False) -> subprocess.Popen[str]:
+        """``run --no-tui`` of the pipeline module in a child process."""
+
+        output = subprocess.PIPE if capture else subprocess.DEVNULL
+        return subprocess.Popen(
+            [sys.executable, str(self.path), "run", "--no-tui", "--root", str(self.root), *argv],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            stdout=output,
+            stderr=output,
+            text=True,
+        )
+
+    @staticmethod
+    def wait_for(path: Path, proc: subprocess.Popen[str]) -> None:
+        """Wait until ``path`` exists while ``proc`` is alive (20 s at most)."""
+
+        deadline = time.monotonic() + 20
+        while not path.exists():
+            assert time.monotonic() < deadline and proc.poll() is None, proc.communicate()
+            time.sleep(0.02)
 
     def close(self) -> None:
         sys.modules.pop(self.module, None)

@@ -540,9 +540,8 @@ function updateBranchPage(route, data) {
   });
   $("dag").replaceChildren(svg);
   $("dagmeta").textContent = `${data.stages.length} stages`;
-  $("dagnote").textContent = data.graph_source === "inferred"
-    ? "Dependency edges unavailable: this state.db has no recorded stage graph (meta.graph_json), so stages are listed in their last execution order."
-    : "Solid: data dependency · dashed: needs= ordering · dotted: dynamic-axis resolver. Click a stage for units, failures and metrics.";
+  $("dagnote").textContent =
+    "Solid: data dependency · dashed: needs= ordering · dotted: dynamic-axis resolver. Click a stage for units, failures and metrics.";
 }
 
 // ---------------------------------------------------------------- history panel

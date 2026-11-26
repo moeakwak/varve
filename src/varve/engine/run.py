@@ -150,22 +150,6 @@ def check_storage_roots(recorded: dict[str, Path], current: dict[str, Path]) -> 
             )
 
 
-def select_stages(
-    session: Session, *, only: str | None, upto: str | None, downstream: str | None
-) -> list[str]:
-    graph = session.graph
-    for name in (only, upto, downstream):
-        if name is not None and name not in graph.nodes:
-            raise ValueError(f"Unknown stage {name!r}; stages: {list(graph.order)}")
-    if only is not None:
-        return [only]
-    if upto is not None:
-        return [*graph.ancestors(upto), upto]
-    if downstream is not None:
-        return [downstream, *graph.descendants(downstream)]
-    return list(graph.order)
-
-
 class Runner:
     def __init__(self, session: Session, options: RunOptions, bus: EventBus) -> None:
         self.session = session
@@ -174,8 +158,8 @@ class Runner:
         self.run_id = new_run_id()
         self.stop = StopFlag()
         self.tui_active = False
-        self.selected = select_stages(
-            session, only=options.only, upto=options.upto, downstream=options.downstream
+        self.selected = session.graph.select(
+            only=options.only, upto=options.upto, downstream=options.downstream
         )
         needed = set(self.selected)
         for name in self.selected:
@@ -214,7 +198,6 @@ class Runner:
             repo.upsert_branch(
                 BranchRow(
                     branch_id=session.branch_id,
-                    name=branch.name,
                     config=branch.config_json,
                     active_axes=branch.active_axes_json,
                     is_temp=branch.is_temp,
@@ -402,16 +385,7 @@ class Runner:
         outcome = StageOutcome(name, "ok", total=len(plan.units))
         if plan.orphans:
             outcome.orphaned = repo.mark_orphaned(session.branch_id, name, plan.orphans)
-        state = StageState([unit.unit for unit in plan.units])
-        self.states[name] = state
-        for unit_plan in plan.units:
-            row = unit_plan.row
-            if unit_plan.decision == "hit" and row is not None:
-                assert row.artifact_fp is not None and row.artifact_relpath is not None
-                state.artifacts[unit_plan.unit_key] = (
-                    row.artifact_fp,
-                    session.storage_roots[row.storage_name] / row.artifact_relpath,
-                )
+        state = self.states[name] = probe_state(session, plan)  # hits are available
         outcome.hit = len(state.artifacts)
         to_run = [unit for unit in plan.units if unit.decision != "hit"]
         if self.options.failed_only:
@@ -547,11 +521,13 @@ class Runner:
             resource_access.setdefault(index, []).append(access)
         keys: dict[str, InputKey] = {}
 
+        def probe_access(unit_plan: UnitPlan) -> list[str] | None:
+            return unit_plan.row.config_access if unit_plan.row is not None else None
+
         def probe_key(unit_plan: UnitPlan) -> InputKey:
             cached = keys.get(unit_plan.unit_key)
             if cached is None:
-                access = unit_plan.row.config_access if unit_plan.row is not None else None
-                cached = self.commits.input_key(node, unit_plan, access)
+                cached = self.commits.input_key(node, unit_plan, probe_access(unit_plan))
                 keys[unit_plan.unit_key] = cached
             return cached
 
@@ -567,9 +543,6 @@ class Runner:
                 job = self._job(node, unit_plan, capture, unit_resources[unit_plan.unit_key])
                 jobs[unit_plan.unit_key] = job
             return job
-
-        def probe_access(unit_plan: UnitPlan) -> list[str] | None:
-            return unit_plan.row.config_access if unit_plan.row is not None else None
 
         def on_start(unit_plan: UnitPlan) -> None:
             key = probe_key(unit_plan)
@@ -651,7 +624,7 @@ class Runner:
                 node, backend_name, workers, shared, resource_access, cells, capture
             )
             try:
-                result = await run_window(
+                halted = await run_window(
                     to_run,
                     lambda unit_plan: backend.submit(job_for(unit_plan)),
                     workers=workers,
@@ -670,7 +643,7 @@ class Runner:
                 raise
             backend.close()
             queue_cleanup()
-        return result.halted
+        return halted
 
     def _backend(
         self,
