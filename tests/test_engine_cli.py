@@ -10,13 +10,11 @@ import time
 
 import pytest
 
+from varve.branch_config import BranchRequest
 from varve.engine import RunOptions, probe_pipeline
 from varve.engine.probe import probe
-from varve.engine.service import _request
 from varve.engine.session import open_session
 from varve.store import layout
-from varve.store.db import connect
-from varve.store.repo import Repo
 
 SOURCE = """
 from pathlib import Path
@@ -59,9 +57,9 @@ if __name__ == "__main__":
 
 
 def _branches(ws) -> dict:
-    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    repo = ws.repo()
     try:
-        return {row.name: row for row in repo.list_branches()}
+        return {row.branch_id: row for row in repo.list_branches()}
     finally:
         repo.conn.close()
 
@@ -73,11 +71,11 @@ def test_slice_and_sample_need_a_temporary_branch(ws, capsys) -> None:
     assert ws.cli(Demo, "run", "--no-tui", "--slice", "dataset=a,c", "--temp") == 0
     branches = _branches(ws)
     [temp] = [row for row in branches.values() if row.is_temp]
-    assert temp.name.startswith("main_tmp_")
+    assert temp.branch_id.startswith("main_tmp_")
     assert temp.active_axes == {"dataset": ["a", "c"]}
-    internal = ws.root / "out/.internal" / temp.name / "per_dataset"
+    internal = ws.root / "out/.internal" / temp.branch_id / "per_dataset"
     assert sorted(p.name for p in internal.iterdir()) == ["dataset=a", "dataset=c"]
-    assert (ws.root / "out/.tmp" / temp.name / "all.txt").read_text() == "2:4"
+    assert (ws.root / "out/.tmp" / temp.branch_id / "all.txt").read_text() == "2:4"
 
     assert (
         ws.cli(Demo, "run", "--no-tui", "--sample", "shard=2", "--seed", "3", "--branch", "pilot")
@@ -243,7 +241,7 @@ def test_probe_5000_units_under_200ms(ws) -> None:
     timings = []
     for _ in range(3):
         started = time.perf_counter()
-        session = open_session(Demo, _request("main"), root=ws.root)
+        session = open_session(Demo, BranchRequest(), root=ws.root)
         try:
             plans = probe(session)
         finally:
@@ -286,7 +284,7 @@ def test_closed_stdout_pipe_is_not_an_error(ws, command: list[str]) -> None:
     assert proc.returncode == 0, stderr.decode()
     assert b"Traceback" not in stderr and b"BrokenPipe" not in stderr
     if command[0] == "run":
-        repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+        repo = ws.repo()
         [run] = repo.runs("main")
         assert run.status == "ok"
         repo.conn.close()
@@ -349,7 +347,7 @@ def test_process_backend_with_classes_in_main(ws, style: str) -> None:
     final = ws.root / "out/.internal/main/work"
     assert (final / "color=red/x.txt").read_text() == "red:3:red!"
     assert (final / "color=blue/x.txt").read_text() == "blue:3:red!"
-    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    repo = ws.repo()
     rows = repo.units("main", "work")
     assert {tuple(row.config_access or ["<all>"]) for row in rows.values()} == {("scale", "tint")}
     repo.conn.close()
@@ -390,7 +388,7 @@ def test_clean_storage_of_an_unknown_branch_deletes_no_rows(ws, capsys) -> None:
     ws.run(Demo, branch="tmpb", temp=True)
     plan = clean_pipeline(Demo, root=ws.root, storage="default", branch="nosuch")
     assert plan.rows == 0
-    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    repo = ws.repo()
     try:
         assert repo.unit_counts("main") and repo.unit_counts("tmpb")
     finally:

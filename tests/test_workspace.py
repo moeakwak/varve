@@ -723,8 +723,9 @@ def test_ls_table_fits_a_narrow_terminal() -> None:
 
     from rich.console import Console
 
+    from varve.store.repo import BranchSummary, RunRow
     from varve.workspace.config import WorkspaceSettings
-    from varve.workspace.discovery import BranchSummary, Entry
+    from varve.workspace.discovery import Entry
 
     entry = Entry(
         name="metric_eval.benchmark_misjudgment.threshold_sensitivity",
@@ -732,7 +733,13 @@ def test_ls_table_fits_a_narrow_terminal() -> None:
         root=Path("/very/long/path/to/studies/exp/metric_eval/benchmark_misjudgment/threshold"),
         db_path=Path("/x/.varve/state.db"),
         branches=[
-            BranchSummary("main_tmp_0123456789abcdef", True, False, {"ok": 1234}, "ok", None, 5)
+            BranchSummary(
+                "main_tmp_0123456789abcdef",
+                True,
+                False,
+                {"ok": 1234},
+                RunRow("r", "main_tmp_0123456789abcdef", "", "ok", [], "host", total_wall_ms=5),
+            )
         ],
     )
     buffer = io.StringIO()

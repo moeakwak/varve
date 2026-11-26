@@ -82,9 +82,6 @@ class Session:
             self.publish_root, self.branch.name, temporary=self.branch.is_temp
         )
 
-    def storage_root(self, name: str) -> Path:
-        return self.storage_roots[name]
-
     def unit_dir(self, stage: str, storage: str, relpath: str) -> Path:
         return layout.internal_dir(self.storage_roots[storage], self.branch.name, stage, relpath)
 
@@ -102,12 +99,6 @@ def main_config(pipeline: type[Pipeline]) -> Any:
     return build_config(pipeline, main.config if main is not None else {})
 
 
-def pipeline_name(pipeline: type[Pipeline], workspace: WorkspaceSettings | None = None) -> str:
-    """Name used for workspace storage subdirectories and ``VARVE_ROOT_BASE``."""
-
-    return (workspace.pipeline_name if workspace else None) or pipeline.selector()
-
-
 def pipeline_root(
     pipeline: type[Pipeline], root: Path | None, workspace: WorkspaceSettings | None = None
 ) -> Path:
@@ -116,7 +107,7 @@ def pipeline_root(
     if root is not None:
         return Path(root).expanduser().absolute()
     if workspace is not None and workspace.root_base is not None:
-        return workspace.root_base / pipeline_name(pipeline, workspace)
+        return workspace.root_base / pipeline.selector()
     return Path(pipeline.default_root(main_config(pipeline))).expanduser().absolute()
 
 
@@ -148,7 +139,7 @@ def resolve_roots(
         declared,
         resolved_root,
         workspace=workspace.storage or None,
-        pipeline_name=pipeline_name(pipeline, workspace),
+        pipeline_name=pipeline.selector(),
     )
     publish_root = layout.resolve_publish_root(
         pipeline.publish_root(config), storage_roots, resolved_root
@@ -287,7 +278,7 @@ def _ref_document(attr: str, ref: Ref) -> dict[str, Any]:
 def identity_meta(session: Session) -> dict[str, str]:
     pipeline = session.pipeline
     return {
-        "pipeline_name": pipeline_name(pipeline, session.workspace),
+        "pipeline_name": pipeline.selector(),
         "module": pipeline.import_module_name(),
         "qualname": pipeline.__qualname__,
         "root": str(session.root),

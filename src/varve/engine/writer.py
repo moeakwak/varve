@@ -23,10 +23,10 @@ class Writer:
     hard kill leaves those rows ``running`` rather than their previous state.
     """
 
-    def __init__(self, repo: Repo, cache: StatCache, *, interval: float = FLUSH_SECONDS) -> None:
+    def __init__(self, repo: Repo, cache: StatCache) -> None:
         self.repo = repo
         self.cache = cache
-        self.interval = interval
+        self.interval = FLUSH_SECONDS
         self._units: dict[tuple[str, str], UnitRow] = {}
         self._file_sets: dict[str, FileSetRow] = {}
         self._pending_running: set[tuple[str, str]] = set()

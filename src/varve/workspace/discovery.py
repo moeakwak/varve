@@ -17,23 +17,12 @@ from pathlib import Path
 from varve.selector import matches_selector
 from varve.store import layout
 from varve.store.db import SchemaError, connect, read_meta
-from varve.store.repo import Repo
+from varve.store.repo import BranchSummary, Repo
 from varve.ui.discovery import discover_state_dbs
 from varve.workspace.config import WorkspaceSettings
 from varve.workspace.modules import ModuleLocation, entry_selector, locate_module, split_entry
 
 UNREGISTERED = 1 << 30
-
-
-@dataclass(frozen=True)
-class BranchSummary:
-    name: str
-    is_temp: bool
-    manual: bool
-    counts: dict[str, int]
-    last_status: str | None = None
-    last_started_at: str | None = None
-    last_wall_ms: int | None = None
 
 
 @dataclass
@@ -104,27 +93,7 @@ def read_store(db_path: Path, *, summaries: bool = False) -> StoreInfo:
         return StoreInfo(db_path, root, {}, str(error), [])
     try:
         meta = read_meta(conn)
-        branches: list[BranchSummary] = []
-        if summaries:
-            repo = Repo(conn)
-            for row in repo.list_branches():
-                counts: dict[str, int] = {}
-                for by_status in repo.unit_counts(row.branch_id).values():
-                    for status, count in by_status.items():
-                        counts[status] = counts.get(status, 0) + count
-                runs = repo.runs(row.branch_id, limit=1)
-                last = runs[0] if runs else None
-                branches.append(
-                    BranchSummary(
-                        row.name,
-                        row.is_temp,
-                        row.manual,
-                        counts,
-                        last.status if last else None,
-                        last.started_at if last else None,
-                        last.total_wall_ms if last else None,
-                    )
-                )
+        branches = Repo(conn).branch_summaries() if summaries else []
         return StoreInfo(db_path, root, meta, None, branches)
     except sqlite3.Error as error:
         return StoreInfo(db_path, root, {}, str(error), [])

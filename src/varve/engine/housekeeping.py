@@ -51,12 +51,6 @@ def percentile(values: Sequence[int], fraction: float) -> int | None:
     return ordered[rank - 1]
 
 
-def unit_pairs(unit_key: str) -> list[tuple[str, str]]:
-    if not unit_key:
-        return []
-    return [(name, item) for name, _, item in (part.partition("=") for part in unit_key.split(","))]
-
-
 def recover(session: Session, current_run: str) -> list[str]:
     """Finish what interrupted runs of this branch left behind; returns notes.
 
@@ -76,7 +70,7 @@ def recover(session: Session, current_run: str) -> list[str]:
         if root is None:
             continue
         final = layout.internal_dir(
-            root, branch, row.stage_name, layout.unit_relpath(unit_pairs(row.unit_key))
+            root, branch, row.stage_name, layout.unit_relpath(layout.parse_unit_key(row.unit_key))
         )
         if not final.parent.exists():
             continue

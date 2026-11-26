@@ -33,7 +33,7 @@ from contextlib import AsyncExitStack, ExitStack
 from dataclasses import replace
 from typing import Any
 
-from varve.keying.config_access import ConfigAccess, merge_access, record_config
+from varve.keying.config_access import ConfigAccess, record_config
 from varve.resource import Resource, RunCtx
 
 
@@ -67,11 +67,27 @@ def recording_ctx(run_ctx: RunCtx, access: ConfigAccess) -> RunCtx:
     return replace(run_ctx, config=record_config(run_ctx.config, access))
 
 
-def resolve_accesses(accesses: Iterable[ConfigAccess]) -> list[str] | None:
-    merged: list[str] | None = []
-    for access in accesses:
-        merged = merge_access(merged, access.resolve())
-    return merged
+def open_manager(resource: Resource[Any], run_ctx: RunCtx, access: ConfigAccess) -> Any:
+    """``resource.open``'s context manager; its Config reads are recorded into ``access``."""
+
+    assert resource.open is not None
+    return resource.open(recording_ctx(run_ctx, access))
+
+
+async def enter_any(stack: AsyncExitStack, manager: Any) -> Any:
+    """Enter a sync or async context manager on ``stack``."""
+
+    if hasattr(manager, "__aenter__"):
+        return await stack.enter_async_context(manager)
+    return stack.enter_context(manager)
+
+
+def enter_sync(stack: ExitStack, manager: Any, refusal: Exception) -> Any:
+    """Enter a sync context manager on ``stack``; raise ``refusal`` for an async one."""
+
+    if not hasattr(manager, "__enter__"):
+        raise refusal
+    return stack.enter_context(manager)
 
 
 class ResourceManager:
@@ -127,11 +143,7 @@ class ResourceManager:
                 continue
             access = ConfigAccess()
             try:
-                manager = resource.open(recording_ctx(run_ctx, access))
-                if hasattr(manager, "__aenter__"):
-                    session = await stack.enter_async_context(manager)  # type: ignore[arg-type]
-                else:
-                    session = stack.enter_context(manager)  # type: ignore[arg-type]
+                session = await enter_any(stack, open_manager(resource, run_ctx, access))
             except Exception as error:
                 raise ResourceError(
                     f"Resource {resource.name!r} failed to open: {type(error).__name__}: {error}"
@@ -169,12 +181,10 @@ def open_worker_sessions(
             sessions[index] = None
             continue
         access = ConfigAccess()
-        manager = resource.open(recording_ctx(run_ctx, access))
-        if not hasattr(manager, "__enter__"):
-            raise ResourceError(
-                f"Resource {resource.name!r} (scope='worker') returned an async context manager; "
-                "process workers need a sync context manager"
-            )
-        sessions[index] = stack.enter_context(manager)  # type: ignore[arg-type]
+        refusal = ResourceError(
+            f"Resource {resource.name!r} (scope='worker') returned an async context manager; "
+            "process workers need a sync context manager"
+        )
+        sessions[index] = enter_sync(stack, open_manager(resource, run_ctx, access), refusal)
         accesses[index] = access
     return sessions, accesses

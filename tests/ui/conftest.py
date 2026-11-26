@@ -6,37 +6,40 @@ from typing import Any
 
 import pytest
 
+from varve import Axis, Pipeline, Ref, stage
+from varve.engine.session import graph_document
 from varve.keying.keys import FileSetRow
 from varve.store.db import connect, write_meta
 from varve.store.layout import state_db_path, unit_log_path
 from varve.store.repo import BranchRow, Repo, RunRow, StageRunRow, UnitRow
 
-CORPUS_GRAPH = {
-    "stages": [
-        {"name": "prepare", "deps": [], "axes": [], "storage": "default", "version": None},
-        {
-            "name": "shard",
-            "deps": [{"stage": "prepare", "kind": "data"}],
-            "axes": [{"name": "shard", "kind": "static"}],
-            "storage": "default",
-            "version": "2",
-        },
-        {"name": "merge", "deps": ["shard", {"stage": "prepare", "kind": "needs"}]},
-    ],
-    "refs": [],
-}
-EVAL_GRAPH = {
-    "stages": [{"name": "score", "deps": [{"stage": "ref:corpus:merge", "kind": "data"}]}],
-    "refs": [
-        {
-            "attr": "corpus",
-            "target": "corpus",
-            "stage": "merge",
-            "branches": ["main"],
-            "align_by": None,
-        }
-    ],
-}
+# The rows below are hand-written (fixed run ids, timestamps, failures, a running run);
+# the recorded graphs are what the engine writes for these pipelines.
+
+
+PART = Axis("part", [str(i) for i in range(11)])
+
+
+class Corpus(Pipeline):
+    @stage()
+    def prepare(self) -> None: ...
+
+    @stage(foreach=PART, version="2")
+    def shard(self, prepare) -> None: ...
+
+    @stage(needs="prepare")
+    def merge(self, shard) -> None: ...
+
+
+class Eval(Pipeline):
+    corpus = Ref("corpus", stage="merge")
+
+    @stage()
+    def score(self, corpus) -> None: ...
+
+
+def _graph_json(pipeline: type[Pipeline]) -> str:
+    return json.dumps(graph_document(pipeline.graph()))
 
 
 def _components(fileset: str | None = None, version: str | None = None) -> dict:
@@ -115,12 +118,12 @@ def build_corpus(root: Path) -> Path:
             "module": "demo.corpus",
             "qualname": "Corpus",
             "root": str(root),
-            "graph_json": json.dumps(CORPUS_GRAPH),
+            "graph_json": _graph_json(Corpus),
         },
     )
     repo.upsert_storages({"default": root / "out"})
     for name in ("main", "dev"):
-        repo.upsert_branch(BranchRow(name, name, config={"lang": "en"}, active_axes={}))
+        repo.upsert_branch(BranchRow(name, config={"lang": "en"}, active_axes={}))
     repo.insert_run(
         _run(
             "r1",
@@ -196,7 +199,7 @@ def build_corpus(root: Path) -> Path:
             _unit(
                 "main",
                 "shard",
-                f"shard={i}",
+                f"part={i}",
                 "ok",
                 last_run_id="r2",
                 duration_ms=1000 + i,
@@ -215,7 +218,7 @@ def build_corpus(root: Path) -> Path:
             _unit(
                 "main",
                 "shard",
-                f"shard={i}",
+                f"part={i}",
                 "failed",
                 last_run_id="r3",
                 error_type=etype,
@@ -223,14 +226,15 @@ def build_corpus(root: Path) -> Path:
                 error_traceback=f"Traceback (most recent call last):\n{etype}: {summary}",
             )
         )
-    units.append(_unit("main", "shard", "shard=9", "running", last_run_id="r3"))
+    units.append(_unit("main", "shard", "part=9", "running", last_run_id="r3"))
     units.append(
-        _unit("main", "shard", "shard=10", "orphaned", last_run_id="r1", artifact_bytes=999)
+        _unit("main", "shard", "part=10", "orphaned", last_run_id="r1", artifact_bytes=999)
     )
     units.append(_unit("dev", "prepare", "", "ok", duration_ms=5))
+    units.append(_unit("dev", "retired", "", "ok"))  # a stage removed from the code
     repo.upsert_units(units)
     conn.close()
-    log = unit_log_path(root, "r3", "shard", "shard=6")
+    log = unit_log_path(root, "r3", "shard", "part=6")
     log.parent.mkdir(parents=True)
     log.write_text("hello from shard 6\n")
     return path
@@ -241,31 +245,8 @@ def build_eval(root: Path) -> Path:
 
     path = state_db_path(root)
     conn = connect(path)
-    write_meta(conn, {"pipeline_name": "demo.eval", "graph_json": json.dumps(EVAL_GRAPH)})
-    Repo(conn).upsert_branch(BranchRow("main", "main", config={}, active_axes={}))
-    conn.close()
-    return path
-
-
-def build_bare(root: Path) -> Path:
-    """No pipeline_name, no graph_json: ids fall back to a path hash, order is inferred."""
-
-    path = state_db_path(root)
-    conn = connect(path)
-    repo = Repo(conn)
-    repo.upsert_storages({"default": root / "out"})
-    repo.upsert_branch(BranchRow("main", "main", config={}, active_axes={}))
-    repo.insert_run(_run("b1", "2026-11-01T00:00:00", "ok", total_wall_ms=10))
-    # Inserted out of order on purpose: finish order in the run defines the stage order.
-    repo.put_stage_run(_stage_run("b1", "late", "2026-11-01T00:00:09", 1, 1))
-    repo.put_stage_run(_stage_run("b1", "early", "2026-11-01T00:00:01", 1, 1))
-    repo.upsert_units(
-        [
-            _unit("main", "late", "", "ok", last_run_id="b1"),
-            _unit("main", "early", "", "ok", last_run_id="b1"),
-            _unit("main", "lonely", "", "ok"),
-        ]
-    )
+    write_meta(conn, {"pipeline_name": "demo.eval", "graph_json": _graph_json(Eval)})
+    Repo(conn).upsert_branch(BranchRow("main", config={}, active_axes={}))
     conn.close()
     return path
 
@@ -275,5 +256,4 @@ def workspace(tmp_path: Path) -> dict[str, Path]:
     return {
         "corpus": build_corpus(tmp_path / "corpus"),
         "eval": build_eval(tmp_path / "eval"),
-        "bare": build_bare(tmp_path / "bare"),
     }

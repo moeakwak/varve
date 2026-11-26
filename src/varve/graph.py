@@ -133,13 +133,9 @@ class StageNode:
                 merged[resource.name] = resource
         return tuple(merged.values())
 
-    def dependencies_for(
-        self, ctx: DepCtx, resources: Sequence[Resource[Any]] | None = None
-    ) -> Dependencies:
+    def dependencies_for(self, ctx: DepCtx, resources: Sequence[Resource[Any]]) -> Dependencies:
         """Merged defaults + stage + resource dependencies of one cell."""
 
-        if resources is None:
-            resources = self.resources_for(ctx)
         labelled = [
             (f"stage {self.name!r}", resolve_dependencies(spec, ctx)) for spec in self.depends
         ]
@@ -202,6 +198,22 @@ class StageGraph:
             if current != name and any(dep in seen for dep in node.deps):
                 seen.add(current)
         return [item for item in self.nodes if item in seen and item != name]
+
+    def select(
+        self, *, only: str | None = None, upto: str | None = None, downstream: str | None = None
+    ) -> list[str]:
+        """Stages picked by ``--only`` / ``--upto`` / ``--downstream`` (default: all)."""
+
+        for name in (only, upto, downstream):
+            if name is not None and name not in self.nodes:
+                raise ValueError(f"Unknown stage {name!r}; stages: {list(self.order)}")
+        if only is not None:
+            return [only]
+        if upto is not None:
+            return [*self.ancestors(upto), upto]
+        if downstream is not None:
+            return [downstream, *self.descendants(downstream)]
+        return list(self.order)
 
     def storage_names(self) -> set[str]:
         return {node.storage for node in self.nodes.values()}
@@ -591,10 +603,6 @@ class Unit:
     def relpath(self) -> str:
         return layout.unit_relpath([(axis.name, item) for axis, item in zip(self.axes, self.ids)])
 
-    @property
-    def unit_hash(self) -> str:
-        return layout.unit_hash(self.unit_key)
-
     def axis_inputs(self) -> dict[str, PathSet]:
         """Path values of dynamic axes; they enter the ``inputs`` key segment."""
 
@@ -616,24 +624,6 @@ class Unit:
 
 def _is_path(value: Any) -> bool:
     return isinstance(value, Path)
-
-
-def key_material(deps: Dependencies, unit: Unit) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Inputs and values of one unit's key: Dependencies plus dynamic axis paths/values."""
-
-    inputs: dict[str, Any] = dict(deps.inputs)
-    values: dict[str, Any] = dict(deps.values)
-    for target, extra, kind in (
-        (inputs, unit.axis_inputs(), "inputs"),
-        (values, unit.axis_values(), "values"),
-    ):
-        clash = sorted(set(target) & set(extra))
-        if clash:
-            raise GraphError(
-                f"Stage {unit.stage!r}: Dependencies {kind} {clash} clash with axis names"
-            )
-        target.update(extra)
-    return inputs, values
 
 
 DomainKey = tuple[Axis, tuple[str, ...]]
@@ -757,10 +747,6 @@ def expand_stage(
 
 Upstream = Unit | dict[Any, Unit]
 """1-to-1 alignment yields a Unit; fan-in yields an ordered dict keyed by the upstream-only axes."""
-
-
-def is_fan_in(down_axes: Sequence[Axis], up_axes: Sequence[Axis]) -> bool:
-    return any(axis not in down_axes for axis in up_axes)
 
 
 def align(

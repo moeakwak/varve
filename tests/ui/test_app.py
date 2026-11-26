@@ -31,8 +31,7 @@ def client(workspace: dict[str, Path]) -> TestClient:
 def test_workspace_overview(client: TestClient, workspace: dict[str, Path]) -> None:
     data = client.get("/api/workspace").json()
     pipes = {p["id"]: p for p in data["pipelines"]}
-    bare_id = next(i for i in pipes if i.startswith("db-"))
-    assert set(pipes) == {"demo.corpus", "demo.eval", bare_id}
+    assert set(pipes) == {"demo.corpus", "demo.eval"}
     corpus = pipes["demo.corpus"]
     assert corpus["has_graph"] and corpus["stage_count"] == 3 and corpus["error"] is None
     main = next(b for b in corpus["branches"] if b["name"] == "main")
@@ -50,7 +49,6 @@ def test_workspace_overview(client: TestClient, workspace: dict[str, Path]) -> N
     }
     dev = next(b for b in corpus["branches"] if b["name"] == "dev")
     assert dev["last_run"] is None and dev["active"] is None
-    assert pipes[bare_id]["stage_count"] == 3 and not pipes[bare_id]["has_graph"]
     assert data["edges"] == [
         {
             "source": "demo.corpus",
@@ -78,7 +76,6 @@ def test_workspace_reports_broken_dbs(tmp_path: Path, workspace: dict[str, Path]
 
 def test_branch_detail_with_graph(client: TestClient) -> None:
     data = client.get(API).json()
-    assert data["graph_source"] == "meta"
     assert [s["name"] for s in data["stages"]] == ["prepare", "shard", "merge"]
     assert data["edges"] == [
         {"from": "prepare", "to": "shard", "kind": "data"},
@@ -101,20 +98,22 @@ def test_branch_detail_with_graph(client: TestClient) -> None:
     assert set(data["storages"]) == {"default"}
 
 
-def test_branch_detail_inferred_order(client: TestClient) -> None:
-    pipes = client.get("/api/workspace").json()["pipelines"]
-    bare_id = next(p["id"] for p in pipes if p["id"].startswith("db-"))
-    data = client.get(f"/api/pipelines/{bare_id}/branches/main").json()
-    assert data["graph_source"] == "inferred"
-    assert data["edges"] == []
-    assert [s["name"] for s in data["stages"]] == ["early", "late", "lonely"]
+def test_branch_detail_lists_stages_removed_from_the_code(client: TestClient) -> None:
+    data = client.get("/api/pipelines/demo.corpus/branches/dev").json()
+    assert [(s["name"], s["declared"]) for s in data["stages"]] == [
+        ("prepare", True),
+        ("shard", True),
+        ("merge", True),
+        ("retired", False),
+    ]
+    assert data["stages"][3]["ok"] == 1 and len(data["edges"]) == 3
 
 
 def test_unknown_things_are_404(client: TestClient) -> None:
     assert client.get("/api/pipelines/nope/branches/main").status_code == 404
     assert client.get("/api/pipelines/demo.corpus/branches/nope").status_code == 404
     assert client.get(f"{API}/stages/nope/units").status_code == 404
-    assert client.get(f"{API}/stages/shard/units/shard=99").status_code == 404
+    assert client.get(f"{API}/stages/shard/units/part=99").status_code == 404
     assert client.get("/api/runs/nope").status_code == 404
     assert client.get(f"{API}/stages/shard/units?page=x").status_code == 400
 
@@ -122,10 +121,10 @@ def test_unknown_things_are_404(client: TestClient) -> None:
 def test_units_pagination_and_filters(client: TestClient) -> None:
     first = client.get(f"{API}/stages/shard/units", params={"page_size": 4}).json()
     assert first["total"] == 11 and first["pages"] == 3 and first["page"] == 1
-    assert [u["unit_key"] for u in first["units"]] == [f"shard={i}" for i in range(4)]
+    assert [u["unit_key"] for u in first["units"]] == [f"part={i}" for i in range(4)]
     assert first["counts"] == {"ok": 6, "failed": 3, "running": 1, "orphaned": 1}
     last = client.get(f"{API}/stages/shard/units", params={"page_size": 4, "page": 3}).json()
-    assert [u["unit_key"] for u in last["units"]] == ["shard=8", "shard=9", "shard=10"]
+    assert [u["unit_key"] for u in last["units"]] == ["part=8", "part=9", "part=10"]
     reused = first["units"][1]
     assert reused["reused"] is True and reused["linked_from"] is None
     assert first["units"][2]["linked_from"] == "dev"
@@ -136,13 +135,13 @@ def test_units_pagination_and_filters(client: TestClient) -> None:
         f"{API}/stages/shard/units",
         params={"error_type": "ValueError", "error_summary": "bad row"},
     ).json()
-    assert [u["unit_key"] for u in group["units"]] == ["shard=6", "shard=7"]
+    assert [u["unit_key"] for u in group["units"]] == ["part=6", "part=7"]
     search = client.get(f"{API}/stages/shard/units", params={"q": "=1"}).json()
-    assert [u["unit_key"] for u in search["units"]] == ["shard=1", "shard=10"]
+    assert [u["unit_key"] for u in search["units"]] == ["part=1", "part=10"]
     by_duration = client.get(
         f"{API}/stages/shard/units", params={"sort": "duration", "page_size": 2}
     ).json()
-    assert [u["unit_key"] for u in by_duration["units"]] == ["shard=5", "shard=4"]
+    assert [u["unit_key"] for u in by_duration["units"]] == ["part=5", "part=4"]
     clamped = client.get(f"{API}/stages/shard/units", params={"page_size": 100000}).json()
     assert clamped["page_size"] == 500
 
@@ -152,7 +151,7 @@ def test_units_error_groups_and_metrics(client: TestClient) -> None:
     groups = [(g["error_type"], g["error_summary"], g["count"]) for g in data["error_groups"]]
     assert groups == [("ValueError", "bad row", 2), ("KeyError", "'x'", 1)]
     first = data["error_groups"][0]
-    assert first["sample_unit_key"] == "shard=6"
+    assert first["sample_unit_key"] == "part=6"
     assert first["sample_traceback"].endswith("ValueError: bad row")
     assert data["metrics"] == [
         {"name": "items", "units": 6, "sum": 600, "min": 100, "max": 100, "mean": 100.0}
@@ -162,7 +161,7 @@ def test_units_error_groups_and_metrics(client: TestClient) -> None:
 
 
 def test_unit_detail(client: TestClient) -> None:
-    data = client.get(f"{API}/stages/shard/units/shard=6").json()
+    data = client.get(f"{API}/stages/shard/units/part=6").json()
     assert data["unit"]["status"] == "failed"
     assert data["unit"]["error_traceback"].startswith("Traceback")
     assert data["unit"]["source_detail"]["symbols"] == {"Pipe.shard": "1" * 16, "helper": "2" * 16}
@@ -176,9 +175,9 @@ def test_unit_detail(client: TestClient) -> None:
     assert data["log"]["available"] and data["log"]["text"] == "hello from shard 6\n"
     assert data["run"]["run_id"] == "r3"
 
-    reused = client.get(f"{API}/stages/shard/units/shard%3D1").json()
+    reused = client.get(f"{API}/stages/shard/units/part%3D1").json()
     assert [label["text"] for label in reused["labels"]] == ["version=2", "reused"]
-    linked = client.get(f"{API}/stages/shard/units/shard=2").json()
+    linked = client.get(f"{API}/stages/shard/units/part=2").json()
     assert {"kind": "linked", "text": "linked@dev"} in linked["labels"]
     assert linked["log"] == {
         "available": False,
@@ -255,7 +254,7 @@ def _hit_everything(client: TestClient) -> None:
         "/api/workspace",
         API,
         f"{API}/stages/shard/units?status=failed",
-        f"{API}/stages/shard/units/shard=6",
+        f"{API}/stages/shard/units/part=6",
         f"{API}/stages/prepare/units/_",
         f"{API}/history",
         f"{API}/history?stage=shard",
@@ -278,31 +277,17 @@ def test_never_writes(workspace: dict[str, Path]) -> None:
         assert not wal.exists() or wal.stat().st_size == 0, files_before[name]
 
 
-def test_reads_while_a_writer_holds_the_wal(workspace: dict[str, Path]) -> None:
-    writer = connect(workspace["corpus"])
-    try:
-        writer.execute("BEGIN IMMEDIATE")
-        writer.execute("UPDATE units SET status = 'ok' WHERE unit_key = 'shard=9'")
-        client = TestClient(create_app(list(workspace.values())))
-        _hit_everything(client)
-        assert client.get(API).json()["running_units"] == 1  # uncommitted write is invisible
-        writer.execute("COMMIT")
-        assert client.get(API).json()["running_units"] == 0
-    finally:
-        writer.close()
-
-
 def test_discovery_callable_is_reevaluated(tmp_path: Path, workspace: dict[str, Path]) -> None:
     found = discover_state_dbs(workspace["corpus"].parents[2])
     assert found == sorted(workspace.values())
     client = TestClient(create_app(lambda: discover_state_dbs(tmp_path)))
-    assert len(client.get("/api/workspace").json()["pipelines"]) == 3
+    assert len(client.get("/api/workspace").json()["pipelines"]) == 2
     conn = connect(tmp_path / "late" / ".varve" / "state.db")
     write_meta(conn, {"pipeline_name": "demo.late"})
     conn.close()
     assert client.get("/api/pipelines/demo.late/branches/main").status_code == 404  # no branch
     ids = {p["id"] for p in client.get("/api/workspace").json()["pipelines"]}
-    assert "demo.late" in ids and len(ids) == 4
+    assert "demo.late" in ids and len(ids) == 3
 
 
 def test_discovery_skips_noise(tmp_path: Path, workspace: dict[str, Path]) -> None:

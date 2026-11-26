@@ -8,7 +8,7 @@ fingerprint is kept separate (``units.source_fp``) and compared by
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -111,7 +111,8 @@ def compute_input_key(
     """Assemble the key of one unit.
 
     ``config`` is projected on ``config_access`` (``None``: whole config).
-    ``upstream`` maps upstream/Ref names to :func:`upstream_entry` values.
+    ``upstream`` maps upstream/Ref names to their key entries (an artifact fp,
+    or ``[[unit_key, fp], ...]`` for fan-in).
     ``inputs`` come from ``FingerprintSession.inputs`` (Dependencies inputs
     plus ``Unit.axis_inputs()``); ``values`` are Dependencies values plus
     ``Unit.axis_values()``. ``hashes`` may carry segment hashes the probe
@@ -160,18 +161,6 @@ def compute_input_key(
         "version": {"hash": segment_hashes["version"], "summary": version, "produces": produces},
     }
     return InputKey(combine_hashes(segment_hashes), components, file_sets)
-
-
-def upstream_entry(binding: Any, artifact_fp: Callable[[Any], str]) -> str | list[list[str]]:
-    """Key material of one aligned upstream: an artifact fp, or ``[[unit_key, fp], ...]`` for fan-in.
-
-    ``binding`` is what ``graph.align`` returned (a Unit or a fan-in dict of Units);
-    ``artifact_fp`` maps an upstream unit to its committed ``artifact_fp``.
-    """
-
-    if isinstance(binding, Mapping):
-        return [[unit.unit_key, artifact_fp(unit)] for unit in binding.values()]
-    return artifact_fp(binding)
 
 
 def changed_segments(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:

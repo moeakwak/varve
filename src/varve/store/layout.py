@@ -52,10 +52,12 @@ def path_segment(text: str) -> str:
     return quote(text, safe=_PATH_SAFE)
 
 
-def unit_key(pairs: Sequence[tuple[str, str]]) -> str:
-    """``"a1=id1,a2=id2"`` in foreach order; ``""`` for a stage without axes."""
+def parse_unit_key(key: str) -> list[tuple[str, str]]:
+    """``(axis, id)`` pairs of a ``"a1=id1,a2=id2"`` unit key; ``[]`` for ``""``."""
 
-    return ",".join(f"{name}={item}" for name, item in pairs)
+    if not key:
+        return []
+    return [(name, item) for name, _, item in (part.partition("=") for part in key.split(","))]
 
 
 def unit_relpath(pairs: Sequence[tuple[str, str]]) -> str:

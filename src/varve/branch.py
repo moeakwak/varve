@@ -6,9 +6,10 @@ import json
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import yaml
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -23,11 +24,24 @@ def validate_branch_name(name: str) -> str:
     return name
 
 
-class BranchDefinition(NamedTuple):
-    config: dict[str, Any]
-    axes: dict[str, list[str]]
-    is_temporary: bool
+class BranchDefinition(BaseModel):
+    """One ``varve.yaml`` branch: Config fields, axis restrictions, and flags."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    config: dict[str, Any] = {}
+    axes: dict[str, list[str]] = {}
+    is_temporary: bool = False
     manual: bool = False
+
+
+def validation_message(error: ValidationError) -> str:
+    """One line per pydantic error: ``location: message``."""
+
+    return "; ".join(
+        f"{'.'.join(str(part) for part in item['loc']) or '<root>'}: {item['msg']}"
+        for item in error.errors()
+    )
 
 
 def load_branches(yaml_path: Path | None) -> dict[str, BranchDefinition]:
@@ -35,53 +49,21 @@ def load_branches(yaml_path: Path | None) -> dict[str, BranchDefinition]:
     if yaml_path is None or not Path(yaml_path).exists():
         return {}
 
-    raw = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8"))
-    if raw is None:
-        raw = {}
+    raw = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8")) or {}
     if not isinstance(raw, Mapping):
         raise ValueError(f"varve.yaml must be a mapping of branch names to configs: {yaml_path}")
     for name in raw:
         validate_branch_name(name)
-
-    result: dict[str, BranchDefinition] = {}
-    for branch, section in raw.items():
-        if section is None:
-            section = {}
-        if not isinstance(section, Mapping):
-            raise ValueError(f"Varve branch {branch!r} must be a mapping in {yaml_path}")
-
-        unknown = set(section) - {"config", "axes", "is_temporary", "manual"}
-        if unknown:
+    branches: dict[str, BranchDefinition] = {}
+    for name, section in raw.items():
+        try:
+            branches[name] = BranchDefinition.model_validate(section or {})
+        except ValidationError as error:
             raise ValueError(
-                f"Varve branch {branch!r} uses the removed flat config format in {yaml_path}; "
-                "move Config fields under 'config:'"
-            )
-        config = section.get("config", {})
-        axes = section.get("axes", {})
-        is_temporary = section.get("is_temporary", False)
-        manual = section.get("manual", False)
-        if not isinstance(config, Mapping):
-            raise ValueError(f"Varve branch {branch!r} config must be a mapping in {yaml_path}")
-        if not isinstance(axes, Mapping) or any(
-            not isinstance(name, str)
-            or not isinstance(values, list)
-            or any(not isinstance(value, str) for value in values)
-            for name, values in axes.items()
-        ):
-            raise ValueError(
-                f"Varve branch {branch!r} axes must map axis names to lists of ids in {yaml_path}"
-            )
-        if not isinstance(is_temporary, bool):
-            raise ValueError(f"Varve branch {branch!r} has non-boolean is_temporary in {yaml_path}")
-        if not isinstance(manual, bool):
-            raise ValueError(f"Varve branch {branch!r} has non-boolean manual in {yaml_path}")
-        result[branch] = BranchDefinition(
-            config=dict(config),
-            axes={name: list(values) for name, values in axes.items()},
-            is_temporary=is_temporary,
-            manual=manual,
-        )
-    return result
+                f"Varve branch {name!r} in {yaml_path}: {validation_message(error)} "
+                "(a branch holds config:, axes:, is_temporary:, and manual:)"
+            ) from None
+    return branches
 
 
 def canonical_config_json(config: Mapping[str, Any]) -> str:

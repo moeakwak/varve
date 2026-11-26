@@ -7,8 +7,6 @@ import sqlite3
 
 from varve.engine import RunOptions
 from varve.store import layout
-from varve.store.db import connect
-from varve.store.repo import Repo
 
 SOURCE = """
 import asyncio
@@ -80,10 +78,6 @@ def _overlap(a, b) -> bool:
     return a[0] < b[1] and b[0] < a[1]
 
 
-def _repo(ws) -> Repo:
-    return Repo(connect(layout.state_db_path(ws.root), readonly=True))
-
-
 def test_async_backend_runs_concurrently_and_captures_logs(ws) -> None:
     Demo = ws.write(SOURCE)
     result = ws.run(Demo, options=RunOptions(only="aio", tui=False))
@@ -92,14 +86,14 @@ def test_async_backend_runs_concurrently_and_captures_logs(ws) -> None:
     assert any(_overlap(a, b) for i, a in enumerate(spans) for b in spans[i + 1 :])
     log = layout.unit_log_path(ws.root, result.run_id, "aio", "item=i3")
     assert log.read_text() == "aio says i3\n"
-    repo = _repo(ws)
-    [stage_run] = repo.stage_runs("main", stage="aio")
+    repo = ws.repo()
+    [stage_run] = [row for row in ws.stage_runs(repo) if row.stage_name == "aio"]
     assert stage_run.metrics_summary == {"items": 12}
     assert stage_run.workers == 3 and stage_run.executed_units == 6
     assert stage_run.unit_p50_ms is not None and stage_run.unit_max_ms is not None
     assert stage_run.unit_max_ms >= stage_run.unit_p50_ms
-    run = repo.get_run(result.run_id)
-    assert run is not None and run.status == "ok" and run.total_wall_ms is not None
+    (run,) = repo.runs("main")
+    assert run.run_id == result.run_id and run.status == "ok" and run.total_wall_ms is not None
     assert {row.last_run_id for row in repo.units("main", "aio").values()} == {result.run_id}
     repo.conn.close()
 
@@ -115,7 +109,7 @@ def test_process_backend_parallel_with_config_access_and_logs(ws) -> None:
     assert any(_overlap(a, b) for i, a in enumerate(values) for b in values[i + 1 :])
     log = layout.unit_log_path(ws.root, result.run_id, "proc", "item=i0")
     assert log.read_text() == "proc says i0 on\n"
-    repo = _repo(ws)
+    repo = ws.repo()
     rows = repo.units("main", "proc")
     assert {tuple(row.config_access or ["<all>"]) for row in rows.values()} == {("flag",)}
     assert all(row.peak_rss_mb for row in rows.values())
@@ -148,7 +142,7 @@ def test_max_failures_then_failed_only(ws, capsys) -> None:
     assert first.status == "failed" and first.exit_code == 1
     assert (outcome.executed, outcome.failed) == (2, 2)
     assert "max_failures=2" in (outcome.detail or "")
-    repo = _repo(ws)
+    repo = ws.repo()
     failed = repo.get_unit("main", "flaky", "item=i0")
     assert failed is not None and failed.status == "failed"
     assert failed.error_type == "RuntimeError" and failed.error_summary == "boom i0"
@@ -300,45 +294,21 @@ def test_exclusive_units_run_alone_on_async_and_process_backends(ws) -> None:
 # -- several processes on one store -------------------------------------------------
 
 
-def _wait_for(path, proc) -> None:
-    import time
-
-    deadline = time.monotonic() + 20
-    while not path.exists():
-        assert time.monotonic() < deadline and proc.poll() is None, proc.communicate()
-        time.sleep(0.02)
-
-
-def _spawn_run(ws, *argv: str):
-    import os
-    import subprocess
-    import sys
-
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
-    return subprocess.Popen(
-        [sys.executable, str(ws.path), "run", "--no-tui", "--root", str(ws.root), *argv],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-
 def test_same_branch_run_is_refused_while_another_branch_runs_alongside(ws, capsys) -> None:
     markers = ws.base / "markers"
     markers.mkdir()
     config = {"marker_dir": str(markers), "pause": 0.15}
     (ws.src / "varve.yaml").write_text(json.dumps({"main": {"config": config}, "other": {}}))
     Demo = ws.write(WINDOW)
-    proc = _spawn_run(ws, "--only", "slow")
-    _wait_for(markers / "started-i1", proc)
+    proc = ws.spawn_run("--only", "slow", capture=True)
+    ws.wait_for(markers / "started-i1", proc)
     assert ws.cli(Demo, "run", "--only", "slow", "--no-tui") == 1
     assert "another varve command" in capsys.readouterr().err
     other = ws.run(Demo, branch="other", options=RunOptions(only="slow", tui=False))
     assert other.status == "ok" and other.stages["slow"].executed == 8
     _, stderr = proc.communicate(timeout=30)
     assert proc.returncode == 0, stderr
-    repo = _repo(ws)
+    repo = ws.repo()
     assert sorted(run.status for run in repo.runs("main") + repo.runs("other")) == ["ok", "ok"]
     for branch in ("main", "other"):
         rows = repo.units(branch, "slow")

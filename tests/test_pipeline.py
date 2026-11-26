@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -81,8 +81,9 @@ def test_storage_and_publish_root_resolution(tmp_path: Path) -> None:
 
 def test_layout_paths(tmp_path: Path) -> None:
     pairs = [("dataset", "mw 2024"), ("batch", "7")]
-    key = layout.unit_key(pairs)
-    assert key == "dataset=mw 2024,batch=7"
+    key = "dataset=mw 2024,batch=7"
+    assert layout.parse_unit_key(key) == pairs
+    assert layout.parse_unit_key("") == []
     assert layout.unit_relpath(pairs) == "dataset=mw%202024/batch=7"
     assert layout.internal_dir(tmp_path, "main", "work", "a=1") == (
         tmp_path / ".internal" / "main" / "work" / "a=1"
@@ -99,11 +100,7 @@ def test_layout_paths(tmp_path: Path) -> None:
 
 class RecordingSink:
     def __init__(self) -> None:
-        self.metrics: list[Mapping[str, Any]] = []
         self.progress_calls: list[tuple[int | None, str | None]] = []
-
-    def metric(self, ctx: Ctx[Any, Any], values: Mapping[str, Any]) -> None:
-        self.metrics.append(dict(values))
 
     def progress(
         self, ctx: Ctx[Any, Any], iterable: Iterable[Any], total: int | None, desc: str | None
@@ -132,7 +129,6 @@ def test_ctx_data_and_sink(tmp_path: Path) -> None:
     ctx.metric(items=3, rows=10)
     ctx.metric(items=4)
     assert ctx.metrics == {"items": 4, "rows": 10}
-    assert sink.metrics == [{"items": 3, "rows": 10}, {"items": 4}]
     assert list(ctx.progress([1, 2, 3], desc="rows")) == [1, 2, 3]
     assert list(ctx.progress(iter([1]))) == [1]
     assert sink.progress_calls == [(3, "rows"), (None, None)]

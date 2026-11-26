@@ -16,8 +16,8 @@ from typing import Any
 from pydantic import BaseModel
 
 from varve.branch_config import BranchRequest
+from varve.decorators import parse_selector
 from varve.engine.capture import terminal_to_process_log
-from varve.engine.clean import CleanPlan, clean_pipeline, plan_clean
 from varve.engine.events import Event, EventBus
 from varve.engine.probe import ProbeError, StagePlan, probe
 from varve.engine.refs import RefInfo, RefResolver, bound_refs
@@ -32,17 +32,6 @@ from varve.store import layout
 from varve.store.lock import branch_lock, pipeline_lock
 
 ArgsInput = BaseModel | Mapping[str, Any] | None
-
-
-def _request(
-    branch: str,
-    overrides: Mapping[str, Any] | str | None = None,
-    temp: bool = False,
-    slices: Mapping[str, Sequence[str]] | None = None,
-    samples: Mapping[str, int] | None = None,
-    seed: int = 0,
-) -> BranchRequest:
-    return BranchRequest(branch, overrides, temp, dict(slices or {}), dict(samples or {}), seed)
 
 
 def run_pipeline(
@@ -71,7 +60,7 @@ def run_pipeline(
     """
 
     options = options or RunOptions()
-    request = _request(branch, overrides, temp, slices, samples, seed)
+    request = BranchRequest(branch, overrides, temp, dict(slices or {}), dict(samples or {}), seed)
     session = open_session(
         pipeline,
         request,
@@ -102,29 +91,6 @@ def run_pipeline(
         session.close()
 
 
-def _probe_session(
-    pipeline: type[Pipeline],
-    *,
-    branch: str,
-    args: ArgsInput,
-    root: Path | None,
-    refs: RefResolver | None,
-    workspace: WorkspaceSettings | None,
-    rehash: bool = False,
-    readonly: bool = True,
-) -> Session:
-    return open_session(
-        pipeline,
-        _request(branch),
-        root=root,
-        args=args,
-        readonly=readonly,
-        refs=refs,
-        workspace=workspace,
-        rehash=rehash,
-    )
-
-
 def probe_plans(
     session: Session,
     stages: Sequence[str] | None = None,
@@ -132,8 +98,7 @@ def probe_plans(
     select: Mapping[str, Callable[[Unit], bool]] | None = None,
 ) -> dict[str, StagePlan]:
     for name in stages or ():
-        if name not in session.graph.nodes:
-            raise ValueError(f"Unknown stage {name!r}; stages: {list(session.graph.order)}")
+        session.graph.select(only=name)  # rejects unknown stages
     return probe(session, stages, select=select)
 
 
@@ -151,8 +116,14 @@ def probe_pipeline(
 ) -> PipelineView:
     """Read-only decisions for ``stages`` (default all; ancestors are evaluated too)."""
 
-    session = _probe_session(
-        pipeline, branch=branch, args=args, root=root, refs=refs, workspace=workspace, rehash=rehash
+    session = open_session(
+        pipeline,
+        BranchRequest(branch),
+        root=root,
+        args=args,
+        refs=refs,
+        workspace=workspace,
+        rehash=rehash,
     )
     try:
         plans = probe_plans(session, stages)
@@ -167,13 +138,10 @@ def parse_unit_selector(text: str) -> tuple[str, dict[str, str]]:
     """``stage`` or ``stage@axis=id[,axis=id]`` (omitted axes are wildcards)."""
 
     stage, _, coords = text.partition("@")
-    pairs: dict[str, str] = {}
-    for part in filter(None, coords.split(",")):
-        name, sep, item = part.partition("=")
-        if not sep or not name or not item:
-            raise ValueError(f"Invalid unit selector {text!r}; expected STAGE[@AXIS=ID,...]")
-        pairs[name] = item
-    return stage, pairs
+    try:
+        return stage, dict(parse_selector(coords)) if coords else {}
+    except ValueError:
+        raise ValueError(f"Invalid unit selector {text!r}; expected STAGE[@AXIS=ID,...]") from None
 
 
 @dataclass(frozen=True)
@@ -200,8 +168,8 @@ def inspect_pipeline(
     workspace: WorkspaceSettings | None = None,
 ) -> InspectResult:
     stage, coords = parse_unit_selector(selector)
-    session = _probe_session(
-        pipeline, branch=branch, args=args, root=root, refs=refs, workspace=workspace
+    session = open_session(
+        pipeline, BranchRequest(branch), root=root, args=args, refs=refs, workspace=workspace
     )
     try:
         node = session.graph.nodes.get(stage)
@@ -256,14 +224,14 @@ def reuse_stage(
     """Exempt the current source change of ``stage``: ``ok`` units whose input key
     still matches get ``reused_source_fp = current source_fp``."""
 
-    session = _probe_session(
+    session = open_session(
         pipeline,
-        branch=branch,
-        args=args,
+        BranchRequest(branch),
         root=root,
+        args=args,
+        readonly=False,
         refs=refs,
         workspace=workspace,
-        readonly=False,
     )
     try:
         repo = session.repo
@@ -311,18 +279,3 @@ def reuse_stage(
             return ReuseResult(stage, reused, already, not_reusable)
     finally:
         session.close()
-
-
-__all__ = [
-    "CleanPlan",
-    "InspectResult",
-    "ReuseResult",
-    "RunOptions",
-    "RunResult",
-    "clean_pipeline",
-    "inspect_pipeline",
-    "plan_clean",
-    "probe_pipeline",
-    "reuse_stage",
-    "run_pipeline",
-]

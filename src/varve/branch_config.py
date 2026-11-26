@@ -13,7 +13,7 @@ import hashlib
 import json
 import random
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -218,7 +218,7 @@ def resolve_branch(
 
     name = validate_branch_name(request.name)
     branches = load_branches(pipeline.varve_config_path())
-    main_def = branches.get("main", BranchDefinition({}, {}, False))
+    main_def = branches.get("main", BranchDefinition())
     axes_by_name = pipeline.graph().axes
     slices = {axis: list(ids) for axis, ids in request.slices.items()}
     samples = {axis: Sample(count, request.seed) for axis, count in request.samples.items()}
@@ -268,7 +268,7 @@ def resolve_branch(
         config = build_config(pipeline, raw)
         active = active_for(main_def, "main")
         resolved_name = None if name == "main" else name
-        return _temporary(pipeline, resolved_name, "main", config, active, samples, stored)
+        return _temporary(resolved_name, "main", config, active, samples, stored)
 
     if declared is not None:
         config = build_config(pipeline, declared.config)
@@ -279,19 +279,18 @@ def resolve_branch(
                     f"--slice/--sample would change persistent branch {name!r}; "
                     "add --temp or pass a new --branch name"
                 )
-            return _temporary(pipeline, None, name, config, active, samples, stored)
-        snapshot = config_data(config)
-        if declared.is_temporary:
-            _check_stored(stored, name, snapshot, active, samples)
-        return ResolvedBranch(
+            return _temporary(None, name, config, active, samples, stored)
+        branch = ResolvedBranch(
             name,
             config,
-            snapshot,
+            config_data(config),
             active,
-            {},
             is_temp=declared.is_temporary,
             manual=declared.manual,
         )
+        if declared.is_temporary:
+            _check_stored(stored, branch)
+        return branch
 
     row = stored(name) if stored is not None else None
     if row is not None and not narrowing and not request.temp:
@@ -300,9 +299,7 @@ def resolve_branch(
         return _from_row(pipeline, row)
     if narrowing or request.temp:
         config = build_config(pipeline, main_def.config)
-        return _temporary(
-            pipeline, name, "main", config, active_for(main_def, "main"), samples, stored
-        )
+        return _temporary(name, "main", config, active_for(main_def, "main"), samples, stored)
     raise ValueError(
         f"Unknown branch {name!r}; declare it in varve.yaml, or create a temporary branch "
         "with --temp, --override, --slice, or --sample"
@@ -310,7 +307,6 @@ def resolve_branch(
 
 
 def _temporary(
-    pipeline: type[Pipeline],
     name: str | None,
     base: str,
     config: Any,
@@ -318,27 +314,26 @@ def _temporary(
     samples: dict[str, Sample],
     stored: Callable[[str], BranchRow | None] | None,
 ) -> ResolvedBranch:
+    """A temporary branch named ``name``, else derived from ``base`` and its snapshot."""
+
     snapshot = config_data(config)
-    resolved = ResolvedBranch(base, config, snapshot, active, samples, is_temp=True)
-    branch_name = name or derived_branch_name(base, snapshot, resolved.active_axes_json)
-    validate_branch_name(branch_name)
-    _check_stored(stored, branch_name, snapshot, active, samples)
-    return ResolvedBranch(branch_name, config, snapshot, active, samples, is_temp=True)
+    branch = ResolvedBranch(base, config, snapshot, active, samples, is_temp=True)
+    if name is None:
+        name = derived_branch_name(base, snapshot, branch.active_axes_json)
+    branch = replace(branch, name=validate_branch_name(name))
+    _check_stored(stored, branch)
+    return branch
 
 
-def _check_stored(
-    stored: Callable[[str], BranchRow | None] | None,
-    name: str,
-    snapshot: Mapping[str, Any],
-    active: Mapping[str, list[str]],
-    samples: Mapping[str, Sample],
-) -> None:
+def _check_stored(stored: Callable[[str], BranchRow | None] | None, branch: ResolvedBranch) -> None:
+    """Reject reusing a stored temporary branch name with a different snapshot."""
+
+    name = branch.name
     row = stored(name) if stored is not None else None
     if row is None or not row.is_temp:
         return
-    assert_same_config(row.config, snapshot, branch=name)
-    expected = ResolvedBranch(name, None, dict(snapshot), dict(active), dict(samples))
-    if canonical_config_json(row.active_axes) != canonical_config_json(expected.active_axes_json):
+    assert_same_config(row.config, branch.config_json, branch=name)
+    if canonical_config_json(row.active_axes) != canonical_config_json(branch.active_axes_json):
         raise ValueError(
             f"Temporary varve branch {name!r} was created with different active axes; "
             "use a different --branch name or clean the existing temporary branch first."
@@ -357,5 +352,5 @@ def _from_row(pipeline: type[Pipeline], row: BranchRow) -> ResolvedBranch:
             active[axis] = list(value)
     config = _restore_config(pipeline, row.config)
     return ResolvedBranch(
-        row.name, config, dict(row.config), active, samples, is_temp=True, manual=row.manual
+        row.branch_id, config, dict(row.config), active, samples, is_temp=True, manual=row.manual
     )

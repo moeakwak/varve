@@ -91,9 +91,9 @@ def test_worker_env_reaches_process_workers(ws) -> None:
 def test_workspace_storage_bases(ws) -> None:
     Demo = ws.write(SOURCE)
     base = ws.base / "bulk"
-    workspace = WorkspaceSettings(storage={"default": base}, pipeline_name="demo")
+    workspace = WorkspaceSettings(storage={"default": base})
     ws.run(Demo, options=RunOptions(only="threads", tui=False), workspace=workspace)
-    assert (base / "demo/.internal/main/threads/item=a/v.txt").exists()
+    assert (base / Demo.selector() / ".internal/main/threads/item=a/v.txt").exists()
 
 
 def test_rehash_detects_same_size_same_mtime_edits(ws) -> None:
@@ -123,14 +123,14 @@ def test_rotate_logs_keeps_the_newest_runs(tmp_path: Path) -> None:
 
 
 def test_log_rotation_keeps_the_logs_of_runs_still_running(ws) -> None:
-    from varve.store.db import connect, now_iso
-    from varve.store.repo import BranchRow, Repo, RunRow
+    from varve.store.db import now_iso
+    from varve.store.repo import BranchRow, RunRow
 
     Demo = ws.write(SOURCE)
     assert ws.run(Demo, options=RunOptions(only="threads", tui=False)).status == "ok"
     # A long run of another branch started before 25 newer runs and is still writing logs.
-    repo = Repo(connect(layout.state_db_path(ws.root)))
-    repo.upsert_branch(BranchRow("other", "other", {}, {}))
+    repo = ws.repo(readonly=False)
+    repo.upsert_branch(BranchRow("other", {}, {}))
     repo.insert_run(RunRow("20000101T000000-aaaaaa", "other", now_iso(), "running", [], "h"))
     repo.conn.close()
     base = layout.logs_dir(ws.root)

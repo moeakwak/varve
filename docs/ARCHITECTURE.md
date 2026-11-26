@@ -48,7 +48,7 @@ src/varve/
 │   ├── clean.py         # clean planning and execution
 │   ├── refs.py          # RefResolver protocol, RefBinding, RefInfo, NoRefResolver
 │   └── service.py       # in-process services: run/probe/inspect/reuse/clean
-├── cli/                 # generated pipeline CLI (app.py, argmap.py, render.py)
+├── cli/                 # generated pipeline CLI (app.py, argmap.py, render.py) and arguments/commands shared with `varve` (common.py)
 ├── workspace/           # varve.toml, VARVE_ROOT_BASE, discovery, Ref resolution, macro runs, top-level CLI
 └── ui/                  # optional varve[ui] web UI: discovery, SQL queries, Starlette app, static assets
 ```
@@ -94,7 +94,7 @@ flowchart TD
 - Declaration modules depend only on each other. `graph` depends on declarations and on `store.layout` for unit paths.
 - `keying` and `store` never import `engine`. `store.repo` uses `keying` types for stat-cache and file-set rows.
 - `engine` is the only layer that writes stores and managed directories. It depends on `workspace.config` for `WorkspaceSettings`, and imports `workspace.refs.WorkspaceRefResolver` lazily as the default Ref resolver; it otherwise reaches other pipelines only through the `RefResolver` protocol in `engine.refs`.
-- `cli` parses argv and renders; it calls `engine.service` functions, which take a Pipeline class and keyword options and never parse argv. The top-level `varve` command calls the same services and reuses the generated CLI's renderers.
+- `cli` parses argv and renders; it calls `engine.service` functions, which take a Pipeline class and keyword options and never parse argv. The top-level `varve` command calls the same services and reuses the generated CLI's renderers, argument definitions, command bodies, and error reporting (`cli.common`, which imports the engine only inside its functions).
 - `workspace.discovery` reuses `ui.discovery.discover_state_dbs`, which has no web dependencies. `ui.app` imports Starlette and Uvicorn on first access; nothing else imports them.
 
 ## On-disk layout
@@ -111,7 +111,7 @@ flowchart TD
 <publish_root>/.tmp/<branch>/                   # published files of temporary branches
 ```
 
-`unit_key` is `"a=x,b=y"` in `foreach` order (`""` without axes); `unit_relpath` is `a=x/b=y` with unsafe characters percent-encoded; `unit_hash` is the first 16 hex digits of SHA-256 of `unit_key`. Roots are resolved by `engine.session.resolve_roots`: explicit `--root`, else `VARVE_ROOT_BASE/<pipeline_name>` (which also forces all storages and the publish root below that root), else `Pipeline.default_root(main Config)`. Storage roots combine `Pipeline.storage_roots(config)`, `varve.toml` `[storage]` bases (`<base>/<pipeline_name>`), and `default = <root>/out`; paths are made absolute without resolving symlinks.
+`unit_key` is `"a=x,b=y"` in `foreach` order (`""` without axes; `store.layout.parse_unit_key` splits it back into pairs); `unit_relpath` is `a=x/b=y` with unsafe characters percent-encoded; `unit_hash` is the first 16 hex digits of SHA-256 of `unit_key`. Roots are resolved by `engine.session.resolve_roots`: explicit `--root`, else `VARVE_ROOT_BASE/<pipeline_name>` (which also forces all storages and the publish root below that root), else `Pipeline.default_root(main Config)`. Storage roots combine `Pipeline.storage_roots(config)`, `varve.toml` `[storage]` bases (`<base>/<pipeline_name>`), and `default = <root>/out`; paths are made absolute without resolving symlinks.
 
 ## Store
 
@@ -132,7 +132,7 @@ Each pipeline root has one SQLite database, opened with WAL, `synchronous=NORMAL
 
 `store.repo` hides the split: `key_components_json` keeps every segment's hash, and a summary either inline or, when long, in `key_parts` under `<segment>:<hash>` (every summary is a function of its segment hash, so equal hashes share one row); reads join `sources` and expand the parts back, so `UnitRow.key_components` and `source_detail` look the same as before. `Repo.collect_garbage` deletes `key_parts`, `sources`, and `file_sets` rows no unit references; it runs after every run that executed or linked units and after every `clean`. Orphan `clean` also drops stat-cache rows whose file is gone or changed.
 
-`graph_json` is a zero-import description of the logical graph, written at every run and `reuse`: per stage its dependencies with kind (`data` for injected, `needs`, `resolver`), Ref edges, axes with kind (`static`/`dynamic`; static axes also list their declared `ids` in order), storage, `produces`, publish entries, version, static worker count, and whether it is async; plus every Ref's attribute, target, stage, branches, selector, and `align_by`. The web UI and Ref resolution read it.
+`graph_json` is a zero-import description of the logical graph, written at every run and `reuse`: per stage its dependencies with kind (`data` for injected, `needs`, `resolver`), Ref edges, axes with kind (`static`/`dynamic`; static axes also list their declared `ids` in order), storage, `produces`, publish entries, version, static worker count, and whether it is async; plus every Ref's attribute, target, stage, branches, selector, and `align_by`. The web UI and Ref resolution read it through `store.db.load_graph`.
 
 Invariants:
 
@@ -165,7 +165,7 @@ Unit execution (`engine.unit.execute` / `execute_async`) runs wherever the backe
 
 The scheduler keeps up to `workers` tasks in flight and refills in completion order. An exclusive unit starts only on an empty window and blocks further submissions while it runs; the queue order is kept. A stop request (first Ctrl-C, `max_failures` reached, or a broken process pool) stops submissions and awaits active units. A second Ctrl-C raises `KeyboardInterrupt`, which cancels tasks and terminates process workers.
 
-Events (`RunStarted`, `StagePlanned`, `UnitStarted`, `UnitProgress`, `UnitMetric`, `UnitFinished`, `StageFinished`, `RunFinished`, `Notice`) go through an `EventBus` to either the `rich.Live` display or the plain reporter (`varve` logger on stderr), and to an optional `on_event` callback. Process workers send progress and metric events through a multiprocessing queue pumped by a thread in the main process.
+Events (`RunStarted`, `StagePlanned`, `UnitStarted`, `UnitProgress`, `UnitFinished`, `StageFinished`, `RunFinished`, `Notice`) go through an `EventBus` to either the `rich.Live` display or the plain reporter (`varve` logger on stderr), and to an optional `on_event` callback. Process workers send progress events through a multiprocessing queue pumped by a thread in the main process.
 
 ## Probe and decisions
 

@@ -1,6 +1,6 @@
 """Zero-import resolution of cross-pipeline ``Ref`` inputs.
 
-The upstream store is opened read-only: the ``branches`` row by name, the
+The upstream store is opened read-only: the ``branches`` row, the
 target stage's ``units``, and the ``storages`` table give each committed
 unit's artifact path (``storages.root_path`` + ``artifact_relpath``) and
 fingerprint (``artifact_fp``) without importing the upstream module or
@@ -30,6 +30,7 @@ wraps each value in an outer ``dict`` keyed by branch name. ``selector``
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from collections.abc import Mapping, Sequence
@@ -42,7 +43,7 @@ from varve.decorators import parse_selector
 from varve.engine.refs import RefBinding, RefInfo, RefResolutionError
 from varve.ref import Ref
 from varve.store import layout
-from varve.store.db import SchemaError, connect, read_meta
+from varve.store.db import SchemaError, connect, load_graph, read_meta
 from varve.workspace.config import WorkspaceSettings
 from varve.workspace.discovery import Entry, discover, match_entries
 from varve.workspace.modules import locate_module
@@ -234,17 +235,19 @@ def _read_stage(location: UpstreamLocation, branch: str, stage: str, attr: str) 
         raise RefResolutionError(f"Ref {attr!r}: cannot read {db_path}: {error}") from error
     try:
         found = conn.execute(
-            "SELECT branch_id, active_axes_json FROM branches WHERE name = ?", (branch,)
+            "SELECT active_axes_json FROM branches WHERE branch_id = ?", (branch,)
         ).fetchone()
         if found is None:
-            names = [row[0] for row in conn.execute("SELECT name FROM branches ORDER BY name")]
+            names = [row[0] for row in conn.execute("SELECT branch_id FROM branches ORDER BY 1")]
             raise RefResolutionError(
                 f"Ref {attr!r}: upstream {location.name!r} has no branch {branch!r} "
                 f"(branches: {', '.join(names) or 'none'}); run it first: {location.hint(branch)}"
             )
-        branch_id = found[0]
-        meta = read_meta(conn)
-        axis_specs = _declared_axis_specs(meta.get("graph_json"), stage)
+        graph = load_graph(read_meta(conn))
+        specs = {str(spec.get("name")): spec for spec in graph["stages"]} if graph else {}
+        axis_specs = None
+        if stage in specs:
+            axis_specs = [axis for axis in specs[stage].get("axes", ()) if isinstance(axis, dict)]
         declared = None if axis_specs is None else tuple(str(a["name"]) for a in axis_specs)
         storages = {
             row[0]: Path(row[1])
@@ -253,29 +256,31 @@ def _read_stage(location: UpstreamLocation, branch: str, stage: str, attr: str) 
         rows = conn.execute(
             "SELECT unit_key, status, storage_name, artifact_relpath, artifact_fp, updated_at, "
             "last_run_id FROM units WHERE branch_id = ? AND stage_name = ? ORDER BY rowid",
-            (branch_id, stage),
+            (branch, stage),
         ).fetchall()
         if declared is None and not rows:
-            stages = _declared_stages(meta.get("graph_json"))
-            if stages is not None and stage not in stages:
+            if graph is not None:
                 raise RefResolutionError(
                     f"Ref {attr!r}: upstream {location.name!r} has no stage {stage!r} "
-                    f"(stages: {', '.join(stages)})"
+                    f"(stages: {', '.join(specs)})"
                 )
             raise RefResolutionError(
                 f"Ref {attr!r}: {where} has no committed units; run it first: "
                 f"{location.hint(branch)}"
             )
-        axes = declared if declared is not None else _key_axes(rows[0]["unit_key"])
-        allowed = _active_ids(axis_specs or (), _json_object(found[1]))
+        axes = declared
+        if axes is None:  # a stage no longer declared: its rows' axes
+            axes = tuple(name for name, _ in layout.parse_unit_key(rows[0]["unit_key"]))
+        allowed = _active_ids(axis_specs or (), json.loads(found[0]))
         allowed_at = [(axes.index(name), ids) for name, ids in allowed.items() if name in axes]
         units: list[UpstreamUnit] = []
         others: dict[tuple[str, ...], str] = {}
         latest: sqlite3.Row | None = None
         for row in rows:
-            ids = _ids(row["unit_key"], axes)
-            if ids is None:  # a stale row from an older foreach declaration
+            pairs = layout.parse_unit_key(row["unit_key"])
+            if tuple(name for name, _ in pairs) != axes:  # an older foreach declaration
                 continue
+            ids = tuple(item for _, item in pairs)
             if any(ids[position] not in keep for position, keep in allowed_at):
                 continue  # outside the branch's active domain
             if row["status"] != "ok" or not row["artifact_relpath"] or not row["artifact_fp"]:
@@ -317,41 +322,6 @@ def _read_stage(location: UpstreamLocation, branch: str, stage: str, attr: str) 
         )
     finally:
         conn.close()
-
-
-def _graph_stages(raw: str | None) -> list[dict[str, Any]] | None:
-    import json
-
-    if not raw:
-        return None
-    try:
-        graph = json.loads(raw)
-    except ValueError:
-        return None
-    stages = graph.get("stages") if isinstance(graph, dict) else None
-    return stages if isinstance(stages, list) else None
-
-
-def _declared_stages(raw: str | None) -> list[str] | None:
-    stages = _graph_stages(raw)
-    return None if stages is None else [str(spec.get("name")) for spec in stages]
-
-
-def _declared_axis_specs(raw: str | None, stage: str) -> list[dict[str, Any]] | None:
-    for spec in _graph_stages(raw) or ():
-        if spec.get("name") == stage:
-            return [axis for axis in spec.get("axes", ()) if isinstance(axis, dict)]
-    return None
-
-
-def _json_object(raw: Any) -> dict[str, Any]:
-    import json
-
-    try:
-        value = json.loads(raw) if isinstance(raw, str) else raw
-    except ValueError:
-        return {}
-    return value if isinstance(value, dict) else {}
 
 
 def _active_ids(
@@ -411,21 +381,6 @@ def _unit_order(axes: tuple[str, ...], axis_specs: Sequence[Mapping[str, Any]]) 
         return tuple(parts)
 
     return key
-
-
-def _key_axes(unit_key: str) -> tuple[str, ...]:
-    if not unit_key:
-        return ()
-    return tuple(part.partition("=")[0] for part in unit_key.split(","))
-
-
-def _ids(unit_key: str, axes: tuple[str, ...]) -> tuple[str, ...] | None:
-    if not unit_key:
-        return () if not axes else None
-    pairs = [part.partition("=") for part in unit_key.split(",")]
-    if tuple(name for name, _, _ in pairs) != axes:
-        return None
-    return tuple(item for _, _, item in pairs)
 
 
 def _pairs(ref: Ref, attr: str, up: UpstreamStage, down: Sequence[str]) -> list[tuple[str, str]]:

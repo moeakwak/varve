@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +40,6 @@ class StageView:
     labels: Mapping[str, int]
     deps: tuple[str, ...]
     axes: tuple[tuple[str, str], ...]
-    storage: str
     units: tuple[UnitView, ...] = ()
     orphaned: int = 0
     """Stored units no longer produced by a dynamic axis (removed by ``clean --orphans``)."""
@@ -79,7 +78,6 @@ class PipelineView:
     pipeline: str
     branch: str
     is_temp: bool
-    root: Path
     stages: tuple[StageView, ...]
     refs: tuple[RefInfo, ...] = ()
     """Upstream records read through cross-pipeline Refs (committed state only)."""
@@ -117,7 +115,6 @@ def stage_view(plan: StagePlan, *, expand: bool = False, orphaned: int = 0) -> S
         labels=dict(labels.most_common()),
         deps=node.deps,
         axes=tuple((axis.name, "static" if axis.is_static else "dynamic") for axis in node.axes),
-        storage=node.storage,
         units=tuple(unit_view(unit) for unit in plan.units) if expand else (),
         orphaned=orphaned,
     )
@@ -136,7 +133,6 @@ def pipeline_view(
         pipeline=session.pipeline.selector(),
         branch=session.branch.name,
         is_temp=session.branch.is_temp,
-        root=session.root,
         stages=tuple(
             stage_view(plan, expand=expand, orphaned=counts.get(plan.name, {}).get("orphaned", 0))
             for plan in plans.values()
@@ -158,13 +154,9 @@ class SegmentDiff:
 
 @dataclass(frozen=True)
 class SourceDiff:
-    mode: str
-    fallback_reason: str | None
     changed: tuple[str, ...]
     added: tuple[str, ...]
     removed: tuple[str, ...]
-    symbols: tuple[str, ...]
-    external: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -181,7 +173,6 @@ class InspectView:
     unit_dir: Path
     artifact_path: Path | None
     log_path: Path | None
-    current_components: dict[str, Any] | None = field(default=None, repr=False)
 
 
 def _diff_mapping(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
@@ -250,15 +241,7 @@ def source_diff(recorded: Mapping[str, Any] | None, current: Mapping[str, Any]) 
     changed = tuple(sorted(k for k in now_symbols if k in before and before[k] != now_symbols[k]))
     added = tuple(sorted(k for k in now_symbols if k not in before)) if recorded else ()
     removed = tuple(sorted(k for k in before if k not in now_symbols))
-    return SourceDiff(
-        mode=current.get("mode", "closure"),
-        fallback_reason=current.get("fallback_reason"),
-        changed=changed,
-        added=added,
-        removed=removed,
-        symbols=tuple(current.get("symbols", {})),
-        external=tuple(current.get("external", {})),
-    )
+    return SourceDiff(changed, added, removed)
 
 
 def inspect_unit(session: Session, plan: StagePlan, unit: UnitPlan) -> InspectView:
@@ -301,5 +284,4 @@ def inspect_unit(session: Session, plan: StagePlan, unit: UnitPlan) -> InspectVi
         unit_dir=unit_dir,
         artifact_path=artifact,
         log_path=log_path,
-        current_components=current,
     )

@@ -353,7 +353,8 @@ def test_duplicate_dependency_names_are_rejected() -> None:
 
     node = Clashing.graph().nodes["a"]
     with pytest.raises(ValueError, match="declared by both"):
-        node.dependencies_for(DepCtx(config=None))
+        ctx = DepCtx(config=None)
+        node.dependencies_for(ctx, node.resources_for(ctx))
 
 
 def test_needs_accepts_methods_and_unbound_refs() -> None:

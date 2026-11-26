@@ -586,11 +586,11 @@ class StageEvaluator:
         for key, row in rows.items():
             if key in active or row.status == "orphaned":
                 continue
-            pairs = [part.partition("=") for part in key.split(",")] if key else []
-            if [name for name, _, _ in pairs] != names:
+            pairs = layout.parse_unit_key(key)
+            if [name for name, _ in pairs] != names:
                 orphans.append(key)  # written under another foreach declaration
                 continue
-            ids = [item for _, _, item in pairs]
+            ids = [item for _, item in pairs]
             if any(ids[positions[axis.name]] not in declared[axis] for axis in declared):
                 orphans.append(key)  # a static id that is no longer declared
                 continue

@@ -17,8 +17,8 @@ def repo(tmp_path: Path) -> Repo:
     conn = db.connect(layout.state_db_path(tmp_path))
     repo = Repo(conn)
     repo.upsert_storages({"default": tmp_path / "out", "interim": tmp_path / "interim"})
-    repo.upsert_branch(BranchRow("main", "main", {"seed": 1}, {"dataset": ["mw"]}))
-    repo.upsert_branch(BranchRow("katex", "katex", {"seed": 1}, {}, manual=True))
+    repo.upsert_branch(BranchRow("main", {"seed": 1}, {"dataset": ["mw"]}))
+    repo.upsert_branch(BranchRow("katex", {"seed": 1}, {}, manual=True))
     repo.insert_run(RunRow("r1", "main", db.now_iso(), "running", ["run"], "host"))
     repo.insert_run(RunRow("r2", "katex", db.now_iso(), "running", ["run"], "host"))
     return repo
@@ -107,11 +107,10 @@ def test_branches_and_storages_round_trip(repo: Repo) -> None:
     )
     assert main.is_temp is False and main.created_at
     created = main.created_at
-    repo.upsert_branch(BranchRow("ignored-id", "main", {"seed": 2}, {}))
+    repo.upsert_branch(BranchRow("main", {"seed": 2}, {}))
     again = repo.get_branch("main")
-    assert again is not None
-    assert again.branch_id == "main" and again.created_at == created and again.config == {"seed": 2}
-    assert [b.name for b in repo.list_branches()] == ["katex", "main"]
+    assert again is not None and again.created_at == created and again.config == {"seed": 2}
+    assert [b.branch_id for b in repo.list_branches()] == ["katex", "main"]
     assert repo.storages()["interim"].name == "interim"
 
 
@@ -137,19 +136,15 @@ def test_unit_round_trip_and_status_transitions(repo: Repo) -> None:
     assert [u.unit_key for u in repo.units_with_status("orphaned")] == ["dataset=im2latex"]
     assert repo.unit_counts("main") == {"work": {"failed": 1, "orphaned": 1}}
     assert repo.delete_units("main", "work", ["dataset=im2latex"]) == 1
-    assert repo.delete_units("main") == 1
 
 
 def test_cross_branch_candidates_and_reuse(repo: Repo) -> None:
     repo.upsert_units([unit(), unit(branch="katex"), unit(branch="katex", key="dataset=b")])
-    candidates = repo.link_candidates("work", "dataset=mw", exclude_branch_id="main")
-    assert [(name, row.branch_id) for name, row in candidates] == [("katex", "katex")]
-    assert candidates[0][1].source_detail == {"mode": "closure", "symbols": {"Demo.work": "x"}}
     assert repo.branch_count() == 2
     index = repo.link_index("work", exclude_branch_id="main")
     assert sorted(index) == ["dataset=b", "dataset=mw"]
     (light,) = index["dataset=mw"]
-    assert (light.branch_name, light.input_key, light.has_manifest) == ("katex", "ik-1", True)
+    assert (light.branch_id, light.input_key, light.has_manifest) == ("katex", "ik-1", True)
 
     updated = repo.set_reused_source_fp(
         "main", "work", [("dataset=mw", "ik-1"), ("dataset=zz", "ik-1")], "s2"
@@ -179,13 +174,14 @@ def test_runs_and_stage_runs(repo: Repo) -> None:
         )
     )
     repo.finish_run("r1", status="ok", total_wall_ms=1600)
-    run = repo.get_run("r1")
-    assert run is not None and run.status == "ok" and run.ended_at and run.cli_argv == ["run"]
-    (stage_run,) = repo.stage_runs("main", stage="work")
-    assert stage_run.metrics_summary == {"items": 30} and stage_run.unit_p95_ms is None
-    assert [r.run_id for r in repo.runs("main")] == ["r1"]
+    (run,) = repo.runs("main")
+    assert run.status == "ok" and run.ended_at and run.cli_argv == ["run"]
+    stored = repo.conn.execute(
+        "SELECT metrics_summary_json, unit_p95_ms FROM stage_runs"
+    ).fetchall()
+    assert [tuple(row) for row in stored] == [('{"items":30}', None)]
     repo.delete_branch("katex")
-    assert repo.get_branch("katex") is None and repo.get_run("r2") is None
+    assert repo.get_branch("katex") is None and repo.runs("katex") == []
 
 
 def test_file_sets_dedup_and_stat_cache(repo: Repo) -> None:
@@ -193,8 +189,12 @@ def test_file_sets_dedup_and_stat_cache(repo: Repo) -> None:
     repo.put_file_sets([row, row])
     repo.put_file_sets([row])
     assert repo.conn.execute("SELECT COUNT(*) FROM file_sets").fetchone()[0] == 1
-    assert repo.get_file_set("f" * 64) == row
-    assert repo.get_file_set("missing") is None
+    stored = repo.conn.execute(
+        "SELECT fileset_hash, file_count, total_bytes, entries_json FROM file_sets"
+    )
+    assert [tuple(item) for item in stored] == [
+        ("f" * 64, 2, 10, '[["content",[["a","x"],["b","y"]]]]')
+    ]
 
     repo.put_stat_cache({"/a.py": CachedStat(1, 2, 3, "c", "ast")})
     repo.put_stat_cache({"/a.py": CachedStat(1, 2, 4, "c2", None)})
@@ -220,8 +220,7 @@ def test_lock_semantics(tmp_path: Path) -> None:
     with pipeline_lock(tmp_path, exclusive=True):
         with pytest.raises(LockBusyError, match="shared"):
             pipeline_lock(tmp_path, exclusive=False).acquire()
-    with branch_lock(tmp_path, "main") as held:
-        assert held.held
+    with branch_lock(tmp_path, "main"):
         with branch_lock(tmp_path, "katex"):
             pass
         with pytest.raises(LockBusyError):
@@ -231,7 +230,8 @@ def test_lock_semantics(tmp_path: Path) -> None:
     with lock:
         with pytest.raises(RuntimeError, match="already held"):
             lock.acquire()
-    assert not lock.held
+    with lock:  # released on exit, so it can be taken again
+        pass
 
 
 def _connect_after_barrier(path: str, barrier) -> None:
@@ -333,7 +333,7 @@ def test_garbage_collection_drops_unreferenced_parts_sources_and_file_sets(repo:
         "inputs:i",
     }
     assert repo.collect_garbage() == {"key_parts": 2, "sources": 1, "file_sets": 1}
-    assert repo.get_file_set("f" * 64) is not None and repo.get_file_set("e" * 64) is None
+    assert [r[0] for r in repo.conn.execute("SELECT fileset_hash FROM file_sets")] == ["f" * 64]
     row = repo.get_unit("main", "work", "dataset=mw")
     assert row is not None and row.key_components == kept
 
@@ -371,7 +371,8 @@ def test_writer_drops_a_running_mark_replaced_before_its_flush(repo: Repo) -> No
     from varve.engine.writer import Writer
     from varve.keying.fingerprint import StatCache
 
-    writer = Writer(repo, StatCache(None), interval=3600)
+    writer = Writer(repo, StatCache(None))
+    writer.interval = 3600
     row = UnitRow("main", "s", "", "default", "k", {}, "fp", {}, "running")
     writer.put(row)
     writer.put(UnitRow("main", "s", "", "default", "k", {}, "fp", {}, "failed"))

@@ -11,7 +11,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -61,13 +61,6 @@ class UnitProgress:
 
 
 @dataclass(frozen=True)
-class UnitMetric:
-    stage: str
-    unit_key: str
-    values: Mapping[str, Any]
-
-
-@dataclass(frozen=True)
 class UnitFinished:
     stage: str
     unit_key: str
@@ -105,7 +98,6 @@ Event = (
     | StagePlanned
     | UnitStarted
     | UnitProgress
-    | UnitMetric
     | UnitFinished
     | StageFinished
     | RunFinished
@@ -129,36 +121,24 @@ class EventBus:
                 callback(event)
 
 
-class _Throttle:
-    def __init__(self) -> None:
-        self._last = 0.0
+def _report(iterable: Iterable[T], emit: Callable[[int], None]) -> Iterator[T]:
+    """Yield ``iterable``, emitting the done count at start, end, and every interval."""
 
-    def due(self) -> bool:
-        now = time.monotonic()
-        if now - self._last >= PROGRESS_INTERVAL:
-            self._last = now
-            return True
-        return False
-
-
-def _report(
-    iterable: Iterable[T],
-    total: int | None,
-    emit: Callable[[int, bool], None],
-) -> Iterator[T]:
-    throttle = _Throttle()
+    last = 0.0
     done = 0
-    emit(0, True)
+    emit(0)
     for item in iterable:
         yield item
         done += 1
-        if throttle.due():
-            emit(done, False)
-    emit(done, True)
+        now = time.monotonic()
+        if now - last >= PROGRESS_INTERVAL:
+            last = now
+            emit(done)
+    emit(done)
 
 
 class BusSink:
-    """In-process sink: metrics and progress become bus events.
+    """In-process sink: progress becomes bus events.
 
     With ``tqdm_fallback`` (no TUI, stderr is a terminal, output not
     captured) progress is also drawn with tqdm.
@@ -168,20 +148,17 @@ class BusSink:
         self.bus = bus
         self.tqdm_fallback = tqdm_fallback
 
-    def metric(self, ctx: Ctx[Any, Any], values: Mapping[str, Any]) -> None:
-        self.bus.publish(UnitMetric(ctx.stage, ctx.unit_key, dict(values)))
-
     def progress(
         self, ctx: Ctx[Any, Any], iterable: Iterable[T], total: int | None, desc: str | None
     ) -> Iterator[T]:
-        def emit(done: int, _final: bool) -> None:
+        def emit(done: int) -> None:
             self.bus.publish(UnitProgress(ctx.stage, ctx.unit_key, done, total, desc))
 
         if self.tqdm_fallback and sys.stderr.isatty():
             from tqdm import tqdm
 
             iterable = tqdm(iterable, total=total, desc=desc or ctx.unit_key or ctx.stage)
-        return _report(iterable, total, emit)
+        return _report(iterable, emit)
 
 
 class QueueSink:
@@ -196,23 +173,13 @@ class QueueSink:
         except Exception:  # a full or closed queue must never fail the unit
             pass
 
-    def metric(self, ctx: Ctx[Any, Any], values: Mapping[str, Any]) -> None:
-        self._put(UnitMetric(ctx.stage, ctx.unit_key, _plain(values)))
-
     def progress(
         self, ctx: Ctx[Any, Any], iterable: Iterable[T], total: int | None, desc: str | None
     ) -> Iterator[T]:
-        def emit(done: int, _final: bool) -> None:
+        def emit(done: int) -> None:
             self._put(UnitProgress(ctx.stage, ctx.unit_key, done, total, desc))
 
-        return _report(iterable, total, emit)
-
-
-def _plain(values: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        key: value if isinstance(value, str | int | float | bool) or value is None else repr(value)
-        for key, value in values.items()
-    }
+        return _report(iterable, emit)
 
 
 def pump(queue: Any, bus: EventBus) -> threading.Thread:

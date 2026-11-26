@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 
 from varve.engine import inspect_pipeline, probe_pipeline, reuse_stage
-from varve.store import layout
-from varve.store.db import connect
 from varve.store.repo import Repo
 
 SOURCE = """
@@ -75,7 +73,7 @@ def test_config_projection_only_read_fields_matter(ws) -> None:
     assert statuses["b"][0] == "hit"
     result = ws.run(Demo)
     assert result.stages["a"].executed == 1 and result.stages["b"].executed == 0
-    repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+    repo = ws.repo()
     unit_a, unit_b = repo.get_unit("main", "a", ""), repo.get_unit("main", "b", "")
     assert unit_a is not None and unit_a.config_access == ["a_field"]
     assert unit_b is not None and unit_b.config_access == []
