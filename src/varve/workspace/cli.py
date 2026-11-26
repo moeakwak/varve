@@ -236,8 +236,9 @@ def render_workspace(console: Console, settings: WorkspaceSettings, entries: lis
         )
         return
     table = Table(box=rich_box.SIMPLE_HEAD, show_edge=False)
+    # Long names and paths fold rather than push the other columns off a narrow terminal.
     for column in ("Pipeline", "Branch", "Units", "Last run", "Root"):
-        table.add_column(column, no_wrap=column in ("Pipeline", "Branch"))
+        table.add_column(column, overflow="fold", min_width=8 if column != "Units" else None)
     for entry in entries:
         name = Text(entry.name, style="bold" if entry.entry else "")
         root = str(entry.root) if entry.root is not None else "-"

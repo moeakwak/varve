@@ -462,14 +462,15 @@ async function renderBranch(route, { poll = false } = {}) {
     data = await api(branchApi(route.pipeline, route.branch));
   } catch (err) { showError($("view"), err); schedulePoll(null, false); return; }
   if (state.routeKey !== key) return;
-  const wasRunning = state.branch && state.branch.running_units > 0;
+  const isLive = (b) => !!b && (b.running_units > 0 || !!b.active_run);
+  const wasRunning = isLive(state.branch);
   state.branch = data;
   stamp();
   crumbs([{ text: "workspace", href: "#/" }, { text: data.pipeline.name }, { text: route.branch }]);
 
   if (fresh) buildBranchPage(route, data);
   else updateBranchPage(route, data);
-  if (fresh || (wasRunning && data.running_units === 0)) loadHistory(route);
+  if (fresh || (wasRunning && !isLive(data))) loadHistory(route);
 
   const current = parseRoute();
   if (current.stage !== null && current.stage !== undefined) {
@@ -480,7 +481,7 @@ async function renderBranch(route, { poll = false } = {}) {
   schedulePoll(() => {
     const r = parseRoute();
     if (r.view === "branch" && `${r.pipeline}\u0000${r.branch}` === key) renderBranch(r, { poll: true });
-  }, data.running_units > 0);
+  }, isLive(data));
 }
 
 function buildBranchPage(route, data) {

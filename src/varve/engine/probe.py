@@ -33,7 +33,13 @@ from varve.graph import (
     expand_stage,
 )
 from varve.keying.config_access import project_config
-from varve.keying.fingerprint import InputDigest, json_hash, normalize_json, verify_manifest
+from varve.keying.fingerprint import (
+    InputDigest,
+    is_real_dir,
+    json_hash,
+    normalize_json,
+    verify_manifest,
+)
 from varve.keying.keys import (
     SEGMENT_REASONS,
     changed_segments,
@@ -504,10 +510,12 @@ class StageEvaluator:
         manifest = row.artifact_manifest
         if self.session.rehash:
             return verify_manifest(Path(unit_dir), manifest, rehash=True)
+        if not is_real_dir(unit_dir):  # an empty manifest says nothing about the directory
+            return False
         for rel, size, mtime_ns, _digest in manifest:
             try:
                 st = os.lstat(f"{unit_dir}/{rel}")
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 return False
             if not S_ISREG(st.st_mode) or st.st_size != size or st.st_mtime_ns != mtime_ns:
                 return False
@@ -516,14 +524,20 @@ class StageEvaluator:
     def _orphans(
         self, node: StageNode, units: Sequence[Unit], rows: Mapping[str, ProbeRow]
     ) -> list[str]:
-        """Rows of this stage no longer produced by a (fully resolved) dynamic axis."""
+        """Rows of this stage the current declaration no longer produces.
 
-        if not node.dynamic_axes:
-            return []
+        A row is orphaned when its axis names differ from the stage's ``foreach``,
+        when a static id is no longer declared, or when its static coordinates are
+        active and a (fully resolved) dynamic axis no longer yields its id. Rows
+        merely outside the branch's active subset (``axes:``, ``--slice``,
+        ``--sample``) are not orphans.
+        """
+
         session = self.session
         active = {unit.unit_key for unit in units}
         names = [axis.name for axis in node.axes]
         positions = {axis.name: i for i, axis in enumerate(node.axes)}
+        declared = {axis: set(axis.ids) for axis in node.static_axes}
         static_ids = {axis: set(session.statics[axis].ids) for axis in node.static_axes}
         domain_ids: dict[int, set[str]] = {}
         orphans: list[str] = []
@@ -532,10 +546,14 @@ class StageEvaluator:
                 continue
             pairs = [part.partition("=") for part in key.split(",")] if key else []
             if [name for name, _, _ in pairs] != names:
+                orphans.append(key)  # written under another foreach declaration
                 continue
             ids = [item for _, _, item in pairs]
-            if any(ids[positions[axis.name]] not in static_ids[axis] for axis in static_ids):
+            if any(ids[positions[axis.name]] not in declared[axis] for axis in declared):
+                orphans.append(key)  # a static id that is no longer declared
                 continue
+            if any(ids[positions[axis.name]] not in static_ids[axis] for axis in static_ids):
+                continue  # outside the active subset only
             for axis in node.dynamic_axes:
                 bound = session.graph.resolvers[axis].static_axes
                 domain = session.full_domains.get(

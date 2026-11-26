@@ -5,12 +5,20 @@ hits, so a deleted published file is restored). Each target is hardlinked to
 a temporary name next to it and moved into place with ``os.replace``;
 directories are rebuilt as a hardlinked tree and swapped in. The publish dir
 must share a filesystem with the stage's storage: varve never copies.
+
+Files published by glob entries are recorded per stage in
+``<publish_dir>/.varve-published/<stage>.json`` (``[unit_key, src, [paths]]``),
+so a file a unit's glob published earlier but no longer produces is removed
+at the next publish. Only files varve recorded are ever removed; files of
+units or entries that disappeared are left alone.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
+import stat
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -57,13 +65,60 @@ def publish_stage(
         return []
     check_same_filesystem(node, storage_root, publish_dir)
     published: list[Path] = []
+    globbed: dict[tuple[str, str], list[str]] = {}
     for target in publish_targets(node, units):
         source_dir = unit_dirs[target.unit.unit_key]
-        for source, relpath in _expand(target, source_dir):
+        expanded = _expand(target, source_dir)
+        if is_glob(target.entry.src):
+            globbed[(target.unit.unit_key, target.entry.src)] = [rel for _, rel in expanded]
+        for source, relpath in expanded:
             destination = publish_dir / relpath
             _place(source, destination)
             published.append(destination)
+    if globbed:
+        _prune_globbed(publish_dir, node.name, globbed, {str(path) for path in published})
     return published
+
+
+def _record_path(publish_dir: Path, stage: str) -> Path:
+    return publish_dir / ".varve-published" / f"{stage}.json"
+
+
+def _prune_globbed(
+    publish_dir: Path, stage: str, globbed: dict[tuple[str, str], list[str]], published: set[str]
+) -> None:
+    """Remove files a current glob target published before but not now; update the record."""
+
+    record = _record_path(publish_dir, stage)
+    previous: dict[tuple[str, str], list[str]] = {}
+    try:
+        for unit_key, src, paths in json.loads(record.read_text()):
+            previous[(str(unit_key), str(src))] = [str(path) for path in paths]
+    except (OSError, ValueError, TypeError):
+        pass
+    for key, paths in globbed.items():
+        for rel in previous.get(key, ()):
+            if rel in paths or os.path.isabs(rel) or ".." in Path(rel).parts:
+                continue
+            stale = publish_dir / rel
+            if str(stale) in published:
+                continue
+            try:
+                if not stat.S_ISREG(stale.lstat().st_mode):
+                    continue
+                stale.unlink()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            parent = stale.parent
+            while parent != publish_dir and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
+    merged = {**previous, **globbed}
+    record.parent.mkdir(parents=True, exist_ok=True)
+    temporary = record.with_name(f".{record.name}.{secrets.token_hex(4)}")
+    rows = [[unit_key, src, paths] for (unit_key, src), paths in sorted(merged.items())]
+    temporary.write_text(json.dumps(rows))
+    os.replace(temporary, record)
 
 
 def _expand(target: PublishTarget, source_dir: Path) -> list[tuple[Path, str]]:

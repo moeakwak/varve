@@ -34,6 +34,8 @@ class Writer:
         self._units[key] = row
         if row.status == "running":
             self._pending_running.add(key)
+        else:  # the pending row is no longer a running mark
+            self._pending_running.discard(key)
         for item in file_sets:
             self._file_sets[item.fileset_hash] = item
 

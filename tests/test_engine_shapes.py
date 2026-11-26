@@ -202,3 +202,87 @@ def test_static_branch_axes_restrict_cells(ws) -> None:
     assert result.stages["per_dataset"].total == 1
     assert (ws.root / "out/.internal/main/per_dataset/dataset=b").is_dir()
     assert not (ws.root / "out/.internal/main/per_dataset/dataset=a").exists()
+
+
+EMPTY_UNITS = """
+from varve import Axis, Ctx, Pipeline, stage
+
+ITEM = Axis("item", ("a", "b"))
+
+class Demo(Pipeline):
+    @stage(foreach=ITEM)
+    def maybe(self, ctx: Ctx, item: str) -> None:
+        if item == "a":
+            (ctx.out / "x.txt").write_text(item)
+"""
+
+
+def test_a_removed_or_replaced_unit_dir_with_an_empty_manifest_is_missing(ws) -> None:
+    import shutil
+
+    Demo = ws.write(EMPTY_UNITS)
+    assert ws.run(Demo).status == "ok"
+    empty = ws.root / "out/.internal/main/maybe/item=b"
+    assert empty.is_dir() and not any(empty.iterdir())
+    empty.rmdir()
+    for rehash in (False, True):
+        view = probe_pipeline(Demo, root=ws.root, expand=True, rehash=rehash)
+        reasons = {unit.unit_key: unit.reason for unit in view.stage("maybe").units}
+        assert reasons["item=b"] in {"artifact-missing", "artifact-changed"}
+        assert reasons["item=a"] is None
+    assert ws.run(Demo).stages["maybe"].executed == 1
+    assert empty.is_dir()
+    # A symlink in place of the unit directory is not the managed directory.
+    full = ws.root / "out/.internal/main/maybe/item=a"
+    os.chmod(full.parent, 0o755)
+    moved = ws.base / "moved"
+    shutil.move(str(full), moved)
+    full.symlink_to(moved, target_is_directory=True)
+    view = probe_pipeline(Demo, root=ws.root, expand=True)
+    reasons = {unit.unit_key: unit.reason for unit in view.stage("maybe").units}
+    assert reasons["item=a"] == "artifact-missing"
+
+
+STATIC_ONLY = """
+from varve import Axis, Ctx, Pipeline, stage
+
+ITEM = Axis("item", ("a", "b", "c"))
+
+class Demo(Pipeline):
+    @stage(foreach=ITEM, produces="v.txt")
+    def work(self, ctx: Ctx, item: str) -> None:
+        (ctx.out / "v.txt").write_text(item)
+"""
+
+
+def test_undeclared_static_ids_and_old_foreach_rows_become_orphans(ws) -> None:
+    def statuses() -> dict[str, str]:
+        repo = Repo(connect(layout.state_db_path(ws.root), readonly=True))
+        try:
+            return {row.unit_key: row.status for row in repo.units("main", "work").values()}
+        finally:
+            repo.conn.close()
+
+    Demo = ws.write(STATIC_ONLY)
+    assert ws.run(Demo).status == "ok"
+    # Outside the branch's active subset only: kept as they are.
+    (ws.src / "varve.yaml").write_text(json.dumps({"main": {"axes": {"item": ["a"]}}}))
+    Demo = ws.write(STATIC_ONLY)
+    assert ws.run(Demo).stages["work"].orphaned == 0
+    assert set(statuses().values()) == {"ok"}
+    (ws.src / "varve.yaml").unlink()
+    # "c" is no longer declared: its row is an orphan.
+    Demo = ws.write(STATIC_ONLY.replace('("a", "b", "c")', '("a", "b")'))
+    assert ws.run(Demo).stages["work"].orphaned == 1
+    assert statuses() == {"item=a": "ok", "item=b": "ok", "item=c": "orphaned"}
+    # Rows written under another foreach declaration are orphans too.
+    Demo = ws.write(
+        STATIC_ONLY.replace('Axis("item"', 'Axis("name"')
+        .replace("item: str", "name: str")
+        .replace("write_text(item)", "write_text(name)")
+    )
+    result = ws.run(Demo)
+    assert result.stages["work"].orphaned == 2 and result.stages["work"].executed == 3
+    assert clean_pipeline(Demo, root=ws.root, orphans=True).rows == 3
+    assert set(statuses()) == {"name=a", "name=b", "name=c"}
+    assert not (ws.root / "out/.internal/main/work/item=a").exists()

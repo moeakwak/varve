@@ -15,7 +15,7 @@ from varve.engine.housekeeping import recover
 from varve.engine.session import open_session
 from varve.store import layout
 from varve.store.db import connect, read_meta
-from varve.store.repo import Repo, RunRow
+from varve.store.repo import Repo, RunRow, StageRunRow
 
 SOURCE = """
 import time
@@ -65,6 +65,7 @@ def test_recovery_restores_old_dirs_and_removes_staging(ws) -> None:
     repo = _repo(ws, readonly=False)
     repo.set_status("main", "work", ["item=a"], "running")
     repo.insert_run(RunRow("crashed", "main", "2026-01-01T00:00:00", "running", [], "host"))
+    repo.put_stage_run(StageRunRow("crashed", "main", "work", "running", 0, 0, 0, 3, 1, 0, "x"))
     repo.conn.close()
 
     session = open_session(Demo, BranchRequest(), root=ws.root, readonly=False)
@@ -79,6 +80,8 @@ def test_recovery_restores_old_dirs_and_removes_staging(ws) -> None:
     repo = _repo(ws)
     run = repo.get_run("crashed")
     assert run is not None and run.status == "interrupted"
+    crashed = [row for row in repo.stage_runs("main") if row.run_id == "crashed"]
+    assert [row.status for row in crashed] == ["interrupted"]
     repo.conn.close()
 
     result = ws.run(Demo, options=RunOptions(tui=False))
@@ -440,3 +443,22 @@ def test_process_workers_exit_when_the_run_process_is_killed(ws) -> None:
     while any(_alive(pid) for pid in children):
         assert time.monotonic() < deadline, "process-pool workers outlived the run"
         time.sleep(0.05)
+
+
+def test_run_records_the_git_commit_of_the_pipeline_checkout(ws, tmp_path, monkeypatch) -> None:
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-C", str(ws.src)]
+    Demo = ws.write(SOURCE)
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True)
+    head = subprocess.run(
+        [*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)  # not a git checkout
+    result = ws.run(Demo)
+    repo = _repo(ws)
+    run = repo.get_run(result.run_id)
+    repo.conn.close()
+    assert run is not None and run.git_commit == head and run.git_dirty is False

@@ -210,7 +210,10 @@ def _clean_storage(
     branch_id = None
     if repo is not None and branch is not None:
         row = repo.get_branch(branch)
-        branch_id = row.branch_id if row is not None else None
+        if row is None:  # unknown branch: no rows to count or delete (never every branch's)
+            repo = None
+        else:
+            branch_id = row.branch_id
     rows = repo.count_units_in_storage(storage, branch_id=branch_id) if repo is not None else 0
     plan = CleanPlan(_existing(paths), rows, f"storage {storage!r}")
     if apply:

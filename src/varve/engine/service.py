@@ -24,6 +24,7 @@ from varve.engine.refs import RefInfo, RefResolver, bound_refs
 from varve.engine.run import Runner, RunOptions, RunResult
 from varve.engine.session import Session, WorkspaceSettings, identity_meta, open_session
 from varve.engine.tui import LiveDisplay, PlainReporter
+from varve.keying.fingerprint import verify_manifest
 from varve.pipeline import Pipeline
 from varve.status import InspectView, PipelineView, inspect_unit, pipeline_view
 from varve.store import layout
@@ -260,6 +261,7 @@ def reuse_stage(
             plan = probe_plans(session, [stage])[stage]
             if plan.status == "awaiting":
                 raise ProbeError(f"Stage {stage!r} is awaiting {plan.awaiting!r}; nothing to reuse")
+            storage = session.graph.nodes[stage].storage
             groups: dict[str, list[tuple[str, str]]] = {}
             already = 0
             not_reusable: dict[str, int] = {}
@@ -273,6 +275,15 @@ def reuse_stage(
                     and unit.input_key is not None
                     and unit.input_key == row.input_key
                 ):
+                    if row.storage_name != storage or not verify_manifest(
+                        session.unit_dir(stage, row.storage_name, unit.unit.relpath),
+                        row.artifact_manifest,
+                    ):
+                        # Its artifact is gone: reusing it would only probe artifact-missing.
+                        not_reusable["artifact-missing"] = (
+                            not_reusable.get("artifact-missing", 0) + 1
+                        )
+                        continue
                     groups.setdefault(unit.cell.source.fingerprint, []).append(
                         (unit.unit_key, unit.input_key)
                     )

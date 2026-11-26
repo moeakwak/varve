@@ -20,6 +20,7 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 
 from varve.branch import load_branches
+from varve.cli.argmap import is_null_token
 from varve.engine.run import RunOptions, RunResult
 from varve.engine.session import main_config
 from varve.pipeline import Pipeline
@@ -335,6 +336,8 @@ def route_sets(plan: MacroPlan, sets: Mapping[str, str]) -> dict[str, dict[str, 
 
 
 def _coerce(annotation: Any, raw: str, key: str, label: str) -> Any:
+    if is_null_token(annotation, raw):  # like the generated CLI: `null` is None
+        return None
     adapter: TypeAdapter[Any] = TypeAdapter(annotation if annotation is not None else Any)
     try:
         return adapter.validate_python(raw)

@@ -51,6 +51,8 @@ def test_stage_decorator_normalizes_bare_strings_and_publish() -> None:
         ({"publish": {"*.png": "x"}}, "must not be globs"),
         ({"workers": 0}, "positive"),
         ({"max_failures": 0}, "positive"),
+        ({"workers": True}, "positive"),
+        ({"max_failures": True}, "positive"),
         ({"foreach": (DATASET, DATASET)}, "repeat"),
         ({"exclusive": "cost_group"}, "selector"),
         ({"backend": "async"}, "async def"),
@@ -434,3 +436,19 @@ def test_literal_publish_targets_may_not_collide_across_stages() -> None:
             pass
 
     Distinct.graph()
+
+
+def test_defaults_reject_bool_workers_and_max_failures() -> None:
+    from varve.graph import GraphError
+
+    for key in ("workers", "max_failures"):
+
+        class Bad(Pipeline):
+            defaults = {key: True}
+
+            @stage()
+            def only(self, ctx: Any) -> None:
+                pass
+
+        with pytest.raises(GraphError, match=f"defaults\\['{key}'\\] must be a positive int"):
+            Bad.graph()

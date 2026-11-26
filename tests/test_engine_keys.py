@@ -265,3 +265,33 @@ def test_status_lists_every_needs_run_reason(ws) -> None:
     stage = view.stage("a")
     assert stage.units[0].reason == "config-changed, source-changed"
     assert stage.reasons == {"config-changed": 1, "source-changed": 1}
+
+
+def test_a_failed_unit_keys_on_the_whole_config(ws) -> None:
+    Demo = ws.write(SOURCE)
+    assert ws.run(Demo).status == "ok"
+    # The edited stage reads a new field and fails on its current value.
+    failing = SOURCE.replace(
+        '        (ctx.out / "a.txt").write_text(helper_a() + ctx.config.a_field)',
+        "        if ctx.config.unused == 0:\n"
+        '            raise ValueError("unused must be set")\n'
+        '        (ctx.out / "a.txt").write_text(helper_a() + ctx.config.a_field)',
+    )
+    Demo = ws.write(failing)
+    assert ws.run(Demo).stages["a"].failed == 1
+    assert _statuses(Demo, ws)["a"][:2] == ("failed", "unused must be set")
+    # Fixing the newly read field is a config change, not a stale failure.
+    _yaml(ws, {"main": {"config": {"unused": 5}}})
+    assert _statuses(Demo, ws)["a"][:2] == ("needs-run", "config-changed")
+    assert ws.run(Demo).stages["a"].executed == 1
+    assert _statuses(Demo, ws)["a"][0] == "hit"
+
+
+def test_reuse_skips_units_whose_artifact_is_missing(ws) -> None:
+    Demo = ws.write(SOURCE)
+    ws.run(Demo)
+    (ws.root / "out/.internal/main/a/a.txt").unlink()
+    Demo = ws.write(SOURCE.replace('return "A1"', 'return "A1"  # tweak\n    pass'))
+    result = reuse_stage(Demo, "a", root=ws.root)
+    assert result.reused == 0 and result.not_reusable == {"artifact-missing": 1}
+    assert _statuses(Demo, ws)["a"][:2] == ("needs-run", "source-changed")

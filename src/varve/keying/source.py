@@ -16,7 +16,8 @@ included in every stage. The classes bound to the pipeline's ``Config`` and
 ``Args`` are never included (field projection covers them), nor is the
 ``if __name__ == "__main__":`` block. The scheduling-only keywords of
 ``@stage(...)`` (``workers``, ``exclusive``, ``max_failures``, ``backend``)
-are stripped before hashing. Files using dynamic lookup (``globals()``,
+are stripped before hashing, and so are those keys of a class-body
+``defaults = {...}`` / ``dict(...)`` statement. Files using dynamic lookup (``globals()``,
 ``eval``, ``sys.modules[__name__]``, ...) and classes using
 ``getattr(self|cls|type(self)|self.__class__, <non-constant>)`` fall back to a
 whole-file AST hash. Cross-file sources are only those declared in
@@ -280,6 +281,46 @@ class _StripScheduling(ast.NodeTransformer):
         return self._function(node)
 
 
+def _is_scheduling_key(key: ast.expr | None) -> bool:
+    return isinstance(key, ast.Constant) and key.value in SCHEDULING_KEYWORDS
+
+
+def _strip_defaults(stmt: ast.stmt) -> ast.stmt:
+    """``stmt`` without scheduling-only entries when it binds ``defaults`` to a
+    dict display or a ``dict(...)`` call; otherwise ``stmt`` itself."""
+
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+        target, value = stmt.targets[0], stmt.value
+    elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+        target, value = stmt.target, stmt.value
+    else:
+        return stmt
+    if not (isinstance(target, ast.Name) and target.id == "defaults"):
+        return stmt
+    if isinstance(value, ast.Dict) and any(_is_scheduling_key(k) for k in value.keys):
+        stmt = copy.deepcopy(stmt)
+        assert isinstance(stmt, ast.Assign | ast.AnnAssign) and isinstance(stmt.value, ast.Dict)
+        pairs = [
+            (k, v)
+            for k, v in zip(stmt.value.keys, stmt.value.values, strict=True)
+            if not _is_scheduling_key(k)
+        ]
+        stmt.value.keys = [k for k, _ in pairs]
+        stmt.value.values = [v for _, v in pairs]
+        return stmt
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "dict"
+        and any(k.arg in SCHEDULING_KEYWORDS for k in value.keywords)
+    ):
+        stmt = copy.deepcopy(stmt)
+        assert isinstance(stmt, ast.Assign | ast.AnnAssign) and isinstance(stmt.value, ast.Call)
+        stmt.value.keywords = [k for k in stmt.value.keywords if k.arg not in SCHEDULING_KEYWORDS]
+        return stmt
+    return stmt
+
+
 @dataclass
 class _Module:
     """Parsed symbol table of one file."""
@@ -291,6 +332,7 @@ class _Module:
     hashes: dict[int, str] = field(default_factory=dict)
     stage_names: frozenset[str] = frozenset()
     varve_packages: frozenset[str] = frozenset()
+    stripped: dict[int, ast.stmt] = field(default_factory=dict)
 
     def stage_decorated(self, node: ast.AST) -> bool:
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -313,6 +355,15 @@ class _Module:
             ):
                 return strip.visit(copy.deepcopy(node))
         return node
+
+    def class_defaults(self, stmt: ast.stmt) -> ast.stmt:
+        """A class-body ``defaults = {...}``/``dict(...)`` statement without its
+        scheduling-only keys (a cached copy if any are present)."""
+
+        stripped = self.stripped.get(id(stmt))
+        if stripped is None:
+            stripped = self.stripped[id(stmt)] = _strip_defaults(stmt)
+        return stripped
 
     @classmethod
     def parse(cls, path: Path, source: bytes) -> _Module:
@@ -541,6 +592,8 @@ class SourceAnalyzer:
                 label = ",".join(sorted(binder.names)) or f"<body:{index}>"
                 if scope == class_name:
                     seen_members.update(binder.names)
+                if label == "defaults":  # scheduling keys are stripped like in `@stage(...)`
+                    stmt = module.class_defaults(stmt)
                 add(f"{scope}.{label}", [stmt], scope, body=True)
             mutations = [
                 stmt for stmt in module.symbols.get(scope, ()) if not isinstance(stmt, ast.ClassDef)

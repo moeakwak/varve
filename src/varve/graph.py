@@ -18,7 +18,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from varve.axis import Axis, AxisDomain, Cell
-from varve.decorators import Backend, PublishEntry, ResourcesSpec, StageSpec, WorkersSpec, is_glob
+from varve.decorators import (
+    Backend,
+    PublishEntry,
+    ResourcesSpec,
+    StageSpec,
+    WorkersSpec,
+    is_glob,
+    is_positive_int,
+)
 from varve.dependencies import (
     DepCtx,
     Dependencies,
@@ -139,7 +147,7 @@ class StageNode:
 
     def resolve_workers(self, ctx: RunCtx) -> int:
         workers = self.workers(ctx) if callable(self.workers) else self.workers
-        if not isinstance(workers, int) or workers < 1:
+        if not is_positive_int(workers):
             raise ValueError(
                 f"Stage {self.name!r}: workers must be a positive int, got {workers!r}"
             )
@@ -252,6 +260,11 @@ def _check_defaults(pipeline: type[Pipeline]) -> Mapping[str, Any]:
             f"{pipeline.__qualname__}.defaults has unsupported keys {sorted(unknown)}; "
             f"allowed: {sorted(DEFAULT_KEYS)}"
         )
+    workers, max_failures = defaults.get("workers"), defaults.get("max_failures")
+    if workers is not None and not callable(workers) and not is_positive_int(workers):
+        raise GraphError(f"{pipeline.__qualname__}.defaults['workers'] must be a positive int")
+    if max_failures is not None and not is_positive_int(max_failures):
+        raise GraphError(f"{pipeline.__qualname__}.defaults['max_failures'] must be a positive int")
     return defaults
 
 

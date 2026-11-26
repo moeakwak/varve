@@ -261,7 +261,7 @@ def test_copy_of_pipeline_file_has_same_fingerprint(tmp_path: Path) -> None:
 def test_class_body_members_enter_every_stage(tmp_path: Path) -> None:
     with_attrs = BASE.replace(
         "    Config = Config\n",
-        "    Config = Config\n    defaults = {'workers': SIZE}\n    SCALE = 1\n\n"
+        "    Config = Config\n    defaults = {'depends': SIZE}\n    SCALE = 1\n\n"
         "    def __init__(self):\n        self.k = 0\n",
     ).replace("SHARED = 10\n", "SHARED = 10\nSIZE = 2\n")
 
@@ -337,7 +337,7 @@ def test_helper_methods_enter_only_the_stages_that_reach_them(tmp_path: Path) ->
         "    def _h(self):\n        return type(self)._deep()\n\n"
         "    @classmethod\n    def _deep(cls):\n        return 'h1'\n\n"
         "    def _picked(self):\n        return 'p1'\n\n"
-        "    defaults = {'workers': _picked}\n\n"
+        "    defaults = {'depends': _picked}\n\n"
         "    def _util(self):",
     )
 
@@ -349,3 +349,26 @@ def test_helper_methods_enter_only_the_stages_that_reach_them(tmp_path: Path) ->
     assert edit("return type(self)._deep()", "return type(self)._deep() + 'x'") == {"b"}
     assert edit("return 'h1'", "return 'h2'") == {"b"}  # transitively via type(self)
     assert edit("return 'p1'", "return 'p2'") == {"a", "b"}  # referenced by `defaults`
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("{'storage': 'x', 'workers': 2}", "{'storage': 'x', 'workers': 8, 'backend': 'thread'}"),
+        ("dict(storage='x', workers=2)", "dict(storage='x', max_failures=3, exclusive='a=1')"),
+        ("dict(storage='x', workers=2)", "dict(storage='x', workers=WORKERS)"),
+    ],
+)
+def test_scheduling_keys_of_class_defaults_do_not_enter_the_fingerprint(
+    tmp_path: Path, old: str, new: str
+) -> None:
+    source = BASE.replace("    Config = Config\n", f"    Config = Config\n    defaults = {old}\n")
+    source = source.replace("SHARED = 10\n", "SHARED = 10\nWORKERS = 4\n")
+    before = fps(tmp_path, source)
+    assert fps(tmp_path, source.replace(old, new)) == before
+    # Other keys still enter every stage.
+    changed_storage = fps(
+        tmp_path,
+        source.replace("storage='x'", "storage='y'").replace("'storage': 'x'", "'storage': 'y'"),
+    )
+    assert all(changed_storage[name] != before[name] for name in before)

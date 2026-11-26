@@ -280,3 +280,18 @@ def test_reader_waits_for_a_store_that_is_being_created(tmp_path: Path) -> None:
     blank.touch()
     with pytest.raises(db.SchemaError):
         db.connect(blank, readonly=True)
+
+
+def test_writer_drops_a_running_mark_replaced_before_its_flush(repo: Repo) -> None:
+    from varve.engine.writer import Writer
+    from varve.keying.fingerprint import StatCache
+
+    writer = Writer(repo, StatCache(None), interval=3600)
+    row = UnitRow("main", "s", "", "default", "k", {}, "fp", {}, "running")
+    writer.put(row)
+    writer.put(UnitRow("main", "s", "", "default", "k", {}, "fp", {}, "failed"))
+    flushed: list[bool] = []
+    writer.flush = lambda: flushed.append(True)  # type: ignore[method-assign]
+    writer.flush_running()
+    writer.before_promote("s", "")
+    assert flushed == []

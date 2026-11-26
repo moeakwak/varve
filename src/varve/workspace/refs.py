@@ -18,7 +18,10 @@ an error naming the command to run, never silently left out of a fan-in.
 Axes align by name (spec §4.6.1): axes the downstream coordinate shares with
 the upstream stage align 1-to-1, upstream-only axes fan in as an ordered
 ``dict`` keyed by the upstream id (a tuple of ids for several axes, in the
-upstream foreach order; ids stay strings because nothing is imported).
+upstream foreach order; ids stay strings because nothing is imported). Entries
+follow the upstream foreach product order: declared id order for static axes,
+id string order for dynamic axes (their resolver order is not stored), so the
+injected dict and the key material never depend on store row order.
 ``align_by=()`` fans everything in, ``align_by={"down": "up"}`` renames,
 ``align_by=("a", ...)`` aligns only on the listed names. A multi-branch Ref
 wraps each value in an outer ``dict`` keyed by branch name. ``selector``
@@ -74,7 +77,7 @@ class UpstreamStage:
     stage: str
     axes: tuple[str, ...]
     units: tuple[UpstreamUnit, ...]
-    """Committed (``ok``) units of the active domain in store order."""
+    """Committed (``ok``) units of the active domain in foreach order (see ``_unit_order``)."""
     others: Mapping[tuple[str, ...], str]
     """ids -> status of active-domain units that exist but are not ``ok`` (nor orphaned)."""
     last_commit_at: str | None
@@ -292,6 +295,7 @@ def _read_stage(location: UpstreamLocation, branch: str, stage: str, attr: str) 
             )
             if latest is None or row["updated_at"] > latest["updated_at"]:
                 latest = row
+        units.sort(key=_unit_order(axes, axis_specs or ()))
         git_commit = git_dirty = None
         if latest is not None and latest["last_run_id"]:
             run = conn.execute(
@@ -366,18 +370,47 @@ def _active_ids(
     for spec in axis_specs:
         name = str(spec.get("name"))
         restriction = active.get(name)
+        listed = restriction
+        if isinstance(restriction, Mapping):  # a sample, drawn from "ids" when present
+            listed = restriction.get("ids")
         if spec.get("kind") == "static" and isinstance(spec.get("ids"), list):
             ids = [str(item) for item in spec["ids"]]
-            if isinstance(restriction, list):
-                wanted = {str(item) for item in restriction}
+            if isinstance(listed, list):
+                wanted = {str(item) for item in listed}
                 ids = [item for item in ids if item in wanted]
-            elif isinstance(restriction, Mapping) and "sample" in restriction:
+            if isinstance(restriction, Mapping) and "sample" in restriction:
                 sample = Sample(int(restriction["sample"]), int(restriction.get("seed", 0)))
                 ids = sample.pick(ids, name)
             allowed[name] = set(ids)
-        elif isinstance(restriction, list):
-            allowed[name] = {str(item) for item in restriction}
+        elif isinstance(listed, list):
+            allowed[name] = {str(item) for item in listed}
     return allowed
+
+
+def _unit_order(axes: tuple[str, ...], axis_specs: Sequence[Mapping[str, Any]]) -> Any:
+    """Sort key giving upstream units a deterministic order, independent of store row order.
+
+    Units are ordered like a foreach product over ``axes``: a static axis by its
+    declared id order (``meta.graph_json``), a dynamic axis (whose resolver order
+    is not recorded) by id string. Ids missing from a declared list sort last.
+    """
+
+    declared: dict[str, dict[str, int]] = {}
+    for spec in axis_specs:
+        if spec.get("kind") == "static" and isinstance(spec.get("ids"), list):
+            declared[str(spec.get("name"))] = {str(item): i for i, item in enumerate(spec["ids"])}
+    positions = [declared.get(name) for name in axes]
+
+    def key(unit: UpstreamUnit) -> tuple[tuple[int, str], ...]:
+        parts = []
+        for order, item in zip(positions, unit.ids, strict=True):
+            if order is None:
+                parts.append((0, item))
+            else:
+                parts.append((order[item], "") if item in order else (len(order), item))
+        return tuple(parts)
+
+    return key
 
 
 def _key_axes(unit_key: str) -> tuple[str, ...]:

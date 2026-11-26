@@ -30,7 +30,8 @@ def _loads(value: str | None) -> Any:
 
 @dataclass
 class BranchRow:
-    """``active_axes`` maps an axis name to its active ids, or ``{"sample": n, "seed": s}``."""
+    """``active_axes`` maps an axis name to its active ids, ``{"sample": n, "seed": s}``, or
+    ``{"ids": [...], "sample": n, "seed": s}`` (see ``ResolvedBranch.active_axes_json``)."""
 
     branch_id: str
     name: str
@@ -260,10 +261,18 @@ class Repo:
         self._upsert("runs", [row], ["run_id"])
 
     def finish_run(self, run_id: str, *, status: str, total_wall_ms: int | None) -> None:
+        """Finish a run; its stages still recorded ``running`` (the run was cut short)
+        take the run's status (``interrupted`` for an ``ok`` run, which has none)."""
+
+        stage_status = "interrupted" if status == "ok" else status
         with transaction(self.conn):
             self.conn.execute(
                 "UPDATE runs SET status = ?, ended_at = ?, total_wall_ms = ? WHERE run_id = ?",
                 (status, now_iso(), total_wall_ms, run_id),
+            )
+            self.conn.execute(
+                "UPDATE stage_runs SET status = ? WHERE run_id = ? AND status = 'running'",
+                (stage_status, run_id),
             )
 
     def get_run(self, run_id: str) -> RunRow | None:
