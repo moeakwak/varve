@@ -173,6 +173,8 @@ class Runner:
         self.aborted = False
         self._interrupt_notice = False
         self._bookkeeping = False
+        self._started_at = ""
+        self._run_recorded = False
         self._writer: Writer | None = None
         self.commits: Committer
 
@@ -181,6 +183,33 @@ class Runner:
         assert self._writer is not None
         return self._writer
 
+    def _ensure_run(self) -> None:
+        """Insert the ``runs`` row on first real work (unit execution or cross-branch link)."""
+
+        if self._run_recorded:
+            return
+        session = self.session
+        repo = session.repo
+        assert repo is not None
+        # The code's checkout, wherever the command was started (roots may be relocated).
+        commit, dirty = git_state(session.pipeline.module_file().parent)
+        repo.insert_run(
+            RunRow(
+                run_id=self.run_id,
+                branch_id=session.branch_id,
+                started_at=self._started_at,
+                status="running",
+                cli_argv=list(self.options.argv if self.options.argv is not None else sys.argv),
+                host=socket.gethostname(),
+                git_commit=commit,
+                git_dirty=dirty,
+            )
+        )
+        self._run_recorded = True
+
+    def _has_executed_units(self) -> bool:
+        return any(item.executed for item in self.outcomes.values())
+
     # -- entry ---------------------------------------------------------------
 
     def run(self) -> RunResult:
@@ -188,6 +217,7 @@ class Runner:
         repo = session.repo
         assert repo is not None, "run needs a writable session"
         started = time.monotonic()
+        self._started_at = now_iso()
         with (
             pipeline_lock(session.root, exclusive=False),
             branch_lock(session.root, session.branch.name),
@@ -205,24 +235,12 @@ class Runner:
                     manual=branch.manual,
                 )
             )
-            # The code's checkout, wherever the command was started (roots may be relocated).
-            commit, dirty = git_state(session.pipeline.module_file().parent)
-            repo.insert_run(
-                RunRow(
-                    run_id=self.run_id,
-                    branch_id=session.branch_id,
-                    started_at=now_iso(),
-                    status="running",
-                    cli_argv=list(self.options.argv if self.options.argv is not None else sys.argv),
-                    host=socket.gethostname(),
-                    git_commit=commit,
-                    git_dirty=dirty,
-                )
-            )
             for note in recover(session, self.run_id):
                 self.bus.publish(Notice(f"recovery: {note}", "warning"))
             self._writer = Writer(repo, session.fingerprints.cache)
-            self.commits = Committer(session, self.run_id, self._writer, self.evaluator, self.bus)
+            self.commits = Committer(
+                session, self.run_id, self._writer, self.evaluator, self.bus, self._ensure_run
+            )
             self.bus.publish(
                 RunStarted(
                     session.pipeline.selector(), branch.name, self.run_id, tuple(self.selected)
@@ -236,8 +254,13 @@ class Runner:
                     self.stop.request("interrupted")
                 except BaseException:
                     self._bookkeeping = True
-                    wall_ms = int((time.monotonic() - started) * 1000)
-                    repo.finish_run(self.run_id, status="failed", total_wall_ms=wall_ms)
+                    if self._run_recorded:
+                        wall_ms = (
+                            int((time.monotonic() - started) * 1000)
+                            if self._has_executed_units()
+                            else None
+                        )
+                        repo.finish_run(self.run_id, status="failed", total_wall_ms=wall_ms)
                     raise
                 finally:
                     # From here on Ctrl-C only flags the run: the store and the staging
@@ -248,7 +271,9 @@ class Runner:
                         shutil.rmtree(layout.staging_root(root, self.run_id), ignore_errors=True)
                 status = self._status()
                 wall_ms = int((time.monotonic() - started) * 1000)
-                repo.finish_run(self.run_id, status=status, total_wall_ms=wall_ms)
+                if self._run_recorded:
+                    recorded_wall_ms = wall_ms if self._has_executed_units() else None
+                    repo.finish_run(self.run_id, status=status, total_wall_ms=recorded_wall_ms)
                 if any(item.executed or item.linked for item in self.outcomes.values()):
                     # Rows this run replaced may have left key parts, source details,
                     # or file sets unreferenced.
@@ -430,21 +455,23 @@ class Runner:
         metrics: dict[str, float] = {}
         rss: list[float] = []
         halted = None
-        stage_run = StageRunRow(
-            run_id=self.run_id,
-            branch_id=session.branch_id,
-            stage_name=name,
-            status="running",
-            executed_units=0,
-            hit_units=outcome.hit + outcome.linked,
-            failed_units=0,
-            total_units=outcome.total,
-            workers=workers,
-            wall_ms=0,
-            finished_at=now_iso(),
-        )
-        repo.put_stage_run(stage_run)
+        stage_run: StageRunRow | None = None
         if to_run:
+            self._ensure_run()
+            stage_run = StageRunRow(
+                run_id=self.run_id,
+                branch_id=session.branch_id,
+                stage_name=name,
+                status="running",
+                executed_units=0,
+                hit_units=outcome.hit + outcome.linked,
+                failed_units=0,
+                total_units=outcome.total,
+                workers=workers,
+                wall_ms=0,
+                finished_at=now_iso(),
+            )
+            repo.put_stage_run(stage_run)
             try:
                 halted = await self._run_units(
                     node, to_run, state, workers, backend_name, outcome, durations, metrics, rss
@@ -488,19 +515,20 @@ class Runner:
                 outcome.status = "partial"
                 outcome.detail = "some units were not selected (--failed-only)"
         outcome.wall_ms = int((time.monotonic() - started) * 1000)
-        peak = max(rss) if rss else (peak_rss_mb() if outcome.executed else None)
-        stage_run.status = outcome.status
-        stage_run.executed_units = outcome.executed
-        stage_run.hit_units = outcome.hit + outcome.linked
-        stage_run.failed_units = outcome.failed
-        stage_run.wall_ms = outcome.wall_ms
-        stage_run.finished_at = now_iso()
-        stage_run.unit_p50_ms = percentile(durations, 0.5)
-        stage_run.unit_p95_ms = percentile(durations, 0.95)
-        stage_run.unit_max_ms = max(durations) if durations else None
-        stage_run.peak_rss_mb = peak
-        stage_run.metrics_summary = metrics or None
-        repo.put_stage_run(stage_run)
+        if stage_run is not None:
+            peak = max(rss) if rss else (peak_rss_mb() if outcome.executed else None)
+            stage_run.status = outcome.status
+            stage_run.executed_units = outcome.executed
+            stage_run.hit_units = outcome.hit + outcome.linked
+            stage_run.failed_units = outcome.failed
+            stage_run.wall_ms = outcome.wall_ms
+            stage_run.finished_at = now_iso()
+            stage_run.unit_p50_ms = percentile(durations, 0.5)
+            stage_run.unit_p95_ms = percentile(durations, 0.95)
+            stage_run.unit_max_ms = max(durations) if durations else None
+            stage_run.peak_rss_mb = peak
+            stage_run.metrics_summary = metrics or None
+            repo.put_stage_run(stage_run)
         self._finish(outcome)
 
     # -- execution -----------------------------------------------------------

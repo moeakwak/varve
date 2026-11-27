@@ -195,12 +195,13 @@ def test_history_full_vs_partial(client: TestClient) -> None:
     data = client.get(f"{API}/history").json()
     assert data["stages"] == ["prepare", "shard", "merge"]
     assert data["throughput_unit"] == "items/s"
+    assert data["declared_stage_count"] == 3
     runs = {r["run_id"]: r for r in data["runs"]}
     assert [r["run_id"] for r in data["runs"]] == ["r3", "r2", "r1"]
     assert runs["r1"]["kind"] == "full" and runs["r1"]["executed"] == 12
     assert runs["r1"]["wall_ms"] == 12000 and runs["r1"]["unit_p50_ms"] is None
     assert runs["r2"]["kind"] == "partial"
-    assert (runs["r2"]["executed"], runs["r2"]["total"], runs["r2"]["failed"]) == (2, 11, 3)
+    assert (runs["r2"]["executed"], runs["r2"]["total"], runs["r2"]["failed"]) == (2, 10, 3)
     assert runs["r2"]["git_dirty"] is True and runs["r2"]["argv"] == ["run"]
     assert runs["r3"]["kind"] == "none" and runs["r3"]["executed"] is None
     assert runs["r1"]["items_per_s"] == pytest.approx(900 / 12)
@@ -219,7 +220,62 @@ def test_history_full_vs_partial(client: TestClient) -> None:
 def test_history_units_per_second_fallback(client: TestClient) -> None:
     data = client.get(f"{API}/history", params={"stage": "prepare"}).json()
     assert data["throughput_unit"] == "units/s"
-    assert data["runs"][-1]["units_per_s"] == pytest.approx(1.0)
+    assert [r["run_id"] for r in data["runs"]] == ["r1"]
+    assert data["runs"][0]["units_per_s"] == pytest.approx(1.0)
+
+
+def test_history_stage_subset_and_zero_executed_classification(workspace: dict[str, Path]) -> None:
+    from varve.store.repo import Repo, RunRow, StageRunRow
+
+    conn = connect(workspace["corpus"])
+    repo = Repo(conn)
+    repo.insert_run(
+        RunRow(
+            run_id="r4",
+            branch_id="main",
+            started_at="2026-11-04T00:00:00",
+            ended_at="2026-11-04T00:00:02",
+            status="ok",
+            cli_argv=["run"],
+            host="box",
+            total_wall_ms=2000,
+        )
+    )
+    # Only `merge` executed (1/1); upstream stages were hits and omitted from `stage_runs`.
+    repo.put_stage_run(
+        StageRunRow("r4", "main", "merge", "ok", 1, 0, 0, 1, 1, 2000, "2026-11-04T00:00:02")
+    )
+    repo.insert_run(
+        RunRow(
+            run_id="r5",
+            branch_id="main",
+            started_at="2026-11-05T00:00:00",
+            ended_at="2026-11-05T00:00:01",
+            status="failed",
+            cli_argv=["run"],
+            host="box",
+            total_wall_ms=None,
+        )
+    )
+    # A failed preflight left a 0-executed stage_run.
+    repo.put_stage_run(
+        StageRunRow("r5", "main", "merge", "failed", 0, 0, 0, 1, 1, 50, "2026-11-05T00:00:01")
+    )
+    conn.close()
+
+    client = TestClient(create_app(list(workspace.values())))
+    all_runs = {r["run_id"]: r for r in client.get(f"{API}/history").json()["runs"]}
+    assert all_runs["r4"]["kind"] == "partial" and all_runs["r4"]["stage_count"] == 1
+    assert all_runs["r5"]["kind"] == "none"
+
+    merge_runs = {
+        r["run_id"]: r
+        for r in client.get(f"{API}/history", params={"stage": "merge"}).json()["runs"]
+    }
+    assert merge_runs["r4"]["kind"] == "full"
+    assert merge_runs["r5"]["kind"] == "none"
+    detail = client.get("/api/runs/r5").json()
+    assert detail["stages"][0]["kind"] == "none"
 
 
 def test_run_detail(client: TestClient) -> None:

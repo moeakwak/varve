@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
 
@@ -29,12 +30,14 @@ class Committer:
         writer: Writer,
         evaluator: StageEvaluator,
         bus: EventBus,
+        ensure_run: Callable[[], None],
     ) -> None:
         self.session = session
         self.run_id = run_id
         self.writer = writer
         self.evaluator = evaluator
         self.bus = bus
+        self._ensure_run = ensure_run
         self._links: tuple[str, dict[str, list[LinkCandidate]]] | None = None
 
     def input_key(self, node: StageNode, unit_plan: UnitPlan, access: list[str] | None) -> InputKey:
@@ -184,6 +187,7 @@ class Committer:
             source_dir = layout.internal_dir(storage_root, other, node.name, relpath)
             if not verify_manifest(source_dir, row.artifact_manifest):
                 continue
+            self._ensure_run()
             staging = layout.staging_dir(storage_root, self.run_id, node.name, unit_plan.unit_key)
             try:
                 if staging.exists():

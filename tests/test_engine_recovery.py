@@ -435,3 +435,128 @@ def test_run_records_the_git_commit_of_the_pipeline_checkout(ws, tmp_path, monke
     (run,) = repo.runs("main")
     repo.conn.close()
     assert run.run_id == result.run_id and run.git_commit == head and run.git_dirty is False
+
+
+def test_all_hit_run_records_no_run_or_stage_run_rows(ws) -> None:
+    from varve.ui import queries
+
+    Demo = ws.write(SOURCE)
+    first = ws.run(Demo)
+    assert first.status == "ok"
+
+    repo = ws.repo()
+    runs_before = repo.runs("main")
+    stage_runs_before = ws.stage_runs(repo)
+    repo.conn.close()
+    assert len(runs_before) == 1
+    assert [row.stage_name for row in stage_runs_before] == ["work", "merge"]
+
+    second = ws.run(Demo)
+    assert second.status == "ok"
+    assert (second.stages["work"].executed, second.stages["work"].hit) == (0, 3)
+    assert (second.stages["merge"].executed, second.stages["merge"].hit) == (0, 1)
+
+    repo = ws.repo()
+    assert repo.runs("main") == runs_before
+    assert ws.stage_runs(repo) == stage_runs_before
+    repo.conn.close()
+
+    registry = queries.Registry([layout.state_db_path(ws.root)])
+    [pipe] = registry.refresh()
+    ws_data = queries.workspace(registry)
+    [branch] = ws_data["pipelines"][0]["branches"]
+    assert branch["last_run"]["run_id"] == first.run_id
+    assert branch["last_duration_ms"] == runs_before[0].total_wall_ms
+    detail = queries.branch_detail(pipe, "main")
+    assert {st["name"]: st["last"]["run_id"] for st in detail["stages"]} == {
+        "work": first.run_id,
+        "merge": first.run_id,
+    }
+    hist = queries.history(pipe, "main")
+    assert [r["run_id"] for r in hist["runs"]] == [first.run_id]
+    assert hist["runs"][0]["kind"] == "full"
+
+
+def test_partial_run_records_only_executed_stage_runs(ws) -> None:
+    from varve.ui import queries
+
+    Demo = ws.write(SOURCE)
+    first = ws.run(Demo)
+    assert first.status == "ok"
+
+    # Edit `merge` only so `work` stays a 100% hit while `merge` executes.
+    Demo2 = ws.write(SOURCE.replace('",".join', '"|".join'))
+    second = ws.run(Demo2)
+    assert second.status == "ok"
+    assert (second.stages["work"].executed, second.stages["work"].hit) == (0, 3)
+    assert (second.stages["merge"].executed, second.stages["merge"].hit) == (1, 0)
+
+    repo = ws.repo()
+    runs = repo.runs("main")
+    assert [run.run_id for run in runs] == [second.run_id, first.run_id]
+    assert runs[0].total_wall_ms is not None
+    stage_runs = ws.stage_runs(repo)
+    assert [(row.run_id, row.stage_name) for row in stage_runs] == [
+        (first.run_id, "work"),
+        (first.run_id, "merge"),
+        (second.run_id, "merge"),
+    ]
+    repo.conn.close()
+
+    registry = queries.Registry([layout.state_db_path(ws.root)])
+    [pipe] = registry.refresh()
+    detail = queries.branch_detail(pipe, "main")
+    assert {st["name"]: st["last"]["run_id"] for st in detail["stages"]} == {
+        "work": first.run_id,
+        "merge": second.run_id,
+    }
+    all_hist = queries.history(pipe, "main")
+    assert [(r["run_id"], r["kind"]) for r in all_hist["runs"]] == [
+        (second.run_id, "partial"),
+        (first.run_id, "full"),
+    ]
+    merge_hist = queries.history(pipe, "main", stage="merge")
+    assert [(r["run_id"], r["kind"]) for r in merge_hist["runs"]] == [
+        (second.run_id, "full"),
+        (first.run_id, "full"),
+    ]
+    work_hist = queries.history(pipe, "main", stage="work")
+    assert [r["run_id"] for r in work_hist["runs"]] == [first.run_id]
+
+
+def test_link_only_run_records_run_without_stage_runs_or_duration(ws) -> None:
+    from varve.ui import queries
+
+    (ws.src / "varve.yaml").write_text(json.dumps({"main": {}, "other": {}}))
+    Demo = ws.write(SOURCE)
+    assert ws.run(Demo).status == "ok"
+
+    linked = ws.run(Demo, branch="other")
+    assert linked.status == "ok"
+    assert (linked.stages["work"].executed, linked.stages["work"].linked) == (0, 3)
+    assert (linked.stages["merge"].executed, linked.stages["merge"].linked) == (0, 1)
+
+    repo = ws.repo()
+    other_runs = repo.runs("other")
+    assert len(other_runs) == 1
+    assert other_runs[0].run_id == linked.run_id
+    assert other_runs[0].status == "ok" and other_runs[0].total_wall_ms is None
+    assert [row for row in ws.stage_runs(repo) if row.branch_id == "other"] == []
+    assert {row.last_run_id for row in repo.units("other", "work").values()} == {linked.run_id}
+    repo.conn.close()
+
+    # Re-running the now-cached branch records nothing further.
+    hit = ws.run(Demo, branch="other")
+    assert hit.status == "ok"
+    repo = ws.repo()
+    assert [run.run_id for run in repo.runs("other")] == [linked.run_id]
+    repo.conn.close()
+
+    registry = queries.Registry([layout.state_db_path(ws.root)])
+    [pipe] = registry.refresh()
+    ws_data = queries.workspace(registry)
+    other = next(b for b in ws_data["pipelines"][0]["branches"] if b["name"] == "other")
+    assert other["last_run"]["run_id"] == linked.run_id
+    assert other["last_duration_ms"] is None
+    hist = queries.history(pipe, "other")
+    assert [(r["run_id"], r["kind"]) for r in hist["runs"]] == [(linked.run_id, "none")]

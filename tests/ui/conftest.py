@@ -163,7 +163,6 @@ def build_corpus(root: Path) -> Path:
             metrics_summary={"items": 900},
         ),
         _stage_run("r1", "merge", "2026-11-01T00:00:12", 1, 1, wall_ms=2000),
-        _stage_run("r2", "prepare", "2026-11-02T00:00:00", 0, 1, wall_ms=10),
         _stage_run(
             "r2",
             "shard",

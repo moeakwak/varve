@@ -34,7 +34,7 @@ This guide is the reference for authoring and operating varve pipelines. For a s
 - **Cell**: the coordinates of a stage's static axes, for example `dataset=alpha`. A stage without static axes has one empty cell. Resources and dependencies may be computed per cell.
 - **Unit**: one stage after expanding all of its axes, static and dynamic, for example `label@dataset=alpha,batch=3`. A unit is what varve executes, caches, and commits atomically. A stage without `foreach=` is a single unit.
 - **Branch**: a named configuration of the whole pipeline (`main`, branches declared in `varve.yaml`, or temporary branches). Each branch has its own unit records and managed directories.
-- **Run**: one execution of `run` for one branch, recorded with per-stage timing.
+- **Run**: one execution of `run` for one branch, recorded with per-stage timing when units execute.
 
 `status`, `plan`, `inspect`, `reuse`, and `run` first **probe**: they expand stages into units in topological order and compute each unit's decision (`hit`, `needs-run` with a reason, or `failed`). `run` then executes the units that are not hits, stage by stage.
 
@@ -621,7 +621,7 @@ Logical stages execute in topological order behind a barrier: every unit of a st
 
 **Progress.** `ctx.progress(iterable, total=None, desc=None)` yields the items and reports progress to the live display (from process workers through a queue). `total` defaults to `len(iterable)` when available. Without the live display and with output not captured, it draws a tqdm bar on stderr when stderr is a terminal; otherwise it only iterates.
 
-**Run bookkeeping.** Every `run` writes a `runs` row (start and end time, status, argv, git commit and dirty flag of the checkout containing the pipeline module, wherever the command runs from, host, wall time) and one `stage_runs` row per executed stage (executed, hit, failed, and total units, workers, wall time, unit p50/p95/max duration, peak RSS, metric sums). Peak RSS is per unit for process workers and the main process's peak otherwise.
+**Run bookkeeping.** A `run` writes a `runs` row (start and end time, status, argv, git commit and dirty flag of the checkout containing the pipeline module, wherever the command runs from, host, and wall time when units execute) only when it executes or links at least one unit, and one `stage_runs` row per stage that had units to execute (executed, hit, failed, and total units, workers, wall time, unit p50/p95/max duration, peak RSS, metric sums). All-hit runs and all-hit (or link-only) stages write no performance rows, so re-running a cached pipeline never overwrites previous wall-time or stage timing history. Peak RSS is per unit for process workers and the main process's peak otherwise.
 
 ```python
     @stage(

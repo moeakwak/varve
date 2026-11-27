@@ -692,8 +692,10 @@ SELECT r.run_id, r.started_at, r.ended_at, r.status, r.git_commit, r.git_dirty, 
        MAX(s.peak_rss_mb) AS peak_rss_mb,
        SUM(CAST(json_extract(s.metrics_summary_json, '$.items') AS REAL)) AS items,
        CASE
-         WHEN COUNT(s.stage_name) = 0 THEN 'none'
-         WHEN SUM(s.total_units) > 0 AND SUM(s.executed_units) = SUM(s.total_units) THEN 'full'
+         WHEN COUNT(s.stage_name) = 0 OR COALESCE(SUM(s.executed_units), 0) = 0 THEN 'none'
+         WHEN SUM(s.total_units) > 0 AND SUM(s.executed_units) = SUM(s.total_units)
+              AND (:stage IS NOT NULL OR :declared_stages IS NULL
+                   OR COUNT(s.stage_name) >= :declared_stages) THEN 'full'
          ELSE 'partial'
        END AS kind
 FROM runs r
@@ -712,6 +714,8 @@ def history(
     limit = min(max(1, limit), 1000)
     with open_ro(pipe.path) as conn:
         bid = _branch(conn, branch_name)["branch_id"]
+        graph = load_graph(read_meta(conn))
+        declared_stages = len(graph["stages"]) if graph is not None else None
         rows = conn.execute(
             f"SELECT h.*, "
             "CASE WHEN h.items IS NOT NULL AND h.stage_wall_ms > 0 "
@@ -719,7 +723,12 @@ def history(
             "CASE WHEN h.stage_wall_ms > 0 AND h.executed > 0 "
             "     THEN h.executed * 1000.0 / h.stage_wall_ms END AS units_per_s "
             f"FROM ({_HISTORY_SQL}) h",
-            {"stage": stage, "branch_id": bid, "limit": limit},
+            {
+                "stage": stage,
+                "branch_id": bid,
+                "limit": limit,
+                "declared_stages": declared_stages,
+            },
         )
         runs = [_row(row) for row in rows]
         stages = [
@@ -738,6 +747,7 @@ def history(
         "stage": stage,
         "limit": limit,
         "stages": stages,
+        "declared_stage_count": declared_stages,
         "throughput_unit": "items/s" if has_items else "units/s",
         "runs": runs,
     }
@@ -769,7 +779,8 @@ def run_detail(registry: Registry, run_id: str, pipeline: str | None = None) -> 
                         "  * 1000.0 / wall_ms END AS items_per_s, "
                         "CASE WHEN wall_ms > 0 AND executed_units > 0 "
                         "  THEN executed_units * 1000.0 / wall_ms END AS units_per_s, "
-                        "CASE WHEN total_units > 0 AND executed_units = total_units "
+                        "CASE WHEN executed_units = 0 THEN 'none' "
+                        "WHEN total_units > 0 AND executed_units = total_units "
                         "  THEN 'full' ELSE 'partial' END AS kind "
                         "FROM stage_runs WHERE run_id = ? ORDER BY finished_at",
                         (run_id,),

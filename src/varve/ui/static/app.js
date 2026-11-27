@@ -571,7 +571,7 @@ function renderHistory(route, data) {
   const rate = (r) => (unit === "items/s" ? r.items_per_s : r.units_per_s);
 
   const charts = h("div", { class: "charts" },
-    chartBox("Wall time per run", wallChart(runs),
+    chartBox("Wall time per run", wallChart(runs, data),
       h("div", { class: "legend" }, h("span", null, h("i", { class: "solid" }), "full run (all units executed)"), h("span", null, h("i", { class: "hollow" }), "partial run, executed / total"))),
     chartBox(`Per-unit time${data.stage ? ` · ${data.stage}` : ""}`, data.stage ? latencyChart(runs) : emptyChart("Select a stage to see unit p50 / p95"),
       data.stage ? h("div", { class: "legend" }, h("span", null, h("i", { class: "solid" }), "p50"), h("span", null, h("i", { class: "l2" }), "p95")) : h("div", { class: "legend" }, h("span", null, " "))),
@@ -593,7 +593,7 @@ function renderHistory(route, data) {
       h("td", { class: "num" }, fmtNum(r.executed)),
       h("td", { class: "num" }, fmtNum(r.hit)),
       h("td", { class: "num" }, r.failed ? h("span", { class: "st-failed" }, fmtNum(r.failed)) : fmtNum(r.failed)),
-      h("td", null, r.kind === "full" ? "full" : r.kind === "partial" ? `partial ${fmtNum(r.executed)}/${fmtNum(r.total)}` : DASH),
+      h("td", null, r.kind === "full" ? "full" : r.kind === "partial" ? `partial ${partialLabel(r, data)}` : DASH),
       h("td", { class: "num" }, fmtMs(r.wall_ms)),
       h("td", { class: "num" }, rate(r) === null || rate(r) === undefined ? DASH : `${fmtRate(rate(r))}`),
       h("td", { class: "num" }, fmtMb(r.peak_rss_mb)),
@@ -689,17 +689,24 @@ function chartFrame(runs, maxY, yFmt, tipFor) {
   return { svg, marks, x, y };
 }
 
+function partialLabel(r, data, short = false) {
+  if (!data.stage && r.executed === r.total && data.declared_stage_count && r.stage_count < data.declared_stage_count) {
+    return `${fmtNum(r.stage_count)}/${fmtNum(data.declared_stage_count)} ${short ? "stg" : "stages"}`;
+  }
+  return `${fmtNum(r.executed)}/${fmtNum(r.total)}`;
+}
+
 function runTip(r, lines) {
   return [h("div", null, h("b", null, fmtTime(r.started_at)), " ", r.git_commit ? h("span", { class: "mono" }, `${r.git_commit.slice(0, 8)}${r.git_dirty ? "*" : ""}`) : null),
     ...lines.map((l) => h("div", null, l)),
-    h("div", { class: "muted" }, `${r.kind === "full" ? "full run" : r.kind === "partial" ? "partial run" : "no stage data"} · executed ${fmtNum(r.executed)} / ${fmtNum(r.total)} · workers ${fmtNum(r.workers)}`)];
+    h("div", { class: "muted" }, `${r.kind === "full" ? "full run" : r.kind === "partial" ? "partial run" : "no executed units"} · executed ${fmtNum(r.executed)} / ${fmtNum(r.total)} · workers ${fmtNum(r.workers)}`)];
 }
 
 function linePath(points) {
   return points.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" ");
 }
 
-function wallChart(runs) {
+function wallChart(runs, data) {
   const withData = runs.filter((r) => r.wall_ms !== null && r.wall_ms !== undefined && r.kind !== "none");
   if (!withData.length) return emptyChart("No finished runs");
   const max = Math.max(...withData.map((r) => r.wall_ms));
@@ -711,7 +718,7 @@ function wallChart(runs) {
     if (r.kind === "none" || r.wall_ms === null || r.wall_ms === undefined) return;
     const cx = f.x(i), cy = f.y(r.wall_ms);
     f.marks.append(s("circle", { class: r.kind === "full" ? "full" : "partial", cx, cy, r: 4 }));
-    if (r.kind === "partial") f.marks.append(s("text", { class: "pt-label", x: cx, y: cy - 8, "text-anchor": "middle" }, `${fmtNum(r.executed)}/${fmtNum(r.total)}`));
+    if (r.kind === "partial") f.marks.append(s("text", { class: "pt-label", x: cx, y: cy - 8, "text-anchor": "middle" }, partialLabel(r, data, true)));
   });
   return f.svg;
 }
